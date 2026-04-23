@@ -25,7 +25,33 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve pnpm version
+        id: pnpm-version
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          version = "10.28.0"
+          package_json = Path("package.json")
+          if package_json.exists():
+            data = json.loads(package_json.read_text())
+            package_manager = data.get("packageManager")
+            if isinstance(package_manager, str) and package_manager.startswith("pnpm@"):
+              version = package_manager.split("@", 1)[1]
+            else:
+              volta = data.get("volta")
+              if isinstance(volta, dict):
+                volta_pnpm = volta.get("pnpm")
+                if isinstance(volta_pnpm, str) and volta_pnpm:
+                  version = volta_pnpm
+
+          print(f"version={version}")
+          PY
+
       - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ steps.pnpm-version.outputs.version }}
 
       - uses: actions/setup-node@v4
         with:
