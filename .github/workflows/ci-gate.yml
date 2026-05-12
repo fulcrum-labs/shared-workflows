@@ -13,13 +13,18 @@ on:
 permissions:
   contents: read
 
+# Workflow-level so cancellations render as "cancelled" (gray) instead of
+# leaving a job-cancelled-mid-flight "failed" (red) run. Cancellations are
+# common on close+reopen, which is the workaround for slow first-webhook
+# delivery from Cloudflare Builds.
+concurrency:
+  group: ci-gate-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    concurrency:
-      group: ci-quality-${{ github.repository }}-${{ github.ref }}
-      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
