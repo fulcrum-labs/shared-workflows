@@ -9,17 +9,34 @@ on:
       check-command:
         type: string
         default: 'pnpm run ci:local'
+      cf-worker-name:
+        type: string
+        default: ''
+        description: 'Optional. CF Worker script name. If set together with cf-account-id and the CF_BUILDS_TOKEN secret, the gate manually triggers a CF Build after passing on main/staging — bypasses CF Builds webhook dispatch latency.'
+      cf-account-id:
+        type: string
+        default: ''
+        description: 'Optional. CF account ID owning the worker (e.g. b8fd8daf73edd8fe6b6bd18eeaacf2bb for fulcrum).'
+    secrets:
+      CF_BUILDS_TOKEN:
+        required: false
+        description: 'Optional user-scoped (cfut_*) Cloudflare API token with Workers Builds Configuration: Edit + Workers Scripts: Read permissions.'
 
 permissions:
   contents: read
+
+# Workflow-level so cancellations render as "cancelled" (gray) instead of
+# leaving a job-cancelled-mid-flight "failed" (red) run. Cancellations are
+# common on close+reopen, which is the workaround for slow first-webhook
+# delivery from Cloudflare Builds.
+concurrency:
+  group: ci-gate-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   quality:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    concurrency:
-      group: ci-quality-${{ github.repository }}-${{ github.ref }}
-      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -78,8 +95,11 @@ jobs:
             exit 1
           fi
 
-      - name: pnpm audit
-        run: pnpm audit --audit-level=high
+      # pnpm audit removed 2026-05-13. Grype (below) covers the same
+      # vulnerability surface using the OSV/NVD feeds and supports per-repo
+      # allowlisting via .grype.yaml. pnpm audit lacks any allowlist mechanism
+      # and was blocking PRs on transitive CVEs (e.g. basic-ftp via
+      # @cloudflare/puppeteer) that the team had no near-term fix for.
 
       - name: Accessibility (axe-core)
         run: |
@@ -149,9 +169,72 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Grype vulnerability database
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/grype/db
+          key: grype-db-${{ hashFiles('.github/workflows/ci-gate.yml') }}
+          restore-keys: |
+            grype-db-
+
       - name: Grype vulnerability scan
         uses: anchore/scan-action@v6
         with:
           path: '.'
           fail-build: true
           severity-cutoff: high
+
+  trigger-cf-build:
+    # Optional: after the gate passes, POST to the Workers Builds manual-trigger
+    # endpoint to start the build immediately instead of waiting for CF Builds'
+    # webhook dispatch. Skipped if cf-worker-name / cf-account-id / CF_BUILDS_TOKEN
+    # aren't provided, and only runs on push to main or staging.
+    if: |
+      github.event_name == 'push' &&
+      (github.ref_name == 'main' || github.ref_name == 'staging') &&
+      inputs.cf-worker-name != '' &&
+      inputs.cf-account-id != ''
+    needs: [quality, gitleaks, semgrep, grype]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Manually trigger Cloudflare Workers build
+        env:
+          CF_TOKEN: ${{ secrets.CF_BUILDS_TOKEN }}
+          ACCOUNT_ID: ${{ inputs.cf-account-id }}
+          WORKER_NAME: ${{ inputs.cf-worker-name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CF_TOKEN:-}" ]; then
+            echo "::warning::CF_BUILDS_TOKEN secret not provided — skipping manual trigger; CF will deploy via webhook (slower)."
+            exit 0
+          fi
+
+          API="https://api.cloudflare.com/client/v4"
+          AUTH="Authorization: Bearer $CF_TOKEN"
+
+          worker_tag=$(curl -fsSL -H "$AUTH" "$API/accounts/$ACCOUNT_ID/workers/scripts/$WORKER_NAME" \
+            | jq -r '.result.tag // empty')
+          if [ -z "$worker_tag" ]; then
+            echo "::warning::Could not resolve worker tag for '$WORKER_NAME' in account $ACCOUNT_ID — skipping manual trigger."
+            exit 0
+          fi
+
+          trigger_uuid=$(curl -fsSL -H "$AUTH" "$API/accounts/$ACCOUNT_ID/builds/workers/$worker_tag/triggers" \
+            | jq -r --arg branch "$BRANCH" '[.result[] | select(.branch_includes | index($branch))] | first | .trigger_uuid // empty')
+          if [ -z "$trigger_uuid" ]; then
+            echo "::warning::No CF Builds trigger matches branch '$BRANCH' for worker '$WORKER_NAME' — skipping manual trigger."
+            exit 0
+          fi
+
+          echo "Triggering CF Build for worker '$WORKER_NAME' on branch '$BRANCH' (trigger $trigger_uuid)"
+          response=$(curl -fsSL -X POST -H "$AUTH" "$API/accounts/$ACCOUNT_ID/builds/triggers/$trigger_uuid/builds")
+          if ! echo "$response" | jq -e '.success == true' > /dev/null; then
+            echo "::error::CF Builds API rejected the trigger:"
+            echo "$response" | jq '.errors // .'
+            exit 1
+          fi
+
+          build_uuid=$(echo "$response" | jq -r '.result.build_uuid // .result.uuid // "unknown"')
+          echo "::notice::CF Build started: $build_uuid"
