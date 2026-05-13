@@ -95,8 +95,11 @@ jobs:
             exit 1
           fi
 
-      - name: pnpm audit
-        run: pnpm audit --audit-level=high
+      # pnpm audit removed 2026-05-13. Grype (below) covers the same
+      # vulnerability surface using the OSV/NVD feeds and supports per-repo
+      # allowlisting via .grype.yaml. pnpm audit lacks any allowlist mechanism
+      # and was blocking PRs on transitive CVEs (e.g. basic-ftp via
+      # @cloudflare/puppeteer) that the team had no near-term fix for.
 
       - name: Accessibility (axe-core)
         run: |
