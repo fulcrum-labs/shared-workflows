@@ -1,0 +1,88 @@
+# Reusable workflow: apply unapplied D1 migrations on push to main.
+#
+# Consumer wrapper shape (one-liner per repo):
+#
+#   # .github/workflows/d1-migrations.yml in the consumer repo
+#   name: D1 migrations apply
+#   on:
+#     push: { branches: [main] }
+#     workflow_dispatch: {}
+#   permissions: { contents: read }
+#   jobs:
+#     apply:
+#       uses: fulcrum-labs/shared-workflows/.github/workflows/d1-migrations-apply.yml@main
+#       with:
+#         database-name: <your-d1-name>
+#         account-id: <your-cloudflare-account-id>
+#       secrets:
+#         CF_API_TOKEN: ${{ secrets.CF_FULCRUM_TOKEN }}
+#
+# Why this exists: 2026-05-25 incident — PR #376 on fronts merged a
+# migration adding `subscriptions.is_current` plus code that queried it.
+# Cloudflare Builds deployed the code but the migration was never run;
+# the site 5xx'd for ~14 minutes. CF Builds only runs `wrangler deploy`
+# — it does NOT apply migrations. This workflow closes that gap.
+# KB: fronts-d1-migration-and-monitoring-gap-2026-05-25.
+
+name: D1 migrations apply (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      database-name:
+        type: string
+        required: true
+        description: "Cloudflare D1 database name (matches `database_name` in wrangler.toml)."
+      account-id:
+        type: string
+        required: true
+        description: "Cloudflare account ID owning the D1 database."
+      migrations-dir:
+        type: string
+        default: "migrations"
+        description: "Directory containing the *.sql migration files. Defaults to migrations/."
+      wrangler-version:
+        type: string
+        default: "4.94.0"
+        description: "Wrangler version to install via npm install -g."
+      shared-workflows-ref:
+        type: string
+        default: "main"
+        description: "Git ref of fulcrum-labs/shared-workflows to check out alongside the consumer repo (for the apply-d1-migrations.mjs script)."
+    secrets:
+      CF_API_TOKEN:
+        required: true
+        description: "Cloudflare API token with `Workers Scripts:Edit` + `D1:Edit` on the target account."
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d1-migrations-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+      D1_DATABASE_NAME: ${{ inputs.database-name }}
+      D1_MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+    steps:
+      - name: Checkout consumer repo
+        uses: actions/checkout@v4
+
+      - name: Checkout shared-workflows for helper script
+        uses: actions/checkout@v4
+        with:
+          repository: fulcrum-labs/shared-workflows
+          ref: ${{ inputs.shared-workflows-ref }}
+          path: .shared-workflows
+
+      - name: Install wrangler
+        run: npm install -g wrangler@${{ inputs.wrangler-version }}
+
+      - name: Apply pending migrations
+        run: node .shared-workflows/.github/scripts/apply-d1-migrations.mjs
