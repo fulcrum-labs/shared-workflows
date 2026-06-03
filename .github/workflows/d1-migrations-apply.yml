@@ -72,10 +72,10 @@ jobs:
       D1_MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
     steps:
       - name: Checkout consumer repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout shared-workflows for helper script
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: fulcrum-labs/shared-workflows
           ref: ${{ inputs.shared-workflows-ref }}
