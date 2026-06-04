@@ -71,6 +71,21 @@ jobs:
           version: ${{ steps.pnpm-version.outputs.version }}
           dest: ${{ runner.temp }}/setup-pnpm
 
+      - name: Guard pnpm runner isolation
+        run: |
+          case "${PNPM_HOME:-}" in
+            "$RUNNER_TEMP"/*) ;;
+            *)
+              echo "::error::PNPM_HOME must be under RUNNER_TEMP on self-hosted runners; got '${PNPM_HOME:-<unset>}'"
+              exit 1
+              ;;
+          esac
+
+          if [ -e "$HOME/setup-pnpm" ]; then
+            echo "::warning::Removing stale home-level pnpm setup from prior self-hosted jobs"
+            rm -rf "$HOME/setup-pnpm"
+          fi
+
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node-version }}
