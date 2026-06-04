@@ -1,0 +1,69 @@
+name: Self-hosted runner smoke
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-hosted-runner-smoke
+  cancel-in-progress: true
+
+jobs:
+  pnpm-isolation:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Preflight home-level pnpm state
+        run: |
+          if [ -e "$HOME/setup-pnpm" ]; then
+            echo "::error::Stale home-level pnpm setup exists at $HOME/setup-pnpm"
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v6.0.8
+        with:
+          version: 10.34.1
+          dest: ${{ runner.temp }}/setup-pnpm
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Verify pnpm isolation
+        run: |
+          set -euo pipefail
+
+          echo "RUNNER_TEMP=$RUNNER_TEMP"
+          echo "PNPM_HOME=${PNPM_HOME:-}"
+
+          case "${PNPM_HOME:-}" in
+            "$RUNNER_TEMP"/*) ;;
+            *)
+              echo "::error::PNPM_HOME must be under RUNNER_TEMP; got '${PNPM_HOME:-<unset>}'"
+              exit 1
+              ;;
+          esac
+
+          version="$(pnpm --version)"
+          echo "pnpm=$version"
+
+          store_path="$(pnpm store path --silent)"
+          echo "store_path=$store_path"
+          case "$store_path" in
+            "$RUNNER_TEMP"/*) ;;
+            *)
+              echo "::error::pnpm store must be under RUNNER_TEMP; got '$store_path'"
+              exit 1
+              ;;
+          esac
+
+          if [ -e "$HOME/setup-pnpm" ]; then
+            echo "::error::pnpm action recreated home-level setup at $HOME/setup-pnpm"
+            exit 1
+          fi
