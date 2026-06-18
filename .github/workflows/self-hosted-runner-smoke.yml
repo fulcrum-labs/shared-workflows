@@ -19,10 +19,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Preflight home-level pnpm state
+      - name: Repair stale home-level pnpm state
         run: |
+          set -euo pipefail
+
           if [ -e "$HOME/setup-pnpm" ]; then
-            echo "::error::Stale home-level pnpm setup exists at $HOME/setup-pnpm"
+            echo "::warning::Removing stale home-level pnpm setup at $HOME/setup-pnpm"
+            rm -rf "$HOME/setup-pnpm"
+            {
+              echo "### Self-hosted runner pnpm hygiene"
+              echo ""
+              echo "Removed stale home-level pnpm setup at \`$HOME/setup-pnpm\` before running the isolation smoke."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### Self-hosted runner pnpm hygiene"
+              echo ""
+              echo "No stale home-level pnpm setup was present before running the isolation smoke."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -e "$HOME/setup-pnpm" ]; then
+            echo "::error::Could not remove stale home-level pnpm setup at $HOME/setup-pnpm"
             exit 1
           fi
 
