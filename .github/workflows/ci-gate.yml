@@ -9,6 +9,10 @@ on:
       check-command:
         type: string
         default: 'pnpm run ci:local'
+      docs-lint-enabled:
+        type: boolean
+        default: false
+        description: 'Optional. Run the docs-convention lint job (@fulcrum-labs/docs-lint). Repos opt in via platform-foundations maintenance.docs_lint.'
       cf-worker-name:
         type: string
         default: ''
@@ -141,6 +145,30 @@ jobs:
             pnpm exec knip
           else
             echo "::notice::Knip not configured — skipping"
+          fi
+
+  docs-lint:
+    if: ${{ inputs.docs-lint-enabled }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v6.0.8
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Docs convention lint
+        run: |
+          if grep -q '"docs-lint"' package.json 2>/dev/null; then
+            pnpm run docs-lint -- --json
+          else
+            pnpm dlx @fulcrum-labs/docs-lint@latest --json
           fi
 
   gitleaks:
