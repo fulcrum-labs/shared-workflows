@@ -13,6 +13,18 @@ on:
         type: boolean
         default: false
         description: 'Optional. Run the docs-convention lint job (@fulcrum-labs/docs-lint). Repos opt in via platform-foundations maintenance.docs_lint.'
+      turbo-cache-enabled:
+        type: boolean
+        default: false
+        description: 'Optional. Enable the signed Turbo remote cache for trusted callers. Fork pull requests remain uncached.'
+      turbo-cache-api:
+        type: string
+        default: ''
+        description: 'Optional. Turbo-compatible remote cache API URL.'
+      turbo-cache-team:
+        type: string
+        default: ''
+        description: 'Optional. Namespace used to isolate this repository family in the shared cache.'
       cf-worker-name:
         type: string
         default: ''
@@ -25,6 +37,12 @@ on:
       CF_BUILDS_TOKEN:
         required: false
         description: 'Optional user-scoped (cfut_*) Cloudflare API token with Workers Builds Configuration: Edit + Workers Scripts: Read permissions.'
+      TURBO_CACHE_TOKEN:
+        required: false
+        description: 'Optional bearer credential for the signed Turbo remote cache.'
+      TURBO_CACHE_SIGNATURE_KEY:
+        required: false
+        description: 'Optional HMAC key used to sign and verify Turbo cache artifacts.'
 
 permissions:
   contents: read
@@ -99,6 +117,17 @@ jobs:
 
       - name: CI gate (typecheck + lint + test + build)
         run: ${{ inputs.check-command }}
+        env:
+          # Cache credentials are never exposed to fork pull requests or setup
+          # actions. An empty TURBO_TOKEN leaves Turbo on its local cache and
+          # keeps the gate fail-open when a caller has not provisioned it yet.
+          TURBO_API: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.turbo-cache-api || '' }}
+          TURBO_TOKEN: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && secrets.TURBO_CACHE_TOKEN || '' }}
+          TURBO_TEAM: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.turbo-cache-team || '' }}
+          TURBO_TEAMID: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.turbo-cache-team || '' }}
+          TURBO_REMOTE_CACHE_SIGNATURE_KEY: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && secrets.TURBO_CACHE_SIGNATURE_KEY || '' }}
+          TURBO_REMOTE_CACHE_TIMEOUT: '10'
+          TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: '10'
 
       - name: Lockfile integrity
         run: |
