@@ -115,17 +115,64 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      - name: Resolve Turbo cache eligibility
+        id: turbo-cache
+        env:
+          TURBO_CACHE_ENABLED: ${{ inputs.turbo-cache-enabled }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          # Credentials are only ever injected for an explicit event allowlist:
+          # push, merge_group, and same-repository pull_request. Every other
+          # event (fork PRs, pull_request_target, issue_comment, workflow_run,
+          # ...) gets an empty credential set and Turbo stays on its local
+          # cache.
+          eligible=false
+          if [ "$TURBO_CACHE_ENABLED" = "true" ]; then
+            case "$GITHUB_EVENT_NAME" in
+              push|merge_group)
+                eligible=true
+                ;;
+              pull_request)
+                if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ]; then
+                  eligible=true
+                fi
+                ;;
+            esac
+          fi
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce signed-cache consumer contract
+        if: ${{ steps.turbo-cache.outputs.eligible == 'true' }}
+        run: |
+          # Fail closed: never inject cache credentials into a consumer that
+          # does not verify artifact signatures (remoteCache.signature).
+          node - <<'JS'
+          const fs = require('node:fs');
+          let config;
+          try {
+            config = JSON.parse(fs.readFileSync('turbo.json', 'utf8'));
+          } catch (error) {
+            console.error('::error::turbo-cache-enabled requires a readable turbo.json: ' + error.message);
+            process.exit(1);
+          }
+          if (config?.remoteCache?.signature !== true) {
+            console.error('::error::turbo-cache-enabled requires remoteCache.signature=true in turbo.json');
+            process.exit(1);
+          }
+          JS
+
       - name: CI gate (typecheck + lint + test + build)
         run: ${{ inputs.check-command }}
         env:
-          # Cache credentials are never exposed to fork pull requests or setup
-          # actions. An empty TURBO_TOKEN leaves Turbo on its local cache and
-          # keeps the gate fail-open when a caller has not provisioned it yet.
-          TURBO_API: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.turbo-cache-api || '' }}
-          TURBO_TOKEN: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && secrets.TURBO_CACHE_TOKEN || '' }}
-          TURBO_TEAM: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.turbo-cache-team || '' }}
-          TURBO_TEAMID: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && inputs.turbo-cache-team || '' }}
-          TURBO_REMOTE_CACHE_SIGNATURE_KEY: ${{ inputs.turbo-cache-enabled && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && secrets.TURBO_CACHE_SIGNATURE_KEY || '' }}
+          # Cache credentials are injected only when the eligibility step above
+          # matched the trusted-event allowlist. Empty credentials leave Turbo
+          # on its local cache and keep the gate fail-open when a caller has
+          # not provisioned the cache yet.
+          TURBO_API: ${{ steps.turbo-cache.outputs.eligible == 'true' && inputs.turbo-cache-api || '' }}
+          TURBO_TOKEN: ${{ steps.turbo-cache.outputs.eligible == 'true' && secrets.TURBO_CACHE_TOKEN || '' }}
+          TURBO_TEAM: ${{ steps.turbo-cache.outputs.eligible == 'true' && inputs.turbo-cache-team || '' }}
+          TURBO_TEAMID: ${{ steps.turbo-cache.outputs.eligible == 'true' && inputs.turbo-cache-team || '' }}
+          TURBO_REMOTE_CACHE_SIGNATURE_KEY: ${{ steps.turbo-cache.outputs.eligible == 'true' && secrets.TURBO_CACHE_SIGNATURE_KEY || '' }}
           TURBO_REMOTE_CACHE_TIMEOUT: '10'
           TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: '10'
 
