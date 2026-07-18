@@ -57,6 +57,7 @@ concurrency:
 
 jobs:
   quality:
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 25
     steps:
@@ -371,7 +372,8 @@ jobs:
       inputs.cf-worker-name != '' &&
       inputs.cf-account-id != ''
     needs: [quality, gitleaks, semgrep, grype]
-    runs-on: ubuntu-24.04
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 3
     steps:
       - name: Manually trigger Cloudflare Workers build
