@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   contract:
-    runs-on: ubuntu-24.04
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
@@ -20,4 +21,4 @@ jobs:
           node-version: '24'
 
       - name: Reusable CI gate contract
-        run: node --test .github/scripts/test-ci-gate.mjs
+        run: node --test .github/scripts/test-ci-gate.mjs .github/scripts/test-self-hosted-runners.mjs
