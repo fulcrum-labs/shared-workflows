@@ -225,12 +225,55 @@ jobs:
 
   docs-lint:
     if: ${{ inputs.docs-lint-enabled }}
-    runs-on: ubuntu-24.04
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
 
+      - name: Resolve pnpm version
+        id: pnpm-version
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          version = "10.28.0"
+          package_json = Path("package.json")
+          if package_json.exists():
+            data = json.loads(package_json.read_text())
+            package_manager = data.get("packageManager")
+            if isinstance(package_manager, str) and package_manager.startswith("pnpm@"):
+              version = package_manager.split("@", 1)[1]
+            else:
+              volta = data.get("volta")
+              if isinstance(volta, dict):
+                volta_pnpm = volta.get("pnpm")
+                if isinstance(volta_pnpm, str) and volta_pnpm:
+                  version = volta_pnpm
+
+          print(f"version={version}")
+          PY
+
       - uses: pnpm/action-setup@v6.0.8
+        with:
+          version: ${{ steps.pnpm-version.outputs.version }}
+          dest: ${{ runner.temp }}/setup-pnpm
+
+      - name: Guard pnpm runner isolation
+        run: |
+          case "${PNPM_HOME:-}" in
+            "$RUNNER_TEMP"/*) ;;
+            *)
+              echo "::error::PNPM_HOME must be under RUNNER_TEMP on self-hosted runners; got '${PNPM_HOME:-<unset>}'"
+              exit 1
+              ;;
+          esac
+
+          if [ -e "$HOME/setup-pnpm" ]; then
+            echo "::warning::Removing stale home-level pnpm setup from prior self-hosted jobs"
+            rm -rf "$HOME/setup-pnpm"
+          fi
 
       - uses: actions/setup-node@v5
         with:
@@ -248,7 +291,8 @@ jobs:
           fi
 
   gitleaks:
-    runs-on: ubuntu-24.04
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
@@ -260,7 +304,8 @@ jobs:
           curl -sSL -o /tmp/gitleaks.tar.gz \
             https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp
-          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          mv /tmp/gitleaks "$RUNNER_TEMP/gitleaks"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Gitleaks scan
         run: gitleaks detect --source . --no-banner --redact
@@ -284,7 +329,9 @@ jobs:
             --quiet
 
   grype:
-    runs-on: ubuntu-24.04
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
+    # anchore/scan-action@v7.4.0 runs 'grype dir:.' (binary download, no Docker required)
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5

@@ -107,3 +107,29 @@ test('remote cache network timeouts are bounded', () => {
   assert.match(workflow, /^\s+TURBO_REMOTE_CACHE_TIMEOUT: '10'$/m);
   assert.match(workflow, /^\s+TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: '10'$/m);
 });
+
+test('non-container scanner jobs use the self-hosted fleet safely', () => {
+  const jobNames = ['docs-lint', 'gitleaks', 'grype'];
+  const jobStarts = new Map(
+    [...workflow.matchAll(/^  ([a-z][a-z0-9-]+):$/gm)]
+      .map(match => [match[1], match.index]),
+  );
+
+  for (const jobName of jobNames) {
+    const start = jobStarts.get(jobName);
+    assert.notEqual(start, undefined, `${jobName} job must exist`);
+    const nextStart = [...jobStarts.values()].find(index => index > start) ?? workflow.length;
+    const job = workflow.slice(start, nextStart);
+    assert.match(job, /^    runs-on: \[self-hosted, Linux, X64\]$/m, `${jobName} must be self-hosted`);
+    assert.match(job, /break-glass: swap runs-on back to ubuntu-24\.04/);
+  }
+
+  const docsLint = workflow.slice(jobStarts.get('docs-lint'), jobStarts.get('gitleaks'));
+  assert.match(docsLint, /dest: \$\{\{ runner\.temp \}\}\/setup-pnpm/);
+  assert.match(docsLint, /PNPM_HOME must be under RUNNER_TEMP/);
+
+  const gitleaks = workflow.slice(jobStarts.get('gitleaks'), jobStarts.get('semgrep'));
+  assert.match(gitleaks, /mv \/tmp\/gitleaks "\$RUNNER_TEMP\/gitleaks"/);
+  assert.match(gitleaks, /echo "\$RUNNER_TEMP" >> "\$GITHUB_PATH"/);
+  assert.equal(gitleaks.includes('sudo '), false, 'gitleaks install must not require privileged mutation');
+});
