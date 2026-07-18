@@ -133,3 +133,29 @@ test('non-container scanner jobs use the self-hosted fleet safely', () => {
   assert.match(gitleaks, /echo "\$RUNNER_TEMP" >> "\$GITHUB_PATH"/);
   assert.equal(gitleaks.includes('sudo '), false, 'gitleaks install must not require privileged mutation');
 });
+
+test('semgrep uses a pinned ephemeral pip install on the self-hosted fleet', () => {
+  const semgrepStart = workflow.indexOf('  semgrep:');
+  const grypeStart = workflow.indexOf('  grype:', semgrepStart);
+  const semgrep = workflow.slice(semgrepStart, grypeStart);
+
+  assert.ok(semgrepStart >= 0 && grypeStart > semgrepStart, 'semgrep job must exist');
+  assert.match(semgrep, /^    runs-on: \[self-hosted, Linux, X64\]$/m);
+  assert.match(semgrep, /break-glass: swap runs-on back to ubuntu-24\.04/);
+  assert.equal(semgrep.includes('container:'), false, 'semgrep must not require Docker');
+  assert.equal(semgrep.includes('returntocorp/semgrep'), false, 'legacy container image must be removed');
+  assert.match(semgrep, /PYTHONUSERBASE="\$RUNNER_TEMP\/semgrep-user"/);
+  assert.match(
+    semgrep,
+    /python3 -m pip install --user --break-system-packages --quiet semgrep==1\.170\.0/,
+  );
+  assert.match(semgrep, /echo "\$RUNNER_TEMP\/semgrep-user\/bin" >> "\$GITHUB_PATH"/);
+  assert.equal(semgrep.includes('sudo '), false, 'semgrep install must not require privileged mutation');
+
+  for (const config of ['p/security-audit', 'p/owasp-top-ten', 'p/typescript']) {
+    assert.match(semgrep, new RegExp(`--config=${config.replace('/', '\\/')}`));
+  }
+  for (const flag of ['--error', '--severity=ERROR', '--quiet']) {
+    assert.ok(semgrep.includes(flag), `semgrep scan must retain ${flag}`);
+  }
+});
