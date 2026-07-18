@@ -311,12 +311,21 @@ jobs:
         run: gitleaks detect --source . --no-banner --redact
 
   semgrep:
-    runs-on: ubuntu-24.04
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
+    # S10/D3: pip installation removes the runner's Docker dependency. Keep the
+    # user base in RUNNER_TEMP so self-hosted jobs cannot leak packages across runs.
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
-    container:
-      image: returntocorp/semgrep:latest
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install semgrep
+        run: |
+          # Both runner fleets use PEP 668 externally-managed Python. --user
+          # confines the pinned package to the ephemeral PYTHONUSERBASE.
+          PYTHONUSERBASE="$RUNNER_TEMP/semgrep-user" \
+            python3 -m pip install --user --break-system-packages --quiet semgrep==1.170.0
+          echo "$RUNNER_TEMP/semgrep-user/bin" >> "$GITHUB_PATH"
 
       - name: Semgrep scan
         run: |
