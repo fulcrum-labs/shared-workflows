@@ -144,18 +144,28 @@ test('semgrep uses a pinned ephemeral pip install on the self-hosted fleet', () 
   assert.match(semgrep, /break-glass: swap runs-on back to ubuntu-24\.04/);
   assert.equal(semgrep.includes('container:'), false, 'semgrep must not require Docker');
   assert.equal(semgrep.includes('returntocorp/semgrep'), false, 'legacy container image must be removed');
-  assert.match(semgrep, /PYTHONUSERBASE="\$RUNNER_TEMP\/semgrep-user"/);
+  assert.equal(
+    (semgrep.match(/^        env:\n          PYTHONUSERBASE: \$\{\{ runner\.temp \}\}\/semgrep-user$/gm) ?? []).length,
+    2,
+    'install and scan must retain the same Python user base',
+  );
   assert.match(
     semgrep,
     /python3 -m pip install --user --break-system-packages --quiet semgrep==1\.170\.0/,
   );
-  assert.match(semgrep, /echo "\$RUNNER_TEMP\/semgrep-user\/bin" >> "\$GITHUB_PATH"/);
+  assert.match(semgrep, /echo "\$PYTHONUSERBASE\/bin" >> "\$GITHUB_PATH"/);
   assert.equal(semgrep.includes('sudo '), false, 'semgrep install must not require privileged mutation');
 
   for (const config of ['p/security-audit', 'p/owasp-top-ten', 'p/typescript']) {
     assert.match(semgrep, new RegExp(`--config=${config.replace('/', '\\/')}`));
   }
-  for (const flag of ['--error', '--severity=ERROR', '--quiet']) {
+  for (const flag of ['--error', '--severity=ERROR']) {
     assert.ok(semgrep.includes(flag), `semgrep scan must retain ${flag}`);
   }
+  const scan = semgrep.slice(semgrep.indexOf('      - name: Semgrep scan'));
+  assert.equal(
+    scan.includes('--quiet'),
+    false,
+    'semgrep must preserve actionable scanner errors in the job log',
+  );
 });
