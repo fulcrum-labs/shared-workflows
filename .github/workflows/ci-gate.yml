@@ -321,14 +321,17 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install semgrep
+        env:
+          PYTHONUSERBASE: ${{ runner.temp }}/semgrep-user
         run: |
           # Both runner fleets use PEP 668 externally-managed Python. --user
           # confines the pinned package to the ephemeral PYTHONUSERBASE.
-          PYTHONUSERBASE="$RUNNER_TEMP/semgrep-user" \
-            python3 -m pip install --user --break-system-packages --quiet semgrep==1.170.0
-          echo "$RUNNER_TEMP/semgrep-user/bin" >> "$GITHUB_PATH"
+          python3 -m pip install --user --break-system-packages --quiet semgrep==1.170.0
+          echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
 
       - name: Semgrep scan
+        env:
+          PYTHONUSERBASE: ${{ runner.temp }}/semgrep-user
         run: |
           semgrep scan \
             --config=p/security-audit \
