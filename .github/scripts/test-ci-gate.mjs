@@ -159,7 +159,13 @@ test('semgrep uses a pinned ephemeral pip install on the self-hosted fleet', () 
   for (const config of ['p/security-audit', 'p/owasp-top-ten', 'p/typescript']) {
     assert.match(semgrep, new RegExp(`--config=${config.replace('/', '\\/')}`));
   }
-  for (const flag of ['--error', '--severity=ERROR', '--quiet']) {
+  for (const flag of ['--error', '--severity=ERROR']) {
     assert.ok(semgrep.includes(flag), `semgrep scan must retain ${flag}`);
   }
+  const scan = semgrep.slice(semgrep.indexOf('      - name: Semgrep scan'));
+  assert.equal(
+    scan.includes('--quiet'),
+    false,
+    'semgrep must preserve actionable scanner errors in the job log',
+  );
 });

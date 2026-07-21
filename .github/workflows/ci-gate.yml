@@ -338,8 +338,7 @@ jobs:
             --config=p/owasp-top-ten \
             --config=p/typescript \
             --error \
-            --severity=ERROR \
-            --quiet
+            --severity=ERROR
 
   grype:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
