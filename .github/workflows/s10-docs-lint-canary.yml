@@ -1,0 +1,16 @@
+name: S10 docs-lint live canary
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/s10-docs-lint-canary.yml
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: fulcrum-labs/shared-workflows/.github/workflows/ci-gate.yml@de9767aa864d456c665c81fd86bfa3e6f4e17faf
+    with:
+      check-command: pnpm dlx @fulcrum-labs/docs-lint@latest --json
+      docs-lint-enabled: true
