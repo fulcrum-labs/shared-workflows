@@ -35,8 +35,13 @@ if (!DB_NAME) throw new Error("D1_DATABASE_NAME is required");
 if (!ACCOUNT_ID) throw new Error("CLOUDFLARE_ACCOUNT_ID is required");
 if (!API_TOKEN) throw new Error("CLOUDFLARE_API_TOKEN is required");
 
+// Self-hosted runners do not expose the global npm bin dir on PATH, so a bare
+// "wrangler" spawn ENOENTs there. The workflow resolves the absolute binary
+// path at install time and passes it via WRANGLER_BIN.
+const WRANGLER_BIN = process.env.WRANGLER_BIN || "wrangler";
+
 const wranglerJson = (args) => {
-	const out = execFileSync("wrangler", args, {
+	const out = execFileSync(WRANGLER_BIN, args, {
 		encoding: "utf8",
 		env: { ...process.env, NO_COLOR: "1" },
 		stdio: ["ignore", "pipe", "inherit"],
@@ -55,7 +60,7 @@ const wranglerJson = (args) => {
 };
 
 const wrangler = (args) =>
-	execFileSync("wrangler", args, {
+	execFileSync(WRANGLER_BIN, args, {
 		encoding: "utf8",
 		env: { ...process.env, NO_COLOR: "1" },
 		stdio: ["ignore", "inherit", "inherit"],
