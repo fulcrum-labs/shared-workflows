@@ -82,8 +82,17 @@ jobs:
           ref: ${{ inputs.shared-workflows-ref }}
           path: .shared-workflows
 
+      # Self-hosted runners do not put the global npm bin dir on PATH, so a
+      # bare `wrangler` spawn in the apply script ENOENTs (issue #21: fronts
+      # migrations silently never applied). Resolve the absolute binary path
+      # here and smoke it, so a broken install fails THIS step loudly instead
+      # of surfacing as a buried spawn error later.
       - name: Install wrangler
-        run: npm install -g wrangler@${{ inputs.wrangler-version }}
+        run: |
+          npm install -g wrangler@${{ inputs.wrangler-version }}
+          WRANGLER_BIN="$(npm prefix -g)/bin/wrangler"
+          "$WRANGLER_BIN" --version
+          echo "WRANGLER_BIN=$WRANGLER_BIN" >> "$GITHUB_ENV"
 
       - name: Apply pending migrations
         run: node .shared-workflows/.github/scripts/apply-d1-migrations.mjs
