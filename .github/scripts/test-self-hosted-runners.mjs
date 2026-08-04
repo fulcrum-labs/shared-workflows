@@ -6,6 +6,7 @@ const workflows = new Map(
   [
     ['ci-gate.yml', ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype', 'trigger-cf-build']],
     ['d1-migrations-apply.yml', ['apply']],
+    ['preview-gate.yml', ['build']],
   ].map(([file, jobs]) => [
     file,
     {
