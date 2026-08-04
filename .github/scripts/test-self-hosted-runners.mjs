@@ -6,7 +6,6 @@ const workflows = new Map(
   [
     ['ci-gate.yml', ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype', 'trigger-cf-build']],
     ['d1-migrations-apply.yml', ['apply']],
-    ['validate.yml', ['contract']],
   ].map(([file, jobs]) => [
     file,
     {
@@ -41,5 +40,24 @@ test('all shared-workflow compute defaults to the self-hosted runner fleet', () 
       );
     }
   }
+});
+
+test('workflows that run in THIS public repo never target the self-hosted fleet', () => {
+  // shared-workflows is a PUBLIC repo: any workflow triggered here (pull_request,
+  // push, schedule) would let fork-PR code reach the self-hosted runner hosts.
+  // Reusable workflow_call jobs (ci-gate, d1-migrations-apply) execute in the
+  // PRIVATE caller repos and are exempt. See 2026-08-04 runner security finding.
+  const validate = readFileSync(new URL('../workflows/validate.yml', import.meta.url), 'utf8');
+  const contract = jobSource(validate, 'contract');
+  assert.match(
+    contract,
+    /^    runs-on: ubuntu-24\.04$/m,
+    'validate.yml:contract must run on GitHub-hosted compute (public repo)',
+  );
+  assert.doesNotMatch(
+    contract,
+    /^    runs-on:.*self-hosted/m,
+    'validate.yml:contract must not target the self-hosted fleet',
+  );
 });
 

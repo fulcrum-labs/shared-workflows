@@ -10,8 +10,10 @@ permissions:
 
 jobs:
   contract:
-    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: [self-hosted, Linux, X64]
+    # SECURITY: this repo is PUBLIC. pull_request jobs must never target the
+    # self-hosted fleet — a fork PR executes arbitrary code on the runner host.
+    # Hosted-only is asserted by test-self-hosted-runners.mjs.
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
