@@ -128,7 +128,9 @@ jobs:
             --message "commit=${HEAD_SHA} pr=${PR_NUMBER} preview" \
             2>&1 | tee "$RUNNER_TEMP/preview-upload.log"
 
-          urls=$(grep -Eo 'https://[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.workers\.dev[^ ]*' "$RUNNER_TEMP/preview-upload.log" | sort -u)
+          # `|| true`: the default shell runs with -e, so a no-match grep would
+          # kill the step at this assignment and skip the diagnostic below.
+          urls=$(grep -Eo 'https://[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.workers\.dev[^ ]*' "$RUNNER_TEMP/preview-upload.log" | sort -u || true)
           if [ -z "$urls" ]; then
             echo "::error::wrangler versions upload produced no preview URL — is preview_urls enabled in wrangler.toml?"
             exit 1
