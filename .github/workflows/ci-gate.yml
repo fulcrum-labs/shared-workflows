@@ -348,20 +348,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Cache Grype vulnerability database
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/grype/db
-          key: grype-db-${{ hashFiles('.github/workflows/ci-gate.yml') }}
-          restore-keys: |
-            grype-db-
-
       - name: Grype vulnerability scan
         uses: anchore/scan-action@v7.4.0
         with:
           path: '.'
           fail-build: true
           severity-cutoff: high
+          # Keep the binary compatible with the current vulnerability DB
+          # schema and explicitly refresh restored data before every scan.
+          grype-version: v0.114.0
+          cache-db: true
 
   trigger-cf-build:
     # Optional: after the gate passes, POST to the Workers Builds manual-trigger
