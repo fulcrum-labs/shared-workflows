@@ -17,6 +17,10 @@ on:
         type: string
         default: 'pnpm run ci:local'
         description: 'CI command to run before uploading the preview version.'
+      artifact-build-command:
+        type: string
+        default: ''
+        description: 'Production build command that replaces any CI-configured artifact before upload.'
       account-id:
         type: string
         required: true
@@ -112,6 +116,13 @@ jobs:
           WRANGLER_BIN="$WRANGLER_DIR/node_modules/.bin/wrangler"
           "$WRANGLER_BIN" --version
           echo "WRANGLER_BIN=$WRANGLER_BIN" >> "$GITHUB_ENV"
+
+      # Astro's Cloudflare adapter writes a redirected deploy config into the
+      # build output. A CI build can intentionally omit production bindings,
+      # so replace that artifact before Wrangler discovers and uploads it.
+      - name: Build production preview artifact
+        if: inputs.artifact-build-command != ''
+        run: ${{ inputs.artifact-build-command }}
 
       - name: Upload preview version
         id: upload

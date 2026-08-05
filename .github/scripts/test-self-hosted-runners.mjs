@@ -63,3 +63,21 @@ test('workflows that run in THIS public repo never target the self-hosted fleet'
   );
 });
 
+test('preview gate rebuilds the upload artifact with the caller production command', () => {
+  const source = workflows.get('preview-gate.yml').source;
+  const build = jobSource(source, 'build');
+
+  assert.match(
+    source,
+    /artifact-build-command:\n\s+type: string\n\s+default: ''/,
+    'preview callers must be able to provide a distinct production artifact build',
+  );
+
+  const ciIndex = build.indexOf('run: ${{ inputs.check-command }}');
+  const artifactIndex = build.indexOf('run: ${{ inputs.artifact-build-command }}');
+  const uploadIndex = build.indexOf('name: Upload preview version');
+
+  assert.ok(ciIndex >= 0, 'preview gate must retain the repository CI command');
+  assert.ok(artifactIndex > ciIndex, 'production artifact build must run after CI');
+  assert.ok(uploadIndex > artifactIndex, 'production artifact build must run immediately before upload');
+});
