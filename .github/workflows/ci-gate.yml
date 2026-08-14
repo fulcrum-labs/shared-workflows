@@ -109,6 +109,11 @@ jobs:
             rm -rf "$HOME/setup-pnpm"
           fi
 
+          # Persistent runners can retain a user-level pnpm store-dir from a
+          # prior runner instance. Keep cache discovery and install on this
+          # job's current RUNNER_TEMP without mutating persistent config.
+          echo "NPM_CONFIG_STORE_DIR=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
+
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node-version }}
