@@ -97,6 +97,8 @@ jobs:
             rm -rf "$HOME/setup-pnpm"
           fi
 
+          echo "NPM_CONFIG_STORE_DIR=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
+
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node-version }}
