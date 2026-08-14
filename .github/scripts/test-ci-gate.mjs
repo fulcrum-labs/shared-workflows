@@ -108,6 +108,18 @@ test('remote cache network timeouts are bounded', () => {
   assert.match(workflow, /^\s+TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: '10'$/m);
 });
 
+test('pnpm cache discovery uses a store owned by the current runner job', () => {
+  const guardStart = workflow.indexOf('      - name: Guard pnpm runner isolation');
+  const setupNodeStart = workflow.indexOf('      - uses: actions/setup-node@v5', guardStart);
+  const guardStep = workflow.slice(guardStart, setupNodeStart);
+
+  assert.ok(guardStart >= 0 && setupNodeStart > guardStart, 'pnpm isolation guard must precede setup-node');
+  assert.match(
+    guardStep,
+    /echo "NPM_CONFIG_STORE_DIR=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
+  );
+});
+
 test('non-container scanner jobs use the self-hosted fleet safely', () => {
   const jobNames = ['docs-lint', 'gitleaks', 'grype'];
   const jobStarts = new Map(

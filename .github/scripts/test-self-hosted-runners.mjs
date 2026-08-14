@@ -63,6 +63,26 @@ test('workflows that run in THIS public repo never target the self-hosted fleet'
   );
 });
 
+test('every pnpm cache uses a store owned by the current runner job', () => {
+  let cacheJobCount = 0;
+  for (const [file, { jobs, source }] of workflows) {
+    for (const jobName of jobs) {
+      const job = jobSource(source, jobName);
+      if (!/cache: 'pnpm'/.test(job)) continue;
+      cacheJobCount += 1;
+      const setupNodeStart = job.indexOf('      - uses: actions/setup-node@v5');
+      const beforeSetupNode = job.slice(0, setupNodeStart);
+      assert.ok(setupNodeStart >= 0, `${file}:${jobName} pnpm cache must use setup-node`);
+      assert.match(
+        beforeSetupNode,
+        /echo "NPM_CONFIG_STORE_DIR=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
+        `${file}:${jobName} must isolate pnpm's store before setup-node cache discovery`,
+      );
+    }
+  }
+  assert.equal(cacheJobCount, 4, 'contract must cover every pnpm-cached reusable job');
+});
+
 test('preview gate rebuilds the upload artifact with the caller production command', () => {
   const source = workflows.get('preview-gate.yml').source;
   const build = jobSource(source, 'build');
