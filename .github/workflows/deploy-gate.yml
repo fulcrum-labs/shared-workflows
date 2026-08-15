@@ -107,7 +107,45 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Production build
+        env:
+          # The build is AUTHENTICATED, not just the deploy.
+          #
+          # Site configs branch on `CI && !CLOUDFLARE_API_TOKEN` to decide
+          # whether a build can reach Cloudflare: without a token they fall back
+          # to the node prerenderer and alias `cloudflare:workers` to a local
+          # TEST stub. That fallback is correct for the tokenless CI gate, whose
+          # artifact is discarded — and catastrophic here, where the artifact is
+          # what ships. casualcriminalist deployed that stub to production: its
+          # `env` proxies an empty object, so the live Worker saw NO bindings at
+          # all (SITE_DB undefined → every article route 500, listing pages
+          # rendered zero articles) while the build and the deploy both stayed
+          # green. Handing the build the same token the deploy already uses puts
+          # this job on the identical code path Cloudflare Builds takes for every
+          # other channel site.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
         run: ${{ inputs.build-command }}
+
+      # Belt and braces for the failure above: even with the token present, a
+      # test-only module must never reach a deployed Worker. `src/lib/testing/**`
+      # is the fleet's conventional home for those, so its appearance in the
+      # emitted server bundle fails the deploy LOUDLY instead of shipping a
+      # silently inert site. Skipped when a repo emits no dist/server (non-Astro
+      # callers) rather than failing them on a directory they never produce.
+      - name: Assert no test-only modules in the deployed bundle
+        run: |
+          set -euo pipefail
+          if [ ! -d dist/server ]; then
+            echo "No dist/server directory; skipping test-module assertion."
+            exit 0
+          fi
+          if grep -rlF 'src/lib/testing/' dist/server > /tmp/test-module-hits.txt 2>/dev/null; then
+            echo "::error::Test-only modules were bundled into the deployable Worker:"
+            cat /tmp/test-module-hits.txt
+            echo "The build took a tokenless/test code path. Do NOT deploy this artifact."
+            exit 1
+          fi
+          echo "OK: dist/server references no src/lib/testing/ module."
 
       - name: Install wrangler
         run: |
