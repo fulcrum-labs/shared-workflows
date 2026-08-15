@@ -124,7 +124,38 @@ jobs:
       # so replace that artifact before Wrangler discovers and uploads it.
       - name: Build production preview artifact
         if: inputs.artifact-build-command != ''
+        env:
+          # AUTHENTICATED, for the same reason deploy-gate's production build is
+          # (shared-workflows#32). This step exists precisely because a CI build
+          # omits production bindings — but rebuilding it tokenlessly reproduces
+          # the defect it is meant to repair: site configs branch on
+          # `CI && !CLOUDFLARE_API_TOKEN` and fall back to a local TEST stub for
+          # `cloudflare:workers`, whose `env` proxies an empty object. The
+          # uploaded preview then resolves no bindings at all, so reviewers see
+          # article routes 500 and listing pages render empty — a preview that
+          # cannot show the change under review. Same token the upload step uses.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_PREVIEW_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
         run: ${{ inputs.artifact-build-command }}
+
+      # Same invariant deploy-gate enforces: a test-only module in the artifact
+      # means the build took a tokenless path, and uploading it would publish a
+      # Worker with no bindings. Fail loudly instead.
+      - name: Assert no test-only modules in the preview artifact
+        if: inputs.artifact-build-command != ''
+        run: |
+          set -euo pipefail
+          if [ ! -d dist/server ]; then
+            echo "No dist/server directory; skipping test-module assertion."
+            exit 0
+          fi
+          if grep -rlF 'src/lib/testing/' dist/server > /tmp/preview-test-module-hits.txt 2>/dev/null; then
+            echo "::error::Test-only modules were bundled into the preview artifact:"
+            cat /tmp/preview-test-module-hits.txt
+            echo "The build took a tokenless/test code path. Do NOT upload this artifact."
+            exit 1
+          fi
+          echo "OK: dist/server references no src/lib/testing/ module."
 
       - name: Upload preview version
         id: upload
