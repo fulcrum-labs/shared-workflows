@@ -316,7 +316,9 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Gitleaks scan
-        run: gitleaks detect --source . --no-banner --redact
+        # --verbose prints each finding (file, line, rule, redacted value) so a red job is actionable
+        # without reproducing the scan locally; secrets stay redacted.
+        run: gitleaks detect --source . --no-banner --redact --verbose
 
   semgrep:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
@@ -339,6 +341,10 @@ jobs:
       - name: Semgrep scan
         env:
           PYTHONUSERBASE: ${{ runner.temp }}/semgrep-user
+          # semgrep-core (OCaml/Eio) defaults to the io_uring backend; on some self-hosted runner
+          # slots io_uring_queue_init fails with ENOMEM (memlock pressure) and the job dies with
+          # "Cannot allocate memory" before scanning anything. The POSIX backend needs no io_uring.
+          EIO_BACKEND: posix
         run: |
           semgrep scan \
             --config=p/security-audit \
