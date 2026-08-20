@@ -367,10 +367,13 @@ jobs:
           path: '.'
           fail-build: true
           severity-cutoff: high
-          # Keep the binary compatible with the current vulnerability DB
-          # schema and explicitly refresh restored data before every scan.
-          grype-version: v0.114.0
-          cache-db: true
+          # Do not restore the vulnerability DB from the Actions cache: on the self-hosted
+          # fleet the restored copy went stale and its refresh failed, so grype aborted with
+          # "the vulnerability database was built 1 week ago (max allowed age is 5 days)"
+          # before scanning anything (invoice-portal run 32390381477, forge-7, 2026-08-20).
+          # A fresh download per job is the fail-loud, always-current path.
+          grype-version: v0.117.0
+          cache-db: false
 
   trigger-cf-build:
     # Optional: after the gate passes, POST to the Workers Builds manual-trigger
