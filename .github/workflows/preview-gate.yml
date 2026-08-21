@@ -176,8 +176,10 @@ jobs:
           # kill the step at this assignment and skip the diagnostic below.
           urls=$(grep -Eo 'https://[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.workers\.dev[^ ]*' "$RUNNER_TEMP/preview-upload.log" | sort -u || true)
           if [ -z "$urls" ]; then
-            echo "::error::wrangler versions upload produced no preview URL — is preview_urls enabled in wrangler.toml?"
-            exit 1
+            # Private Workers (workers_dev/preview_urls disabled — e.g. finance apps) never emit a
+            # preview URL. The upload itself succeeded and IS the build gate; do not fail the PR —
+            # warn loudly and let the sticky comment say there is no URL to open.
+            echo "::warning::wrangler versions upload succeeded but produced no preview URL (preview_urls/workers_dev disabled for this Worker). The uploaded version is the build gate; nothing to open."
           fi
           {
             echo "urls<<URLS_EOF"
@@ -185,9 +187,13 @@ jobs:
             echo "URLS_EOF"
           } >> "$GITHUB_OUTPUT"
           {
-            echo "### Preview uploaded"
-            echo ""
-            echo "$urls" | sed 's/^/- /'
+            if [ -n "$urls" ]; then
+              echo "### Preview uploaded"
+              echo ""
+              echo "$urls" | sed 's/^/- /'
+            else
+              echo "### Preview version uploaded — no preview URL (preview_urls disabled)"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sticky preview comment
@@ -200,7 +206,14 @@ jobs:
             const marker = '<!-- self-hosted-preview -->'
             const urls = process.env.PREVIEW_URLS.trim().split('\n').filter(Boolean)
             const alias = urls.find(u => u.startsWith(`https://pr-${context.issue.number}-`))
-            const lines = [
+            const lines = urls.length === 0 ? [
+              marker,
+              '### Preview',
+              '',
+              `Commit \`${process.env.HEAD_SHA.slice(0, 12)}\`: version uploaded — no preview URL (preview_urls is disabled for this Worker).`,
+              '',
+              '_Uploaded as a Worker version — production traffic is untouched._',
+            ] : [
               marker,
               '### Preview',
               '',
