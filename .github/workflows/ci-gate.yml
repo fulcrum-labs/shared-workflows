@@ -106,7 +106,13 @@ jobs:
 
           if [ -e "$HOME/setup-pnpm" ]; then
             echo "::warning::Removing stale home-level pnpm setup from prior self-hosted jobs"
-            rm -rf "$HOME/setup-pnpm"
+            # Best-effort only. Concurrent jobs on the same self-hosted host share
+            # $HOME, so two runs can race this delete and rm exits non-zero with
+            # "Directory not empty" — which, under `bash -e`, failed the whole build.
+            # Correctness does not depend on this: PNPM_HOME is asserted to live under
+            # RUNNER_TEMP by the hard check above, so leftover $HOME state is unused.
+            rm -rf "$HOME/setup-pnpm" 2>/dev/null || \
+              echo "::warning::Could not fully remove $HOME/setup-pnpm (concurrent job on this host); continuing because PNPM_HOME is pinned under RUNNER_TEMP"
           fi
 
           # Persistent runners can retain a user-level pnpm store-dir from a
@@ -278,7 +284,13 @@ jobs:
 
           if [ -e "$HOME/setup-pnpm" ]; then
             echo "::warning::Removing stale home-level pnpm setup from prior self-hosted jobs"
-            rm -rf "$HOME/setup-pnpm"
+            # Best-effort only. Concurrent jobs on the same self-hosted host share
+            # $HOME, so two runs can race this delete and rm exits non-zero with
+            # "Directory not empty" — which, under `bash -e`, failed the whole build.
+            # Correctness does not depend on this: PNPM_HOME is asserted to live under
+            # RUNNER_TEMP by the hard check above, so leftover $HOME state is unused.
+            rm -rf "$HOME/setup-pnpm" 2>/dev/null || \
+              echo "::warning::Could not fully remove $HOME/setup-pnpm (concurrent job on this host); continuing because PNPM_HOME is pinned under RUNNER_TEMP"
           fi
 
           echo "NPM_CONFIG_STORE_DIR=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
