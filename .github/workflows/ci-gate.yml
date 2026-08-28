@@ -358,12 +358,51 @@ jobs:
           # "Cannot allocate memory" before scanning anything. The POSIX backend needs no io_uring.
           EIO_BACKEND: posix
         run: |
-          semgrep scan \
-            --config=p/security-audit \
-            --config=p/owasp-top-ten \
-            --config=p/typescript \
-            --error \
-            --severity=ERROR
+          # platform-foundations#528 (platform-request): semgrep-core (OCaml/Eio) opens
+          # one io_uring ring per parallel domain in Uring.create via
+          # Eio_linux.Domain_mgr.run. Every runner process on forge/atlas shares one uid
+          # under systemd's default RLIMIT_MEMLOCK (Max locked memory = 8388608, 8 MiB),
+          # so concurrent self-hosted jobs can exhaust that shared per-uid locked-memory
+          # budget and die with "Unix_error: Cannot allocate memory io_uring_queue_init"
+          # before scanning anything, even with EIO_BACKEND=posix above. --jobs 2 bounds
+          # the Eio domains (and rings) this run opens. The durable fix raises
+          # RLIMIT_MEMLOCK for the runner uid at the host level (tracked separately in
+          # platform-foundations#528); the retry below is the bounded workflow-level
+          # stopgap on top of it: at most one retry, and only for this exact memlock
+          # signature. Any other non-zero exit (real findings, config errors) fails
+          # immediately on the first attempt — this is not a fail-open retry.
+          set -uo pipefail
+
+          run_semgrep() {
+            semgrep scan \
+              --config=p/security-audit \
+              --config=p/owasp-top-ten \
+              --config=p/typescript \
+              --error \
+              --severity=ERROR \
+              --jobs 2 \
+              2>&1 | tee "$1"
+          }
+
+          log1="$RUNNER_TEMP/semgrep-attempt-1.log"
+          if run_semgrep "$log1"; then
+            exit 0
+          else
+            status=$?
+          fi
+
+          if ! grep -qE 'Unix_error:\s*Cannot allocate memory io_uring_queue_init' "$log1"; then
+            exit "$status"
+          fi
+
+          echo "semgrep: retried once after io_uring memlock exhaustion (see platform-foundations#528)"
+
+          log2="$RUNNER_TEMP/semgrep-attempt-2.log"
+          if run_semgrep "$log2"; then
+            exit 0
+          else
+            exit $?
+          fi
 
   grype:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
