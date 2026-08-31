@@ -29,6 +29,14 @@ on:
         type: string
         default: '4.94.0'
         description: 'Wrangler version installed into RUNNER_TEMP for the upload.'
+      preview-url-var-name:
+        type: string
+        default: ''
+        description: 'Optional. When set together with preview-url-host, inject a Wrangler var of this name (e.g. AUTH_RESOURCE) set to the computed per-PR preview URL, so origin-sensitive features (e.g. better-auth callbacks) resolve on the preview version. Empty (default) preserves prior behavior.'
+      preview-url-host:
+        type: string
+        default: ''
+        description: 'Optional. The <worker>.<subdomain>.workers.dev host suffix used to compute the injected preview URL (https://pr-<N>-<host>) for preview-url-var-name. Must match the Worker the preview alias uploads to.'
     secrets:
       CF_PREVIEW_API_TOKEN:
         required: true
@@ -170,12 +178,23 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PREVIEW_URL_VAR_NAME: ${{ inputs.preview-url-var-name }}
+          PREVIEW_URL_HOST: ${{ inputs.preview-url-host }}
         run: |
           set -o pipefail
-          "$WRANGLER_BIN" versions upload \
-            --preview-alias "pr-${PR_NUMBER}" \
-            --tag "${HEAD_SHA:0:12}" \
-            --message "commit=${HEAD_SHA} pr=${PR_NUMBER} preview" \
+          upload_args=(
+            --preview-alias "pr-${PR_NUMBER}"
+            --tag "${HEAD_SHA:0:12}"
+            --message "commit=${HEAD_SHA} pr=${PR_NUMBER} preview"
+          )
+          # Optional: inject the computed per-PR preview URL as a Wrangler var (e.g.
+          # AUTH_RESOURCE) so origin-sensitive features (better-auth callbacks) resolve
+          # against this preview version. The URL is deterministic -- it is the same
+          # pr-<N>-<host> alias URL Cloudflare mints for the --preview-alias above.
+          if [ -n "${PREVIEW_URL_VAR_NAME}" ] && [ -n "${PREVIEW_URL_HOST}" ]; then
+            upload_args+=(--var "${PREVIEW_URL_VAR_NAME}:https://pr-${PR_NUMBER}-${PREVIEW_URL_HOST}")
+          fi
+          "$WRANGLER_BIN" versions upload "${upload_args[@]}" \
             2>&1 | tee "$RUNNER_TEMP/preview-upload.log"
 
           # `|| true`: the default shell runs with -e, so a no-match grep would
