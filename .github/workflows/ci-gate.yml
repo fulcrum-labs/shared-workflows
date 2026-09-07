@@ -209,6 +209,50 @@ jobs:
       # and was blocking PRs on transitive CVEs (e.g. basic-ftp via
       # @cloudflare/puppeteer) that the team had no near-term fix for.
 
+      # Workers SQLite (D1 and DO SQLite) caps LIKE/GLOB patterns at 50 bytes;
+      # a longer literal inside a CHECK constraint or trigger aborts every
+      # write to that table with "LIKE or GLOB pattern too complex", while the
+      # better-sqlite3 test harness keeps SQLite's 50000-byte default and stays
+      # green. Fronts migration 0072 took a Masthead action down this way on
+      # 2026-09-07 (KB d1-like-glob-pattern-50-byte-limit). A migration that
+      # was later rebuilt may opt out with the comment
+      # `-- d1-like-pattern-limit: superseded` on its own line.
+      - name: D1 LIKE/GLOB pattern length
+        run: |
+          node - <<'D1_PATTERN_SCAN'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const LIMIT = 50
+          const SKIP = new Set(['node_modules', '.git', 'dist', '.worktrees', '.wrangler', '.astro', 'build', 'coverage'])
+          const PATTERN = /\b(?:LIKE|GLOB)\s*'((?:[^']|'')*)'/gi
+          const offenders = []
+          let scanned = 0
+          const walk = (dir, underMigrations) => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (SKIP.has(entry.name)) continue
+              const full = path.join(dir, entry.name)
+              if (entry.isDirectory()) {
+                walk(full, underMigrations || entry.name === 'migrations')
+              } else if (underMigrations && entry.name.endsWith('.sql')) {
+                scanned += 1
+                const sql = fs.readFileSync(full, 'utf8')
+                if (/^\s*--\s*d1-like-pattern-limit:\s*superseded\s*$/m.test(sql)) continue
+                for (const match of sql.matchAll(PATTERN)) {
+                  const bytes = Buffer.byteLength(match[1], 'utf8')
+                  if (bytes > LIMIT) {
+                    const line = sql.slice(0, match.index).split('\n').length
+                    offenders.push(`${path.relative(process.cwd(), full)}:${line} pattern is ${bytes} bytes (limit ${LIMIT})`)
+                  }
+                }
+              }
+            }
+          }
+          walk(process.cwd(), false)
+          for (const offender of offenders) console.log(`::error::D1 LIKE/GLOB pattern too long — ${offender}`)
+          if (offenders.length > 0) process.exit(1)
+          console.log(`D1 LIKE/GLOB pattern length: ${scanned} migration file(s) scanned, none over ${LIMIT} bytes`)
+          D1_PATTERN_SCAN
+
       - name: Accessibility (axe-core)
         run: |
           if grep -q '"test:a11y"' package.json 2>/dev/null; then
