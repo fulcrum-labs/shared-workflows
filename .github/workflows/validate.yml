@@ -23,4 +23,4 @@ jobs:
           node-version: '24'
 
       - name: Reusable CI gate contract
-        run: node --test .github/scripts/test-ci-gate.mjs .github/scripts/test-self-hosted-runners.mjs
+        run: node --test .github/scripts/test-ci-gate.mjs .github/scripts/test-deploy-gate.mjs .github/scripts/test-self-hosted-runners.mjs

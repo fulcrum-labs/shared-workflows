@@ -180,3 +180,55 @@ jobs:
             echo "- commit: \`${COMMIT_SHA}\`"
             echo "- build: \`${BUILD_UUID}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Migrations that merge but never reach the live D1 ledger are a silent
+      # schema gap: deployed code queries columns that do not exist. Fronts hit
+      # this twice on 2026-09-07 (analytics 0006 skipped in the ledger while
+      # 0007/0008 were present; repo 0073/0074 merged and deployed against a
+      # database without their columns). Repos whose D1 publisher is suspended
+      # (.publication/d1-migrations.json) get a post-deploy check: every
+      # migration file in the repo and in every wrangler `migrations_dir` must
+      # have a ledger row, or the deploy run goes red with the missing names.
+      - name: D1 migration ledger tripwire
+        if: hashFiles('.publication/d1-migrations.json') != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+        run: |
+          DB_NAME="$(node -p "JSON.parse(require('fs').readFileSync('.publication/d1-migrations.json','utf8')).databaseName || ''")"
+          if [ -z "$DB_NAME" ]; then
+            echo "::error::.publication/d1-migrations.json has no databaseName" >&2
+            exit 1
+          fi
+          if ! "$WRANGLER_BIN" d1 execute "$DB_NAME" --remote --json \
+              --command "SELECT name FROM d1_migrations" > "$RUNNER_TEMP/d1-ledger.json"; then
+            echo "::error::D1 ledger read failed for $DB_NAME — CF_DEPLOY_API_TOKEN needs D1:Read on the account" >&2
+            exit 1
+          fi
+          D1_LEDGER_JSON="$RUNNER_TEMP/d1-ledger.json" node - <<'D1_LEDGER_TRIPWIRE'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const raw = JSON.parse(fs.readFileSync(process.env.D1_LEDGER_JSON, 'utf8'))
+          const rows = Array.isArray(raw) ? (raw[0]?.results ?? []) : (raw.results ?? [])
+          const ledger = new Set(rows.map((row) => String(row.name)))
+          const dirs = new Set()
+          if (fs.existsSync('migrations')) dirs.add('migrations')
+          for (const config of ['wrangler.toml', 'wrangler.jsonc', 'wrangler.json']) {
+            if (!fs.existsSync(config)) continue
+            const text = fs.readFileSync(config, 'utf8')
+            for (const match of text.matchAll(/migrations_dir\s*[=:]\s*["']([^"']+)["']/g)) {
+              if (fs.existsSync(match[1])) dirs.add(match[1])
+            }
+          }
+          const missing = []
+          let checked = 0
+          for (const dir of dirs) {
+            for (const file of fs.readdirSync(dir).filter((name) => name.endsWith('.sql')).sort()) {
+              checked += 1
+              if (!ledger.has(file)) missing.push(path.posix.join(dir, file))
+            }
+          }
+          for (const file of missing) console.log(`::error::D1 migration never applied to the live ledger — ${file}`)
+          if (missing.length > 0) process.exit(1)
+          console.log(`D1 migration ledger tripwire: ${checked} migration file(s) across ${dirs.size} dir(s), all present in the ledger (${ledger.size} rows)`)
+          D1_LEDGER_TRIPWIRE
