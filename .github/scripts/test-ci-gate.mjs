@@ -181,3 +181,49 @@ test('semgrep uses a pinned ephemeral pip install on the self-hosted fleet', () 
     'semgrep must preserve actionable scanner errors in the job log',
   );
 });
+
+test('the D1 LIKE/GLOB pattern length step rejects literals over 50 bytes in migrations', async () => {
+  const stepStart = workflow.indexOf('      - name: D1 LIKE/GLOB pattern length');
+  const stepEnd = workflow.indexOf('      - name: Accessibility (axe-core)', stepStart);
+  assert.ok(stepStart >= 0 && stepEnd > stepStart, 'pattern-length step must precede the axe step');
+  const step = workflow.slice(stepStart, stepEnd);
+  const scriptMatch = step.match(/node - <<'D1_PATTERN_SCAN'\n([\s\S]*?)\n\s*D1_PATTERN_SCAN/);
+  assert.ok(scriptMatch, 'the step must embed its scanner as a heredoc');
+  const script = scriptMatch[1].replace(/^ {10}/gm, '');
+
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const run = (files) => {
+    const root = mkdtempSync(join(tmpdir(), 'd1-pattern-'));
+    try {
+      for (const [rel, body] of Object.entries(files)) {
+        mkdirSync(join(root, rel, '..'), { recursive: true });
+        writeFileSync(join(root, rel), body);
+      }
+      return spawnSync(process.execPath, ['-'], { cwd: root, input: script, encoding: 'utf8' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const long = `NEW.id GLOB '${'[0-9a-f]'.repeat(8)}'`;
+
+  const clean = run({
+    'migrations/0001.sql': "CREATE TABLE t (email TEXT CHECK (email NOT LIKE '% %'));",
+    'src/notes.sql': `-- outside migrations: ${long}`,
+    'node_modules/x/migrations/0001.sql': long,
+  });
+  assert.equal(clean.status, 0, clean.stdout + clean.stderr);
+  assert.match(clean.stdout, /1 migration file\(s\) scanned/);
+
+  const dirty = run({ 'migrations/0002.sql': `CREATE TRIGGER g BEFORE INSERT ON t WHEN NOT (${long}) BEGIN SELECT 1; END;` });
+  assert.equal(dirty.status, 1);
+  assert.match(dirty.stdout, /::error::D1 LIKE\/GLOB pattern too long — migrations\/0002.sql:1 pattern is 64 bytes/);
+
+  const superseded = run({ 'migrations/0002.sql': `-- d1-like-pattern-limit: superseded\n${long}` });
+  assert.equal(superseded.status, 0, superseded.stdout + superseded.stderr);
+
+  const exactly50 = run({ 'migrations/0003.sql': `x LIKE '${'a'.repeat(50)}'` });
+  assert.equal(exactly50.status, 0, exactly50.stdout + exactly50.stderr);
+});
