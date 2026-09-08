@@ -5,7 +5,7 @@ on:
     inputs:
       node-version:
         type: string
-        default: '24'
+        default: '24.18.0'
       check-command:
         type: string
         default: 'pnpm run ci:local'
