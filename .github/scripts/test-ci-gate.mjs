@@ -7,6 +7,14 @@ const workflow = readFileSync(
   'utf8',
 );
 
+test('the reusable gate pins its default Node patch without latest-cache drift', () => {
+  assert.match(
+    workflow,
+    /node-version:\n        type: string\n        default: '24\.18\.0'/,
+  );
+  assert.doesNotMatch(workflow, /check-latest:/);
+});
+
 test('the reusable gate exposes optional signed Turbo cache configuration', () => {
   for (const input of [
     'turbo-cache-enabled:',
