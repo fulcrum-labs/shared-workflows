@@ -47,13 +47,12 @@ on:
 permissions:
   contents: read
 
-# Workflow-level so cancellations render as "cancelled" (gray) instead of
-# leaving a job-cancelled-mid-flight "failed" (red) run. Cancellations are
-# common on close+reopen, which is the workaround for slow first-webhook
-# delivery from Cloudflare Builds.
+# PR heads share a ref-keyed group so a newer candidate cancels stale work.
+# Main uses the immutable commit SHA: reruns reuse their original SHA/ref, and
+# must not be evicted from the group's single pending slot by a newer main push.
 concurrency:
-  group: ci-gate-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-gate-${{ github.repository }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   quality:

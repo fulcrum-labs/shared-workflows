@@ -15,6 +15,18 @@ test('the reusable gate pins its default Node patch without latest-cache drift',
   assert.doesNotMatch(workflow, /check-latest:/);
 });
 
+test('main push reruns keep a SHA-isolated concurrency group', () => {
+  assert.match(
+    workflow,
+    /group: ci-gate-\$\{\{ github\.repository \}\}-\$\{\{ github\.ref == 'refs\/heads\/main' && github\.sha \|\| github\.ref \}\}/,
+  );
+  assert.match(
+    workflow,
+    /cancel-in-progress: \$\{\{ github\.ref != 'refs\/heads\/main' \}\}/,
+  );
+  assert.doesNotMatch(workflow, /group: ci-gate-\$\{\{ github\.repository \}\}-\$\{\{ github\.ref \}\}/);
+});
+
 test('the reusable gate exposes optional signed Turbo cache configuration', () => {
   for (const input of [
     'turbo-cache-enabled:',
