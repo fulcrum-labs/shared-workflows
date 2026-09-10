@@ -33,14 +33,19 @@ function runTripwire(script, files, ledgerNames) {
   }
 }
 
-test('the ledger tripwire runs after the deploy, only for repos with a D1 publication contract', () => {
+test('the ledger tripwire blocks deployment after wrangler installation, only for repos with a D1 publication contract', () => {
+  const installStart = workflow.indexOf('      - name: Install wrangler');
   const deployStart = workflow.indexOf('      - name: Deploy with provenance');
   const tripwireStart = workflow.indexOf('      - name: D1 migration ledger tripwire');
-  assert.ok(deployStart >= 0 && tripwireStart > deployStart, 'tripwire must follow the deploy step');
-  const step = workflow.slice(tripwireStart);
+  assert.ok(installStart >= 0 && installStart < tripwireStart && tripwireStart < deployStart,
+    'wrangler installation and the D1 ledger tripwire must succeed before deployment');
+  const step = workflow.slice(tripwireStart, deployStart);
   assert.match(step, /if: hashFiles\('.publication\/d1-migrations.json'\) != ''/);
   assert.match(step, /d1 execute "\$DB_NAME" --remote --json/);
   assert.match(step, /CF_DEPLOY_API_TOKEN needs D1:Read/);
+  assert.doesNotMatch(step, /continue-on-error:|d1 migrations apply/, 'the ledger check must fail closed and never apply migrations');
+  assert.doesNotMatch(workflow.slice(deployStart), /if:.*(?:always|failure|cancelled)\(/,
+    'deployment must preserve the default success guard after a failed ledger check');
 });
 
 test('the ledger tripwire fails on migration files missing from the live ledger', () => {

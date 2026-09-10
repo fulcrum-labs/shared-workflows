@@ -162,33 +162,16 @@ jobs:
           "$WRANGLER_BIN" --version
           echo "WRANGLER_BIN=$WRANGLER_BIN" >> "$GITHUB_ENV"
 
-      - name: Deploy with provenance
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
-        run: |
-          COMMIT_SHA="$GITHUB_SHA"
-          printf "%s\n" "$COMMIT_SHA" | grep -Eq "^[0-9a-f]{40}$" \
-            || { echo "::error::invalid deploy commit SHA" >&2; exit 1; }
-          BUILD_UUID="actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          "$WRANGLER_BIN" deploy \
-            --tag "$COMMIT_SHA" \
-            --message "source=https://github.com/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA} build=${BUILD_UUID}"
-          {
-            echo "### Deployed"
-            echo ""
-            echo "- commit: \`${COMMIT_SHA}\`"
-            echo "- build: \`${BUILD_UUID}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
       # Migrations that merge but never reach the live D1 ledger are a silent
       # schema gap: deployed code queries columns that do not exist. Fronts hit
       # this twice on 2026-09-07 (analytics 0006 skipped in the ledger while
       # 0007/0008 were present; repo 0073/0074 merged and deployed against a
       # database without their columns). Repos whose D1 publisher is suspended
-      # (.publication/d1-migrations.json) get a post-deploy check: every
+      # (.publication/d1-migrations.json) get a pre-deploy check: every
       # migration file in the repo and in every wrangler `migrations_dir` must
-      # have a ledger row, or the deploy run goes red with the missing names.
+      # have a ledger row, or deployment is blocked with the missing names.
+      # Checking after deployment already shipped code against missing schema.
+      # This remains read-only: the suspended migration publisher is unchanged.
       - name: D1 migration ledger tripwire
         if: hashFiles('.publication/d1-migrations.json') != ''
         env:
@@ -232,3 +215,22 @@ jobs:
           if (missing.length > 0) process.exit(1)
           console.log(`D1 migration ledger tripwire: ${checked} migration file(s) across ${dirs.size} dir(s), all present in the ledger (${ledger.size} rows)`)
           D1_LEDGER_TRIPWIRE
+
+      - name: Deploy with provenance
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+        run: |
+          COMMIT_SHA="$GITHUB_SHA"
+          printf "%s\n" "$COMMIT_SHA" | grep -Eq "^[0-9a-f]{40}$" \
+            || { echo "::error::invalid deploy commit SHA" >&2; exit 1; }
+          BUILD_UUID="actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          "$WRANGLER_BIN" deploy \
+            --tag "$COMMIT_SHA" \
+            --message "source=https://github.com/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA} build=${BUILD_UUID}"
+          {
+            echo "### Deployed"
+            echo ""
+            echo "- commit: \`${COMMIT_SHA}\`"
+            echo "- build: \`${BUILD_UUID}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
