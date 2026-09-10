@@ -451,15 +451,22 @@ jobs:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     # anchore/scan-action@v7.4.0 runs 'grype dir:.' (binary download, no Docker required)
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 10
+    # Two scan passes now (SARIF + table below) instead of one; 10m was tight
+    # even for a single fresh-DB pull.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
-      - name: Grype vulnerability scan
+      - name: Grype vulnerability scan (SARIF)
         uses: anchore/scan-action@v7.4.0
         with:
           path: '.'
-          fail-build: true
+          # This step only produces the SARIF artifact retained below; the
+          # table step further down is what gates the job. fail-build: false
+          # here so a real scan failure (non-"vulnerabilities found" exit)
+          # still fails this step without double-failing the job on findings
+          # alone.
+          fail-build: false
           severity-cutoff: high
           # Do not restore the vulnerability DB from the Actions cache: on the self-hosted
           # fleet the restored copy went stale and its refresh failed, so grype aborted with
@@ -468,6 +475,35 @@ jobs:
           # A fresh download per job is the fail-loud, always-current path.
           grype-version: v0.117.0
           cache-db: false
+          output-format: sarif
+          output-file: grype-results.sarif
+
+      - name: Grype vulnerability scan (findings table)
+        # Re-runs the same scan with a human-readable table. anchore/scan-action
+        # prints table output back into the job log (it does not for
+        # sarif/json — those go to a file only), so a failure here names the
+        # package, installed version, advisory and fixed version directly in
+        # the log. Before this step, that gap left GHSA-26w7-cxv4-gfx2 (astro
+        # RCE, 2026-09-10) unnamed across the fleet for two days — the SARIF
+        # was written to an unretained temp file and code scanning is off on
+        # most repos, so the only way to learn the CVE was rerunning grype
+        # locally. This step is the one that actually fails the job.
+        uses: anchore/scan-action@v7.4.0
+        with:
+          path: '.'
+          fail-build: true
+          severity-cutoff: high
+          grype-version: v0.117.0
+          cache-db: false
+          output-format: table
+
+      - name: Upload grype SARIF
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: grype-sarif
+          path: grype-results.sarif
+          retention-days: 7
 
   trigger-cf-build:
     # Optional: after the gate passes, POST to the Workers Builds manual-trigger
