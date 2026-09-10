@@ -13,6 +13,10 @@ name: Deploy Gate (Reusable)
 on:
   workflow_call:
     inputs:
+      runner-labels:
+        type: string
+        default: '["self-hosted","Linux","X64"]'
+        description: 'Optional JSON array of runner labels. Every job uses the selected fleet.'
       node-version:
         type: string
         default: '24'
@@ -45,7 +49,7 @@ concurrency:
 jobs:
   deploy:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     environment: production
     timeout-minutes: 30
     steps:

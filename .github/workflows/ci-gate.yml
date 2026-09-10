@@ -3,6 +3,10 @@ name: CI Gate (Reusable)
 on:
   workflow_call:
     inputs:
+      runner-labels:
+        type: string
+        default: '["self-hosted","Linux","X64"]'
+        description: 'Optional JSON array of runner labels. Every job uses the selected fleet.'
       node-version:
         type: string
         default: '24.18.0'
@@ -57,7 +61,7 @@ concurrency:
 jobs:
   quality:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
@@ -281,7 +285,7 @@ jobs:
   docs-lint:
     if: ${{ inputs.docs-lint-enabled }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
@@ -355,7 +359,7 @@ jobs:
 
   gitleaks:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
@@ -379,7 +383,7 @@ jobs:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     # S10/D3: pip installation removes the runner's Docker dependency. Keep the
     # user base in RUNNER_TEMP so self-hosted jobs cannot leak packages across runs.
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -450,7 +454,7 @@ jobs:
   grype:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     # anchore/scan-action@v7.4.0 runs 'grype dir:.' (binary download, no Docker required)
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -481,7 +485,7 @@ jobs:
       inputs.cf-account-id != ''
     needs: [quality, gitleaks, semgrep, grype]
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 3
     steps:
       - name: Manually trigger Cloudflare Workers build

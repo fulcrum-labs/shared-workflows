@@ -26,14 +26,28 @@ function jobSource(source, jobName) {
   return source.slice(start, end);
 }
 
-test('all shared-workflow compute defaults to the self-hosted runner fleet', () => {
+test('shared compute preserves the default fleet and honors caller runner labels on every job', () => {
   for (const [file, { jobs, source }] of workflows) {
+    const configurable = file !== 'd1-migrations-apply.yml';
+    if (configurable) {
+      const input = source.match(
+        /^      runner-labels:\n        type: string\n        default: '([^']+)'/m,
+      );
+      assert.ok(input, `${file} must accept optional JSON runner labels`);
+      assert.deepEqual(
+        JSON.parse(input[1]),
+        ['self-hosted', 'Linux', 'X64'],
+        `${file} must preserve the existing fleet when a caller omits runner labels`,
+      );
+    }
     for (const jobName of jobs) {
       const job = jobSource(source, jobName);
       assert.match(
         job,
-        /^    runs-on: \[self-hosted, Linux, X64\]$/m,
-        `${file}:${jobName} must default to the self-hosted fleet`,
+        configurable
+          ? /^    runs-on: \$\{\{ fromJSON\(inputs\.runner-labels\) \}\}$/m
+          : /^    runs-on: \[self-hosted, Linux, X64\]$/m,
+        `${file}:${jobName} must honor the caller's selected fleet`,
       );
       assert.match(
         job,
