@@ -162,11 +162,16 @@ test('the gate is inert unless the caller names a required journey check', () =>
   assert.match(workflow, /^      required-journey-check:\n        type: string\n        default: ''$/m);
 });
 
-test('the deploy job holds the pull-requests and checks reads the gate needs', () => {
+test('the gate declares no permissions of its own, so one pin serves both shapes of caller', () => {
+  // A reusable workflow that omits `permissions` inherits the caller job's
+  // token scopes verbatim. Declaring the journey gate's wider set here would
+  // push `pull-requests: read` + `checks: read` at every existing caller that
+  // grants only `contents: read` -- which is the whole fleet's deploy path.
+  assert.ok(!/^permissions:$/m.test(workflow), 'no workflow-level permissions block');
   const job = workflow.slice(workflow.indexOf('  deploy:'), workflow.indexOf('    steps:'));
-  for (const scope of ['contents: read', 'pull-requests: read', 'checks: read']) {
-    assert.ok(job.includes(scope), `deploy job permissions must include ${scope}`);
-  }
+  assert.ok(!job.includes('permissions:'), 'no job-level permissions block');
+  assert.match(workflow, /MUST grant `pull-requests: read` and\n\s+`checks: read`/,
+    'the input description must tell callers which scopes to grant');
 });
 
 test('a green journey run on the originating PR head lets the deploy proceed', async () => {
