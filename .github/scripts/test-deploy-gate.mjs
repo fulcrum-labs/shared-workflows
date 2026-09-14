@@ -69,3 +69,188 @@ test('the ledger tripwire fails on migration files missing from the live ledger'
   assert.match(drifted.stdout, /never applied to the live ledger — node_modules\/@growth-labs\/analytics\/migrations\/0006_identity.sql/);
   assert.doesNotMatch(drifted.stdout, /0073_a.sql/);
 });
+
+// ─── Risk-matched journey gate (operating-baseline B-03) ───
+//
+// The gate's whole value is that it REFUSES. These tests run the actual
+// github-script body extracted from the workflow against a stub Octokit, so a
+// future edit that turns a refusal into a pass fails here rather than in
+// production four and a half hours after every member starts seeing 500s.
+
+function extractJourneyGateScript() {
+  const marker = '          script: |\n';
+  const start = workflow.indexOf(marker);
+  assert.ok(start >= 0, 'the journey gate must embed a github-script body');
+  const lines = [];
+  for (const line of workflow.slice(start + marker.length).split('\n')) {
+    if (line.trim() !== '' && !line.startsWith('            ')) break;
+    lines.push(line.slice(12));
+  }
+  return lines.join('\n');
+}
+
+const journeyGateScript = extractJourneyGateScript();
+
+function stubCore() {
+  const state = { failed: null, errors: [], warnings: [], summary: [] };
+  const summary = {
+    addHeading(text) { state.summary.push(text); return summary; },
+    addRaw(text) { state.summary.push(text); return summary; },
+    async write() { return summary; },
+  };
+  return {
+    state,
+    core: {
+      summary,
+      error: (message) => state.errors.push(message),
+      warning: (message) => state.warnings.push(message),
+      info: () => {},
+      setFailed: (message) => { state.failed = message; },
+    },
+  };
+}
+
+async function runJourneyGate({ env, pulls = [], checkRuns = [] }) {
+  const { state, core } = stubCore();
+  const github = {
+    rest: {
+      repos: { listPullRequestsAssociatedWithCommit: 'pulls' },
+      checks: { listForRef: 'checks' },
+    },
+    async paginate(route) {
+      return route === 'pulls' ? pulls : checkRuns;
+    },
+  };
+  const context = { repo: { owner: 'fulcrum-labs', repo: 'fronts' } };
+  const previous = process.env;
+  process.env = { ...previous, ...env };
+  try {
+    const run = new Function(
+      'github', 'context', 'core',
+      `return (async () => {${journeyGateScript}})()`,
+    );
+    await run(github, context, core);
+  } finally {
+    process.env = previous;
+  }
+  return state;
+}
+
+const GATE_ENV = {
+  DEPLOY_SHA: 'a'.repeat(40),
+  REQUIRED_CHECK: 'Fronts preview journeys',
+  OVERRIDE_REASON: '',
+};
+const mergedPr = {
+  number: 42,
+  merged_at: '2026-09-14T20:00:00Z',
+  head: { sha: 'b'.repeat(40) },
+};
+
+test('the journey gate runs before the production build, so a failing journey costs no fleet minutes', () => {
+  const gateStart = workflow.indexOf('      - name: Preview journeys gate');
+  const checkoutStart = workflow.indexOf('      - uses: actions/checkout@v5');
+  const buildStart = workflow.indexOf('      - name: Production build');
+  assert.ok(gateStart >= 0, 'deploy-gate must carry the preview journeys gate');
+  assert.ok(gateStart < checkoutStart, 'the gate must refuse before the repo is even checked out');
+  assert.ok(checkoutStart < buildStart);
+});
+
+test('the gate is inert unless the caller names a required journey check', () => {
+  const gate = workflow.slice(workflow.indexOf('      - name: Preview journeys gate'));
+  assert.match(gate, /^\s+if: inputs\.required-journey-check != ''$/m);
+  assert.match(workflow, /^      required-journey-check:\n        type: string\n        default: ''$/m);
+});
+
+test('the deploy job holds the pull-requests and checks reads the gate needs', () => {
+  const job = workflow.slice(workflow.indexOf('  deploy:'), workflow.indexOf('    steps:'));
+  for (const scope of ['contents: read', 'pull-requests: read', 'checks: read']) {
+    assert.ok(job.includes(scope), `deploy job permissions must include ${scope}`);
+  }
+});
+
+test('a green journey run on the originating PR head lets the deploy proceed', async () => {
+  const state = await runJourneyGate({
+    env: GATE_ENV,
+    pulls: [mergedPr],
+    checkRuns: [{
+      status: 'completed',
+      conclusion: 'success',
+      completed_at: '2026-09-14T19:50:00Z',
+      html_url: 'https://github.com/fulcrum-labs/fronts/runs/1',
+    }],
+  });
+  assert.equal(state.failed, null);
+  assert.equal(state.errors.length, 0);
+});
+
+test('a failed journey run refuses the deploy and names the run', async () => {
+  const state = await runJourneyGate({
+    env: GATE_ENV,
+    pulls: [mergedPr],
+    checkRuns: [{
+      status: 'completed',
+      conclusion: 'failure',
+      completed_at: '2026-09-14T19:50:00Z',
+      html_url: 'https://github.com/fulcrum-labs/fronts/runs/1',
+      output: { title: 'member-video failed', summary: 'playback never started' },
+    }],
+  });
+  assert.ok(state.failed, 'a failed journey must fail the deploy');
+  assert.match(state.errors.join('\n'), /concluded \*\*failure\*\*/);
+  assert.match(state.errors.join('\n'), /runs\/1/);
+});
+
+test('the newest completed journey run decides, not the first one listed', async () => {
+  const state = await runJourneyGate({
+    env: GATE_ENV,
+    pulls: [mergedPr],
+    checkRuns: [
+      { status: 'completed', conclusion: 'success', completed_at: '2026-09-14T18:00:00Z', html_url: 'https://x/1' },
+      { status: 'completed', conclusion: 'failure', completed_at: '2026-09-14T19:00:00Z', html_url: 'https://x/2' },
+    ],
+  });
+  assert.ok(state.failed, 'the latest run failed, so the deploy must refuse');
+});
+
+test('journeys that never completed refuse the deploy rather than letting it outrun the gate', async () => {
+  const state = await runJourneyGate({
+    env: GATE_ENV,
+    pulls: [mergedPr],
+    checkRuns: [{ status: 'in_progress', conclusion: null }],
+  });
+  assert.ok(state.failed);
+  assert.match(state.errors.join('\n'), /no completed run/);
+});
+
+test('a commit with no merged pull request cannot deploy a member-facing site', async () => {
+  const state = await runJourneyGate({ env: GATE_ENV, pulls: [], checkRuns: [] });
+  assert.ok(state.failed);
+  assert.match(state.errors.join('\n'), /No merged pull request/);
+});
+
+test('an unmerged associated pull request does not satisfy the gate', async () => {
+  const state = await runJourneyGate({
+    env: GATE_ENV,
+    pulls: [{ number: 7, merged_at: null, head: { sha: 'c'.repeat(40) } }],
+    checkRuns: [{ status: 'completed', conclusion: 'success', completed_at: '2026-09-14T19:00:00Z' }],
+  });
+  assert.ok(state.failed);
+  assert.match(state.errors.join('\n'), /No merged pull request/);
+});
+
+test('an override reason bypasses the gate loudly and never silently', async () => {
+  const state = await runJourneyGate({
+    env: { ...GATE_ENV, OVERRIDE_REASON: 'incident 2026-09-14: revert the 500' },
+    pulls: [],
+    checkRuns: [],
+  });
+  assert.equal(state.failed, null, 'an explicit override must let the deploy through');
+  assert.match(state.warnings.join('\n'), /overridden: incident 2026-09-14/);
+  assert.match(state.summary.join('\n'), /BYPASSED/);
+});
+
+test('the override input exists only for callers to wire from workflow_dispatch', () => {
+  assert.match(workflow, /^      journeys-override-reason:\n        type: string\n        default: ''$/m);
+  assert.match(workflow, /never from the push\/workflow_run path/);
+});
