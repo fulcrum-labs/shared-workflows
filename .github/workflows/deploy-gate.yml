@@ -32,6 +32,19 @@ on:
         type: string
         default: '4.94.0'
         description: 'Wrangler version installed into RUNNER_TEMP for the deploy.'
+      config-path:
+        type: string
+        default: ''
+        description: >-
+          Wrangler config file, relative to the repository root, for a Worker
+          that does not live at the root. Empty (default) leaves the command
+          byte-identical to before: wrangler discovers the nearest ./wrangler.*
+          from the working directory, which is what every existing caller
+          relies on. Set it for a monorepo whose deployable Worker is in a
+          subdirectory (e.g. 'apps/masthead/wrangler.toml'); wrangler resolves
+          `main` and every other path in the file relative to the FILE's
+          directory, not to the working directory, so the build command still
+          runs from the root as usual.
       required-journey-check:
         type: string
         default: ''
@@ -362,14 +375,31 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+          # Read through env, never interpolated into the script body, so a
+          # caller's value is data and can never become shell.
+          CONFIG_PATH: ${{ inputs.config-path }}
         run: |
           COMMIT_SHA="$GITHUB_SHA"
           printf "%s\n" "$COMMIT_SHA" | grep -Eq "^[0-9a-f]{40}$" \
             || { echo "::error::invalid deploy commit SHA" >&2; exit 1; }
           BUILD_UUID="actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          "$WRANGLER_BIN" deploy \
-            --tag "$COMMIT_SHA" \
+          # Unset config-path appends nothing, so the command every existing
+          # caller runs is unchanged. Set-but-missing fails HERE with the path
+          # named, rather than letting wrangler fall back to discovery and
+          # deploy some other Worker under this repo's provenance annotations.
+          DEPLOY_ARGS=(deploy)
+          if [ -n "${CONFIG_PATH:-}" ]; then
+            [ -f "$CONFIG_PATH" ] || {
+              echo "::error::config-path '$CONFIG_PATH' does not exist in this repository" >&2
+              exit 1
+            }
+            DEPLOY_ARGS+=(--config "$CONFIG_PATH")
+          fi
+          DEPLOY_ARGS+=(
+            --tag "$COMMIT_SHA"
             --message "source=https://github.com/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA} build=${BUILD_UUID}"
+          )
+          "$WRANGLER_BIN" "${DEPLOY_ARGS[@]}"
           {
             echo "### Deployed"
             echo ""
