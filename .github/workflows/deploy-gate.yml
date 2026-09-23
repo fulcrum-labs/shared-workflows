@@ -706,10 +706,20 @@ jobs:
           # newest deployment, so the summary can show the rollback target by
           # commit sha, not just by opaque version id.
           echo '{}' > "$RUNNER_TEMP/live-version-tags.json"
-          version_ids="$(node -p "
-            const d = JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/live-deployments.json','utf8')).result?.deployments ?? []
-            const newest = [...d].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))[0]
-            (newest?.versions ?? []).map((v) => v.version_id).join('\n')
+          # version_id is API-sourced data, not a literal -- read the deployments
+          # path through env, never interpolated into the script body, same rule
+          # as the version-tag script below.
+          #
+          # Every statement is semicolon-terminated. Without it, ASI does not
+          # break a statement before a line starting with `(`: the array-sort
+          # result (`)[0]`) would otherwise be parsed as a call --
+          # `...[0](newest?.versions ...)` -- reading `newest` inside its own
+          # initializer (ReferenceError, TDZ). See growth-labs/publishing run
+          # 35916382952 and .github/scripts/test-deploy-gate.mjs.
+          version_ids="$(DEPLOYMENTS_JSON="$RUNNER_TEMP/live-deployments.json" node -p "
+            const d = JSON.parse(require('fs').readFileSync(process.env.DEPLOYMENTS_JSON, 'utf8')).result?.deployments ?? [];
+            const newest = [...d].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))[0];
+            (newest?.versions ?? []).map((v) => v.version_id).join('\n');
           ")"
           if [ -n "$version_ids" ]; then
             while IFS= read -r version_id; do

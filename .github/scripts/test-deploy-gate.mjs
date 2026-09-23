@@ -8,7 +8,10 @@ import { test } from 'node:test';
 const workflow = readFileSync(new URL('../workflows/deploy-gate.yml', import.meta.url), 'utf8');
 
 function extractHeredoc(step, marker) {
-  const match = step.match(new RegExp(`node - <<'${marker}'\\n([\\s\\S]*?)\\n\\s*${marker}`));
+  // `[^\n]*` tolerates trailing shell after the closing quote on the opener
+  // line (e.g. BINDING_DIFF's `node - <<'BINDING_DIFF' | tee -a "$GITHUB_STEP_SUMMARY"`),
+  // not just a bare heredoc redirect.
+  const match = step.match(new RegExp(`node - <<'${marker}'[^\\n]*\\n([\\s\\S]*?)\\n\\s*${marker}`));
   assert.ok(match, `${marker} heredoc must be embedded in the step`);
   return match[1].replace(/^ {10}/gm, '');
 }
@@ -40,7 +43,14 @@ test('the ledger tripwire blocks deployment after wrangler installation, only fo
   assert.ok(installStart >= 0 && installStart < tripwireStart && tripwireStart < deployStart,
     'wrangler installation and the D1 ledger tripwire must succeed before deployment');
   const step = workflow.slice(tripwireStart, deployStart);
-  assert.match(step, /if: hashFiles\('.publication\/d1-migrations.json'\) != ''/);
+  // #52 made the ledger contract path app-directory-aware for monorepo
+  // callers (M2-14): under `<app-directory>/.publication/d1-migrations.json`
+  // when set, and unchanged at the repo root when app-directory is empty --
+  // so an existing single-app caller's condition is byte-identical to before.
+  assert.match(
+    step,
+    /if: hashFiles\(inputs\.app-directory != '' && format\('\{0\}\/\.publication\/d1-migrations\.json', inputs\.app-directory\) \|\| '\.publication\/d1-migrations\.json'\) != ''/,
+  );
   assert.match(step, /d1 execute "\$DB_NAME" --remote --json/);
   assert.match(step, /CF_DEPLOY_API_TOKEN needs D1:Read/);
   assert.doesNotMatch(step, /continue-on-error:|d1 migrations apply/, 'the ledger check must fail closed and never apply migrations');
@@ -110,15 +120,27 @@ function stubCore() {
   };
 }
 
-async function runJourneyGate({ env, pulls = [], checkRuns = [] }) {
+// #52 added a SECOND `checks.listForRef` call (on the deployed commit itself,
+// checked before the pull-request-head fallback -- see the script's own
+// comment on "stronger evidence than a PR preview"). The real Octokit
+// paginate() is called with {ref, ...} and returns only check runs that
+// exist for that exact ref; a run on the PR's head sha never appears when
+// querying the deployed commit's sha, and vice versa. The stub must model
+// that per-ref scoping -- checkRunsBySha keyed by the ref -- not return one
+// undifferentiated list for every `checks.listForRef` call regardless of
+// which ref was queried. (A flat `checkRuns` list previously let a fixture
+// written for an unrelated PR's head leak into the new deploy-sha lookup;
+// see the "unmerged associated pull request" test below.)
+async function runJourneyGate({ env, pulls = [], checkRunsBySha = {} }) {
   const { state, core } = stubCore();
   const github = {
     rest: {
       repos: { listPullRequestsAssociatedWithCommit: 'pulls' },
       checks: { listForRef: 'checks' },
     },
-    async paginate(route) {
-      return route === 'pulls' ? pulls : checkRuns;
+    async paginate(route, params) {
+      if (route === 'pulls') return pulls;
+      return checkRunsBySha[params.ref] ?? [];
     },
   };
   const context = { repo: { owner: 'fulcrum-labs', repo: 'fronts' } };
@@ -156,9 +178,11 @@ test('the journey gate runs before the production build, so a failing journey co
   assert.ok(checkoutStart < buildStart);
 });
 
-test('the gate is inert unless the caller names a required journey check', () => {
+test('the gate is inert unless the caller names a required journey check, and is skipped on a read-only dry-run', () => {
+  // #52 added `&& !inputs.dry-run`: a dry-run never deploys, so gating it on
+  // journeys would refuse read-only diffs for no safety benefit.
   const gate = workflow.slice(workflow.indexOf('      - name: Preview journeys gate'));
-  assert.match(gate, /^\s+if: inputs\.required-journey-check != ''$/m);
+  assert.match(gate, /^\s+if: inputs\.required-journey-check != '' && !inputs\.dry-run$/m);
   assert.match(workflow, /^      required-journey-check:\n        type: string\n        default: ''$/m);
 });
 
@@ -170,36 +194,62 @@ test('the gate declares no permissions of its own, so one pin serves both shapes
   assert.ok(!/^permissions:$/m.test(workflow), 'no workflow-level permissions block');
   const job = workflow.slice(workflow.indexOf('  deploy:'), workflow.indexOf('    steps:'));
   assert.ok(!job.includes('permissions:'), 'no job-level permissions block');
-  assert.match(workflow, /MUST grant `pull-requests: read` and\n\s+`checks: read`/,
-    'the input description must tell callers which scopes to grant');
+  // #52 reworded the description around the new deployed-commit-first lookup.
+  assert.match(
+    workflow,
+    /A caller that sets this MUST grant\n\s+`pull-requests: read` and `checks: read` alongside `contents: read`\n\s+on its calling job\./,
+    'the input description must tell callers which scopes to grant',
+  );
 });
 
-test('a green journey run on the originating PR head lets the deploy proceed', async () => {
+test('a green journey run on the originating PR head lets the deploy proceed (deployed-commit lookup empty, falls back to PR head)', async () => {
   const state = await runJourneyGate({
     env: GATE_ENV,
     pulls: [mergedPr],
-    checkRuns: [{
-      status: 'completed',
-      conclusion: 'success',
-      completed_at: '2026-09-14T19:50:00Z',
-      html_url: 'https://github.com/fulcrum-labs/fronts/runs/1',
-    }],
+    checkRunsBySha: {
+      [mergedPr.head.sha]: [{
+        status: 'completed',
+        conclusion: 'success',
+        completed_at: '2026-09-14T19:50:00Z',
+        html_url: 'https://github.com/fulcrum-labs/fronts/runs/1',
+      }],
+    },
   });
   assert.equal(state.failed, null);
   assert.equal(state.errors.length, 0);
+});
+
+test('a green journey run directly on the deployed commit lets the deploy proceed, without ever consulting the pull request (#52 deployed-commit-first lookup)', async () => {
+  const state = await runJourneyGate({
+    env: GATE_ENV,
+    pulls: [],
+    checkRunsBySha: {
+      [GATE_ENV.DEPLOY_SHA]: [{
+        status: 'completed',
+        conclusion: 'success',
+        completed_at: '2026-09-14T19:50:00Z',
+        html_url: 'https://github.com/fulcrum-labs/fronts/runs/2',
+      }],
+    },
+  });
+  assert.equal(state.failed, null);
+  assert.equal(state.errors.length, 0);
+  assert.match(state.summary.join('\n'), /deployed commit/);
 });
 
 test('a failed journey run refuses the deploy and names the run', async () => {
   const state = await runJourneyGate({
     env: GATE_ENV,
     pulls: [mergedPr],
-    checkRuns: [{
-      status: 'completed',
-      conclusion: 'failure',
-      completed_at: '2026-09-14T19:50:00Z',
-      html_url: 'https://github.com/fulcrum-labs/fronts/runs/1',
-      output: { title: 'member-video failed', summary: 'playback never started' },
-    }],
+    checkRunsBySha: {
+      [mergedPr.head.sha]: [{
+        status: 'completed',
+        conclusion: 'failure',
+        completed_at: '2026-09-14T19:50:00Z',
+        html_url: 'https://github.com/fulcrum-labs/fronts/runs/1',
+        output: { title: 'member-video failed', summary: 'playback never started' },
+      }],
+    },
   });
   assert.ok(state.failed, 'a failed journey must fail the deploy');
   assert.match(state.errors.join('\n'), /concluded \*\*failure\*\*/);
@@ -210,10 +260,12 @@ test('the newest completed journey run decides, not the first one listed', async
   const state = await runJourneyGate({
     env: GATE_ENV,
     pulls: [mergedPr],
-    checkRuns: [
-      { status: 'completed', conclusion: 'success', completed_at: '2026-09-14T18:00:00Z', html_url: 'https://x/1' },
-      { status: 'completed', conclusion: 'failure', completed_at: '2026-09-14T19:00:00Z', html_url: 'https://x/2' },
-    ],
+    checkRunsBySha: {
+      [mergedPr.head.sha]: [
+        { status: 'completed', conclusion: 'success', completed_at: '2026-09-14T18:00:00Z', html_url: 'https://x/1' },
+        { status: 'completed', conclusion: 'failure', completed_at: '2026-09-14T19:00:00Z', html_url: 'https://x/2' },
+      ],
+    },
   });
   assert.ok(state.failed, 'the latest run failed, so the deploy must refuse');
 });
@@ -222,23 +274,41 @@ test('journeys that never completed refuse the deploy rather than letting it out
   const state = await runJourneyGate({
     env: GATE_ENV,
     pulls: [mergedPr],
-    checkRuns: [{ status: 'in_progress', conclusion: null }],
+    checkRunsBySha: { [mergedPr.head.sha]: [{ status: 'in_progress', conclusion: null }] },
   });
   assert.ok(state.failed);
   assert.match(state.errors.join('\n'), /no completed run/);
 });
 
 test('a commit with no merged pull request cannot deploy a member-facing site', async () => {
-  const state = await runJourneyGate({ env: GATE_ENV, pulls: [], checkRuns: [] });
+  const state = await runJourneyGate({ env: GATE_ENV, pulls: [] });
   assert.ok(state.failed);
   assert.match(state.errors.join('\n'), /No merged pull request/);
 });
 
-test('an unmerged associated pull request does not satisfy the gate', async () => {
+// Root-caused 2026-09-23: this test failed after #52 added the
+// deployed-commit-first `checks.listForRef` lookup, because the OLD stub
+// returned one undifferentiated `checkRuns` list for every `checks.listForRef`
+// call regardless of which `ref` was queried -- so a fixture written to
+// represent a check run on this UNMERGED PR's head sha (never meant to be
+// reachable, since the pre-#52 script only consulted checkRuns after
+// confirming a merge) got misread as a run on the DEPLOYED commit itself,
+// letting the gate pass before it ever reached the merge check. That was a
+// test-double gap, not a gate bug: the real deploy-gate.yml script (and the
+// real Octokit paginate()) only returns check runs for the exact ref queried,
+// so a run on an unrelated PR's head can never satisfy a lookup scoped to the
+// deployed commit. checkRunsBySha now models that scoping -- the fixture
+// stays keyed to the unmerged PR's head sha, and the deployed commit's own
+// bucket is left empty, exactly as a real fresh commit with no check run of
+// its own would look -- and this asserts the success run is never consulted.
+test('an unmerged associated pull request does not satisfy the gate, and a success run on ITS head never leaks into the deployed-commit lookup', async () => {
+  const unmergedPr = { number: 7, merged_at: null, head: { sha: 'c'.repeat(40) } };
   const state = await runJourneyGate({
     env: GATE_ENV,
-    pulls: [{ number: 7, merged_at: null, head: { sha: 'c'.repeat(40) } }],
-    checkRuns: [{ status: 'completed', conclusion: 'success', completed_at: '2026-09-14T19:00:00Z' }],
+    pulls: [unmergedPr],
+    checkRunsBySha: {
+      [unmergedPr.head.sha]: [{ status: 'completed', conclusion: 'success', completed_at: '2026-09-14T19:00:00Z' }],
+    },
   });
   assert.ok(state.failed);
   assert.match(state.errors.join('\n'), /No merged pull request/);
@@ -248,7 +318,6 @@ test('an override reason bypasses the gate loudly and never silently', async () 
   const state = await runJourneyGate({
     env: { ...GATE_ENV, OVERRIDE_REASON: 'incident 2026-09-14: revert the 500' },
     pulls: [],
-    checkRuns: [],
   });
   assert.equal(state.failed, null, 'an explicit override must let the deploy through');
   assert.match(state.warnings.join('\n'), /overridden: incident 2026-09-14/);
@@ -258,4 +327,166 @@ test('an override reason bypasses the gate loudly and never silently', async () 
 test('the override input exists only for callers to wire from workflow_dispatch', () => {
   assert.match(workflow, /^      journeys-override-reason:\n        type: string\n        default: ''$/m);
   assert.match(workflow, /never from the push\/workflow_run path/);
+});
+
+// ─── Dry-run inline scripts (ASI hazard) ───
+//
+// growth-labs/publishing run 35916382952 (Fronts staging dry-run, 2026-09-23
+// 20:33Z), step "Dry-run binding diff": ReferenceError: Cannot access
+// 'newest' before initialization at [eval]:4:4. The version-listing
+// `node -p` script had no semicolons; ASI does not break a statement before a
+// line starting with `(`, so `const newest = [...d].sort(...)[0]` followed
+// by a line starting `(newest?.versions ?? [])...` parsed as one statement --
+// a call `...[0](newest?.versions ...)` that reads `newest` inside its own
+// initializer. These tests extract the actual inline scripts from the
+// workflow and execute them with node against live-shape fixtures, so a
+// future edit that reintroduces this hazard (or any real behavior
+// regression) fails here, not four minutes into a live dry-run.
+
+function fixturePath(name) {
+  return new URL(`fixtures/${name}`, import.meta.url);
+}
+
+function extractVersionIdsScript() {
+  const anchor = 'DEPLOYMENTS_JSON="$RUNNER_TEMP/live-deployments.json" node -p "\n';
+  const start = workflow.indexOf(anchor);
+  assert.ok(start >= 0, 'the dry-run version-listing snippet must read DEPLOYMENTS_JSON through env, not through $RUNNER_TEMP interpolated into the script body');
+  const bodyStart = start + anchor.length;
+  const end = workflow.indexOf('\n          ")"', bodyStart);
+  assert.ok(end >= 0, 'the version-listing node -p script must close with ")"');
+  return workflow.slice(bodyStart, end).replace(/^ {12}/gm, '');
+}
+
+test('the dry-run version-listing snippet is free of unsemicoloned statements', () => {
+  const script = extractVersionIdsScript();
+  for (const statement of script.split('\n').filter((line) => line.trim() !== '')) {
+    assert.match(statement.trim(), /;$/, `every statement must end in an explicit semicolon: ${statement}`);
+  }
+});
+
+test('the dry-run version-listing snippet parses and lists the newest deployment\'s version ids, against the real fronts-staging shape (growth-labs/publishing run 35916382952)', () => {
+  const script = extractVersionIdsScript();
+  const deploymentsJson = fixturePath('fronts-staging-deployments.json');
+  const result = spawnSync(process.execPath, ['-p', script], {
+    encoding: 'utf8',
+    env: { ...process.env, DEPLOYMENTS_JSON: deploymentsJson.pathname },
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stderr, /ReferenceError/);
+  // The staging fixture's newest deployment (created_on 2026-09-22T12:42:48Z)
+  // has exactly one version at 100%.
+  assert.equal(result.stdout.trim(), '3bd93141-0fd0-4b4e-9db8-e57d548c6714');
+});
+
+test('reproduces the exact ASI/TDZ failure from run 35916382952 on the unsemicoloned pre-fix shape', () => {
+  // Not the live workflow text (the fix already replaced it) -- the exact
+  // shape that shipped at 530670d, kept here so the failure mode itself
+  // stays pinned even after the live snippet moves on.
+  const preFixScript = [
+    "const d = JSON.parse(require('fs').readFileSync(process.env.DEPLOYMENTS_JSON, 'utf8')).result?.deployments ?? []",
+    'const newest = [...d].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))[0]',
+    "(newest?.versions ?? []).map((v) => v.version_id).join('\\n')",
+  ].join('\n');
+  const deploymentsJson = fixturePath('fronts-staging-deployments.json');
+  const result = spawnSync(process.execPath, ['-p', preFixScript], {
+    encoding: 'utf8',
+    env: { ...process.env, DEPLOYMENTS_JSON: deploymentsJson.pathname },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Cannot access 'newest' before initialization/);
+});
+
+function readFixture(name) {
+  return readFileSync(fixturePath(name), 'utf8');
+}
+
+// CONFIG_JSON (a built wrangler config) and SETTINGS_JSON (the live Worker
+// settings response) are not part of the vendored live fixtures -- neither
+// was captured in the brief -- so they are hand-built here to the documented
+// shapes (wrangler's RawConfig, and the CF Workers scripts/{name}/settings
+// response) rather than guessed. DEPLOYMENTS_JSON/SCHEDULES_JSON/
+// SUBDOMAIN_JSON below are the real vendored fronts-staging fixtures.
+function bindingDiffEnv(overrides = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'binding-diff-'));
+  const write = (name, body) => {
+    const path = join(root, name);
+    writeFileSync(path, typeof body === 'string' ? body : JSON.stringify(body));
+    return path;
+  };
+  const builtConfig = {
+    compatibility_date: '2026-08-01',
+    compatibility_flags: ['nodejs_compat'],
+    workers_dev: true,
+    observability: { enabled: true },
+    triggers: { crons: ['*/5 * * * *'] },
+    vars: { SITE_URL: 'https://staging.fronts.co' },
+    d1_databases: [{ binding: 'DB', database_id: 'd1-fronts-staging' }],
+    ...overrides.built,
+  };
+  const settingsResp = {
+    result: {
+      compatibility_date: '2026-08-01',
+      compatibility_flags: ['nodejs_compat'],
+      observability: { enabled: true },
+      bindings: [
+        { name: 'SITE_URL', type: 'plain_text', text: 'https://staging.fronts.co' },
+        { name: 'DB', type: 'd1', id: 'd1-fronts-staging' },
+      ],
+      ...overrides.live,
+    },
+  };
+  return {
+    root,
+    env: {
+      ...process.env,
+      CONFIG_JSON: write('config.json', builtConfig),
+      SETTINGS_JSON: write('settings.json', settingsResp),
+      SCHEDULES_JSON: write('schedules.json', readFixture('fronts-staging-schedules.json')),
+      SUBDOMAIN_JSON: write('subdomain.json', readFixture('fronts-staging-subdomain.json')),
+      DEPLOYMENTS_JSON: write('deployments.json', readFixture('fronts-staging-deployments.json')),
+    },
+  };
+}
+
+function runBindingDiff(overrides) {
+  const script = extractHeredoc(
+    workflow.slice(workflow.indexOf('      - name: Dry-run binding diff')),
+    'BINDING_DIFF',
+  );
+  const { root, env } = bindingDiffEnv(overrides);
+  try {
+    return spawnSync(process.execPath, ['-'], { input: script, encoding: 'utf8', env });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('the binding diff parses and passes when the built config matches live, against the real fronts-staging shape', () => {
+  const result = runBindingDiff();
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout + result.stderr, /ReferenceError/);
+  assert.match(result.stdout, /only in built \(0\):/);
+  assert.match(result.stdout, /only in live \(0\):/);
+  assert.match(result.stdout, /active deployment .* rollback target:/);
+});
+
+test('the binding diff fails loudly when the built config declares a binding live does not have', () => {
+  const result = runBindingDiff({
+    built: { r2_buckets: [{ binding: 'MEDIA', bucket_name: 'fronts-media-staging' }] },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /only in built \(1\):/);
+  assert.match(result.stdout, /MEDIA r2_bucket fronts-media-staging/);
+});
+
+test('the binding diff fails loudly on a settings drift (crons) even with identical bindings', () => {
+  const result = runBindingDiff({ built: { triggers: { crons: ['*/10 * * * *'] } } });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /crons: built=\["\*\/10 \* \* \* \*"\] live=\["\*\/5 \* \* \* \*"\] — DIFF/);
+});
+
+test('an unhandled binding class fails the dry-run instead of being silently skipped', () => {
+  const result = runBindingDiff({ built: { durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] } } });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /::error::unhandled binding class `durable_objects`/);
 });
