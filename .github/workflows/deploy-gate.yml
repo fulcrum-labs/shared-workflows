@@ -119,6 +119,17 @@ on:
           it loudly in the job summary. Callers must wire this from a
           workflow_dispatch input ONLY, never from the push/workflow_run path, so
           an automatic deploy can never carry one.
+      required-journey-app:
+        type: string
+        default: ''
+        description: >-
+          GitHub App slug that must own the required-journey-check run (e.g.
+          the canary posts as 'fulcrum-platform-automation'). Empty (default)
+          accepts a run from any source, exactly as before this input existed.
+          When set, both the deployed-commit and the pull-request-head lookup
+          only consider runs where `run.app.slug` equals this value, so a
+          same-named check from an unrelated workflow or App cannot satisfy
+          the gate.
     secrets:
       CF_DEPLOY_API_TOKEN:
         required: true
@@ -214,11 +225,14 @@ jobs:
           DEPLOY_SHA: ${{ github.sha }}
           REQUIRED_CHECK: ${{ inputs.required-journey-check }}
           OVERRIDE_REASON: ${{ inputs.journeys-override-reason }}
+          REQUIRED_APP: ${{ inputs.required-journey-app }}
         with:
           script: |
             const sha = process.env.DEPLOY_SHA
             const name = process.env.REQUIRED_CHECK
             const override = (process.env.OVERRIDE_REASON || '').trim()
+            const requiredApp = (process.env.REQUIRED_APP || '').trim()
+            const byRequiredApp = (run) => !requiredApp || run.app?.slug === requiredApp
             const { owner, repo } = context.repo
 
             const refuse = async (title, lines) => {
@@ -259,7 +273,7 @@ jobs:
               check_name: name,
               per_page: 100,
             })
-            const deployShaCompleted = deployShaRuns.filter((run) => run.status === 'completed')
+            const deployShaCompleted = deployShaRuns.filter((run) => run.status === 'completed' && byRequiredApp(run))
             const deployShaFinishedAt = (run) => new Date(run.completed_at || run.started_at || 0).getTime()
             deployShaCompleted.sort((a, b) => deployShaFinishedAt(b) - deployShaFinishedAt(a))
 
@@ -316,7 +330,7 @@ jobs:
               check_name: name,
               per_page: 100,
             })
-            const completed = runs.filter((run) => run.status === 'completed')
+            const completed = runs.filter((run) => run.status === 'completed' && byRequiredApp(run))
             if (completed.length === 0) {
               return refuse('journeys never ran', [
                 `Check \`${name}\` has no completed run on \`${head}\` (PR #${pr.number}, head of the pull request that produced \`${sha}\`).`,
@@ -693,7 +707,7 @@ jobs:
           # commit sha, not just by opaque version id.
           echo '{}' > "$RUNNER_TEMP/live-version-tags.json"
           version_ids="$(node -p "
-            const d = JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/live-deployments.json','utf8')).result ?? []
+            const d = JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/live-deployments.json','utf8')).result?.deployments ?? []
             const newest = [...d].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))[0]
             (newest?.versions ?? []).map((v) => v.version_id).join('\n')
           ")"
@@ -822,7 +836,7 @@ jobs:
             ['tail consumer services', sortedJson((built.tail_consumers ?? []).map((t) => t.service)), sortedJson((live.tail_consumers ?? []).map((t) => t.service))],
             ['observability enabled', String(built.observability?.enabled ?? false), String(live.observability?.enabled ?? false)],
             ['logs enabled', String(built.observability?.logs?.enabled ?? built.observability?.enabled ?? false), String(live.observability?.logs?.enabled ?? live.observability?.enabled ?? false)],
-            ['crons', sortedJson(built.triggers?.crons), sortedJson(schedulesResp.result?.cron)],
+            ['crons', sortedJson(built.triggers?.crons), sortedJson((schedulesResp.result?.schedules ?? []).map((s) => s.cron))],
             ['workers_dev enabled', String(built.workers_dev ?? false), String(subdomainResp.result?.enabled ?? false)],
             ['previews enabled', String(built.preview_urls ?? built.workers_dev ?? false), String(subdomainResp.result?.previews_enabled ?? false)],
           ]
@@ -830,7 +844,7 @@ jobs:
 
           const queueConsumers = (built.queues?.consumers ?? []).map((c) => c.queue)
 
-          const deployments = [...(deploymentsResp.result ?? [])].sort(
+          const deployments = [...(deploymentsResp.result?.deployments ?? [])].sort(
             (a, b) => new Date(b.created_on || 0).getTime() - new Date(a.created_on || 0).getTime(),
           )
           const activeDeployment = deployments[0]

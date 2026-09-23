@@ -84,10 +84,15 @@ jobs:
           "$WRANGLER_BIN" --version
           echo "WRANGLER_BIN=$WRANGLER_BIN" >> "$GITHUB_ENV"
 
-      # `wrangler deployments status --json` prints the active deployment
-      # itself: {..., versions: [{version_id, percentage}, ...]}. A rollback
-      # onto the version that is already the sole 100% version is a no-op --
-      # skip it rather than have wrangler reject or repeat a no-op rollback.
+      # `wrangler deployments status --json` (4.94.0) prints a non-JSON
+      # banner line ("Cloudflare agent skills are available for: ...") before
+      # the JSON on stdout, so it cannot be parsed reliably here -- whether a
+      # given runner's wrangler install prints it is not something a rollback
+      # safety net can depend on. Reads the active deployment from the
+      # Cloudflare API directly instead: the same endpoint and response shape
+      # the gate's dry-run diff already trusts (`/deployments` ->
+      # `result.deployments`, newest by `created_on`), so there is one shape
+      # to get right, not two. `wrangler rollback` remains the mutating step.
       - name: Before
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
@@ -96,17 +101,30 @@ jobs:
           VERSION_ID: ${{ inputs.version-id }}
         run: |
           set -euo pipefail
-          "$WRANGLER_BIN" deployments status --name "$WORKER" --json > "$RUNNER_TEMP/rollback-before.json"
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER/deployments" \
+            > "$RUNNER_TEMP/rollback-deployments-before.json"
+          if [ "$(node -p "JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-deployments-before.json','utf8')).success === true")" != "true" ]; then
+            echo "::error::/deployments did not report success -- $(cat "$RUNNER_TEMP/rollback-deployments-before.json")"
+            exit 1
+          fi
+          node -e "
+            const fs = require('node:fs')
+            const d = JSON.parse(fs.readFileSync('$RUNNER_TEMP/rollback-deployments-before.json', 'utf8'))
+            const deployments = [...(d.result?.deployments ?? [])].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))
+            fs.writeFileSync('$RUNNER_TEMP/rollback-active-before.json', JSON.stringify(deployments[0] ?? null, null, 2))
+          "
           {
             echo "### Before"
             echo '```json'
-            cat "$RUNNER_TEMP/rollback-before.json"
+            cat "$RUNNER_TEMP/rollback-active-before.json"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          already_active="$(BEFORE_PATH="$RUNNER_TEMP/rollback-before.json" node -p "
-            const d = JSON.parse(require('fs').readFileSync(process.env.BEFORE_PATH, 'utf8'))
-            const versions = d.versions ?? []
+          already_active="$(node -p "
+            const d = JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-active-before.json', 'utf8'))
+            const versions = d?.versions ?? []
             versions.length === 1 && versions[0].version_id === process.env.VERSION_ID && versions[0].percentage === 100
           ")"
           if [ "$already_active" = "true" ]; then
@@ -139,20 +157,38 @@ jobs:
           VERSION_ID: ${{ inputs.version-id }}
         run: |
           set -euo pipefail
-          "$WRANGLER_BIN" deployments status --name "$WORKER" --json > "$RUNNER_TEMP/rollback-after.json"
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER/deployments" \
+            > "$RUNNER_TEMP/rollback-deployments-after.json"
+          if [ "$(node -p "JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-deployments-after.json','utf8')).success === true")" != "true" ]; then
+            echo "::error::/deployments did not report success -- $(cat "$RUNNER_TEMP/rollback-deployments-after.json")"
+            exit 1
+          fi
+          node -e "
+            const fs = require('node:fs')
+            const d = JSON.parse(fs.readFileSync('$RUNNER_TEMP/rollback-deployments-after.json', 'utf8'))
+            const deployments = [...(d.result?.deployments ?? [])].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))
+            fs.writeFileSync('$RUNNER_TEMP/rollback-active-after.json', JSON.stringify(deployments[0] ?? null, null, 2))
+          "
+          # The design needs the real workers/triggered_by value a rollback
+          # produces (a normal deploy shows 'deployment'), so print the full
+          # annotations here rather than just the versions.
           {
             echo "### After"
             echo '```json'
-            cat "$RUNNER_TEMP/rollback-after.json"
+            cat "$RUNNER_TEMP/rollback-active-after.json"
             echo '```'
+            echo ""
+            echo "workers/triggered_by: \`$(node -p "JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-active-after.json','utf8'))?.annotations?.['workers/triggered_by'] ?? 'unknown'")\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          ok="$(AFTER_PATH="$RUNNER_TEMP/rollback-after.json" node -p "
-            const d = JSON.parse(require('fs').readFileSync(process.env.AFTER_PATH, 'utf8'))
-            const versions = d.versions ?? []
+          ok="$(node -p "
+            const d = JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-active-after.json', 'utf8'))
+            const versions = d?.versions ?? []
             versions.length === 1 && versions[0].version_id === process.env.VERSION_ID && versions[0].percentage === 100
           ")"
           if [ "$ok" != "true" ]; then
-            echo "::error::rollback did not converge on a single version at 100% -- actual state: $(cat "$RUNNER_TEMP/rollback-after.json")"
+            echo "::error::rollback did not converge on a single version at 100% -- actual state: $(cat "$RUNNER_TEMP/rollback-active-after.json")"
             exit 1
           fi
