@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+
+const workflowsDir = fileURLToPath(new URL('../workflows/', import.meta.url));
 
 const workflows = new Map(
   [
@@ -26,6 +30,43 @@ function jobSource(source, jobName) {
   return source.slice(start, end);
 }
 
+// Every workflow file under .github/workflows/, independent of the
+// hand-maintained job-name map above (which several tests below use for
+// job-specific assertions and which does not list every file -- e.g.
+// worker-rollback.yml). #50's ruling applies repo-wide, so these two tests
+// enumerate the directory instead of trusting that map to be complete.
+function allWorkflows(dir = workflowsDir) {
+  return readdirSync(dir)
+    .filter(name => name.endsWith('.yml') || name.endsWith('.yaml'))
+    .sort()
+    .map(name => [name, readFileSync(join(dir, name), 'utf8')]);
+}
+
+// Slices out a top-level (0-indent) "key:" block: everything strictly
+// between its own header line and the next 0-indent key, or EOF. Line-
+// anchored, like jobSource above -- not a whole-file regex.
+function topLevelBlock(source, key) {
+  const lines = source.split('\n');
+  const startIndex = lines.findIndex(line => line === `${key}:`);
+  if (startIndex === -1) return null;
+  let endIndex = lines.length;
+  for (let i = startIndex + 1; i < lines.length; i += 1) {
+    if (/^[A-Za-z_-]/.test(lines[i])) {
+      endIndex = i;
+      break;
+    }
+  }
+  return lines.slice(startIndex + 1, endIndex).join('\n');
+}
+
+function triggerKeys(onBlock) {
+  return [...onBlock.matchAll(/^  ([a-zA-Z_-]+):/gm)].map(match => match[1]);
+}
+
+function runsOnValues(source) {
+  return [...source.matchAll(/^\s*runs-on:\s*(.+)$/gm)].map(match => match[1].trim());
+}
+
 test('all shared-workflow compute defaults to the self-hosted runner fleet', () => {
   for (const [file, { jobs, source }] of workflows) {
     for (const jobName of jobs) {
@@ -44,23 +85,45 @@ test('all shared-workflow compute defaults to the self-hosted runner fleet', () 
   }
 });
 
-test('workflows that run in THIS public repo never target the self-hosted fleet', () => {
-  // shared-workflows is a PUBLIC repo: any workflow triggered here (pull_request,
-  // push, schedule) would let fork-PR code reach the self-hosted runner hosts.
-  // Reusable workflow_call jobs (ci-gate, d1-migrations-apply) execute in the
-  // PRIVATE caller repos and are exempt. See 2026-08-04 runner security finding.
-  const validate = readFileSync(new URL('../workflows/validate.yml', import.meta.url), 'utf8');
-  const contract = jobSource(validate, 'contract');
-  assert.match(
-    contract,
-    /^    runs-on: ubuntu-24\.04$/m,
-    'validate.yml:contract must run on GitHub-hosted compute (public repo)',
-  );
-  assert.doesNotMatch(
-    contract,
-    /^    runs-on:.*self-hosted/m,
-    'validate.yml:contract must not target the self-hosted fleet',
-  );
+// #50 (operator ruling 2026-09-19, Amendment 1): shared-workflows is a PUBLIC
+// repo that stays public only because cross-org callers need its reusable
+// workflows, so it keeps NO CI of its own -- validate.yml (the only workflow
+// that ran here directly, on push/pull_request) was deleted rather than kept
+// on hosted compute. These two tests enforce that ruling repo-wide instead of
+// reading the deleted file: any workflow triggered directly in this repo
+// (push, pull_request, pull_request_target, schedule, workflow_dispatch)
+// would let fork-PR code reach a runner, self-hosted or not, so every file
+// must be workflow_call-only; and no job anywhere may default to
+// GitHub-hosted compute.
+test('every workflow in this repo is triggered only by workflow_call', () => {
+  for (const [file, source] of allWorkflows()) {
+    const onBlock = topLevelBlock(source, 'on');
+    assert.ok(onBlock, `${file} must declare an "on:" trigger block`);
+    const triggers = triggerKeys(onBlock);
+    assert.deepEqual(
+      triggers,
+      ['workflow_call'],
+      `${file} must be triggered only by workflow_call (found: ${triggers.join(', ') || 'none'}) -- ` +
+        'this public repo keeps no CI of its own (#50).',
+    );
+  }
+});
+
+test('no job anywhere in this repo may run on GitHub-hosted compute', () => {
+  const hostedRunnerLabel = /\b(?:ubuntu|windows|macos)-/i;
+  let runsOnCount = 0;
+  for (const [file, source] of allWorkflows()) {
+    for (const value of runsOnValues(source)) {
+      runsOnCount += 1;
+      assert.doesNotMatch(
+        value,
+        hostedRunnerLabel,
+        `${file} has a job on GitHub-hosted compute (runs-on: ${value}) -- ` +
+          'hosted runners are no longer allowed in this repo (#50).',
+      );
+    }
+  }
+  assert.ok(runsOnCount > 0, 'expected at least one runs-on: line under .github/workflows/');
 });
 
 test('every pnpm cache uses a store owned by the current runner job', () => {
