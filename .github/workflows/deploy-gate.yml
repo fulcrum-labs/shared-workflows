@@ -13,6 +13,11 @@ name: Deploy Gate (Reusable)
 # Risk-matched: callers that pass `required-journey-check` additionally refuse
 # any commit whose originating pull request does not carry a successful run of
 # that check on its head SHA (operating-baseline B-03).
+#
+# Per-target environments, a read-only dry-run, post-deploy journeys, and a
+# monorepo app-directory joined this gate for M2-14 (Fronts deploying from
+# growth-labs/publishing): every new input below defaults to a no-op, so an
+# existing caller's run is unchanged.
 
 on:
   workflow_call:
@@ -20,6 +25,13 @@ on:
       node-version:
         type: string
         default: '24'
+      environment:
+        type: string
+        default: 'production'
+        description: >-
+          GitHub environment the job runs in, and where its CF_DEPLOY_API_TOKEN
+          lives. Default keeps every existing caller on `production`, exactly
+          as before this input existed.
       build-command:
         type: string
         required: true
@@ -45,17 +57,60 @@ on:
           `main` and every other path in the file relative to the FILE's
           directory, not to the working directory, so the build command still
           runs from the root as usual.
+      app-directory:
+        type: string
+        default: ''
+        description: >-
+          The deployable app's directory relative to the repo root (e.g.
+          'publications/fronts'), for a Worker built inside a monorepo. Empty
+          (default) keeps the test-only-module assertion and the D1 tripwire
+          running from the repo root, exactly as before this input existed.
+      worker-name:
+        type: string
+        default: ''
+        description: >-
+          Worker script name. Required when `dry-run` is true, so the dry-run
+          knows which live Worker to diff against.
+      dry-run:
+        type: boolean
+        default: false
+        description: >-
+          Build and run every safety check exactly as for a deploy, then diff
+          the built config against the live Worker instead of deploying.
+          Requires `worker-name`. Default false leaves the deploy step running
+          exactly as before this input existed.
+      journeys-canary-url:
+        type: string
+        default: ''
+        description: >-
+          Base URL of the authenticated-browser canary that runs post-deploy
+          preview journeys. The three journeys-* inputs are all-or-none; when
+          set, the CALLING job must grant `id-token: write` so the gate can
+          mint the OIDC token the canary verifies.
+      journeys-audience:
+        type: string
+        default: ''
+        description: >-
+          OIDC audience for the post-deploy journeys canary (e.g.
+          'fronts-preview-gate'). All-or-none with the other journeys-* inputs.
+      journeys-target-url:
+        type: string
+        default: ''
+        description: >-
+          URL the post-deploy journeys run against (e.g.
+          'https://staging.fronts.co/'). All-or-none with the other journeys-*
+          inputs.
       required-journey-check:
         type: string
         default: ''
         description: >-
-          Risk-matched deploy gate. When set, this deploy refuses any commit whose
-          originating pull request does not carry a SUCCESSFUL check run of this
-          name on its head SHA -- the preview journeys (member sign-in, article
-          read, video/podcast playback) that prove the money paths still work.
-          Empty (default) preserves prior behaviour for repos with no journeys.
-          A caller that sets this MUST grant `pull-requests: read` and
-          `checks: read` alongside `contents: read` on its calling job.
+          Risk-matched deploy gate. When set, this deploy refuses unless the
+          named check ran SUCCESSFULLY on the deployed commit itself, or --
+          failing that -- on the head SHA of the pull request the deployed
+          commit came from. Empty (default) preserves prior behaviour for repos
+          with no journeys. A caller that sets this MUST grant
+          `pull-requests: read` and `checks: read` alongside `contents: read`
+          on its calling job.
       journeys-override-reason:
         type: string
         default: ''
@@ -64,6 +119,17 @@ on:
           it loudly in the job summary. Callers must wire this from a
           workflow_dispatch input ONLY, never from the push/workflow_run path, so
           an automatic deploy can never carry one.
+      required-journey-app:
+        type: string
+        default: ''
+        description: >-
+          GitHub App slug that must own the required-journey-check run (e.g.
+          the canary posts as 'fulcrum-platform-automation'). Empty (default)
+          accepts a run from any source, exactly as before this input existed.
+          When set, both the deployed-commit and the pull-request-head lookup
+          only consider runs where `run.app.slug` equals this value, so a
+          same-named check from an unrelated workflow or App cannot satisfy
+          the gate.
     secrets:
       CF_DEPLOY_API_TOKEN:
         required: true
@@ -83,37 +149,90 @@ on:
 
 # Serialize deploys per repo and NEVER cancel one mid-flight: an interrupted
 # deploy is worse than a queued one. Later main pushes wait their turn.
+#
+# A non-production `environment` gets its own group: GitHub keeps only one
+# PENDING run per concurrency group and replaces an older pending run with a
+# newer one, so a repo with two deploy targets (e.g. fronts-staging and
+# fronts-production) needs two groups, or a queued staging dispatch would
+# silently displace a queued production one (and vice versa). A default
+# caller's group string is byte-identical to before this changed.
 concurrency:
-  group: deploy-gate-${{ github.repository }}
+  group: deploy-gate-${{ github.repository }}${{ inputs.environment != 'production' && format('-{0}', inputs.environment) || '' }}
   cancel-in-progress: false
 
 jobs:
   deploy:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     runs-on: [self-hosted, Linux, X64]
-    environment: production
+    environment: ${{ inputs.environment }}
     timeout-minutes: 30
     steps:
+      # Input sanity before anything else runs, so a misconfigured caller
+      # fails in seconds instead of after a fleet build. A tokenless build is
+      # the sharpest trap: site configs branch on `CI && !CLOUDFLARE_API_TOKEN`
+      # and fall back to the node prerender stub (Fronts' is
+      # src/lib/cloudflare-workers-build.ts), which the "assert no test-only
+      # modules" step below cannot see because the stub is not under
+      # src/lib/testing/ -- it ships a Worker with no bindings, silently.
+      - name: Preflight
+        env:
+          CF_DEPLOY_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          WORKER_NAME: ${{ inputs.worker-name }}
+          JOURNEYS_CANARY_URL: ${{ inputs.journeys-canary-url }}
+          JOURNEYS_AUDIENCE: ${{ inputs.journeys-audience }}
+          JOURNEYS_TARGET_URL: ${{ inputs.journeys-target-url }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CF_DEPLOY_API_TOKEN" ]; then
+            echo "::error::CF_DEPLOY_API_TOKEN is empty for environment '$ENVIRONMENT' -- a tokenless build selects the node prerender stub (CI && !CLOUDFLARE_API_TOKEN) and ships a Worker with no bindings"
+            exit 1
+          fi
+          if [ "$DRY_RUN" = "true" ] && [ -z "$WORKER_NAME" ]; then
+            echo "::error::dry-run is true but worker-name is empty -- the dry-run needs a live Worker to diff against"
+            exit 1
+          fi
+          present=0
+          missing=()
+          for pair in "journeys-canary-url:$JOURNEYS_CANARY_URL" "journeys-audience:$JOURNEYS_AUDIENCE" "journeys-target-url:$JOURNEYS_TARGET_URL"; do
+            name="${pair%%:*}"
+            value="${pair#*:}"
+            if [ -n "$value" ]; then
+              present=$((present + 1))
+            else
+              missing+=("$name")
+            fi
+          done
+          if [ "$present" -gt 0 ] && [ "$present" -lt 3 ]; then
+            echo "::error::the journeys-* inputs are all-or-none; missing: ${missing[*]} -- check for an empty vars.* in the caller"
+            exit 1
+          fi
+
       # Risk-matched deploy gate (operating-baseline B-03). On 2026-09-14 every
       # signed-in member got a 500 on the newest Fronts videos for ~4.5 hours:
       # the change that caused it had a preview, and nothing required the
       # preview's authenticated journeys to pass before it reached production.
       # This step is that requirement. It resolves the pull request the deployed
       # commit came from and refuses unless the named journey check concluded
-      # SUCCESS on that PR's head SHA. Deliberately the first step in the job:
-      # a failing journey must cost zero fleet build minutes.
+      # SUCCESS on that PR's head SHA (or, more directly, on the deployed
+      # commit itself -- see below). Runs right after Preflight: a failing
+      # journey must cost zero fleet build minutes.
       - name: Preview journeys gate
-        if: inputs.required-journey-check != ''
+        if: inputs.required-journey-check != '' && !inputs.dry-run
         uses: actions/github-script@v8
         env:
           DEPLOY_SHA: ${{ github.sha }}
           REQUIRED_CHECK: ${{ inputs.required-journey-check }}
           OVERRIDE_REASON: ${{ inputs.journeys-override-reason }}
+          REQUIRED_APP: ${{ inputs.required-journey-app }}
         with:
           script: |
             const sha = process.env.DEPLOY_SHA
             const name = process.env.REQUIRED_CHECK
             const override = (process.env.OVERRIDE_REASON || '').trim()
+            const requiredApp = (process.env.REQUIRED_APP || '').trim()
+            const byRequiredApp = (run) => !requiredApp || run.app?.slug === requiredApp
             const { owner, repo } = context.repo
 
             const refuse = async (title, lines) => {
@@ -139,6 +258,51 @@ jobs:
               return
             }
 
+            // The post-deploy staging journeys (step "Post-deploy journeys")
+            // run on the exact commit that later deploys to production --
+            // stronger evidence than a PR preview, since nothing can change
+            // between that check and this deploy. The PR-head path below
+            // stays for callers that journey their previews instead (e.g.
+            // fulcrum-labs/fronts pr-preview.yml, whose journeys check lands
+            // on the PR head sha, never on a main commit, because that repo
+            // is squash-merge only).
+            const deployShaRuns = await github.paginate(github.rest.checks.listForRef, {
+              owner,
+              repo,
+              ref: sha,
+              check_name: name,
+              per_page: 100,
+            })
+            const deployShaCompleted = deployShaRuns.filter((run) => run.status === 'completed' && byRequiredApp(run))
+            const deployShaFinishedAt = (run) => new Date(run.completed_at || run.started_at || 0).getTime()
+            deployShaCompleted.sort((a, b) => deployShaFinishedAt(b) - deployShaFinishedAt(a))
+
+            if (deployShaCompleted.length > 0) {
+              const latestOnDeploySha = deployShaCompleted[0]
+              if (latestOnDeploySha.conclusion === 'success') {
+                core.summary.addHeading('Preview journeys passed', 3)
+                core.summary.addRaw([
+                  `\`${name}\` succeeded on the deployed commit \`${sha}\`.`,
+                  '',
+                  `Run: ${latestOnDeploySha.html_url}`,
+                ].join('\n'))
+                await core.summary.write()
+                core.info(`Journey gate satisfied by ${latestOnDeploySha.html_url} (deployed commit)`)
+                return
+              }
+              return refuse(`journeys ${latestOnDeploySha.conclusion} on the deployed commit`, [
+                `Check \`${name}\` concluded **${latestOnDeploySha.conclusion}** on the deployed commit \`${sha}\`.`,
+                '',
+                `Run: ${latestOnDeploySha.html_url}`,
+                latestOnDeploySha.output?.title ? `\nTitle: ${latestOnDeploySha.output.title}` : '',
+                latestOnDeploySha.output?.summary ? `\n\n${latestOnDeploySha.output.summary}` : '',
+                '',
+                'A member-facing site does not deploy on failed journeys.',
+              ].filter(Boolean))
+            }
+
+            // No completed run on the deployed commit itself -- fall back to
+            // the pull-request head, unchanged from before this check existed.
             const associated = await github.paginate(
               github.rest.repos.listPullRequestsAssociatedWithCommit,
               { owner, repo, commit_sha: sha, per_page: 100 },
@@ -166,7 +330,7 @@ jobs:
               check_name: name,
               per_page: 100,
             })
-            const completed = runs.filter((run) => run.status === 'completed')
+            const completed = runs.filter((run) => run.status === 'completed' && byRequiredApp(run))
             if (completed.length === 0) {
               return refuse('journeys never ran', [
                 `Check \`${name}\` has no completed run on \`${head}\` (PR #${pr.number}, head of the pull request that produced \`${sha}\`).`,
@@ -294,6 +458,7 @@ jobs:
       # silently inert site. Skipped when a repo emits no dist/server (non-Astro
       # callers) rather than failing them on a directory they never produce.
       - name: Assert no test-only modules in the deployed bundle
+        working-directory: ${{ inputs.app-directory || '.' }}
         run: |
           set -euo pipefail
           if [ ! -d dist/server ]; then
@@ -327,11 +492,19 @@ jobs:
       # have a ledger row, or deployment is blocked with the missing names.
       # Checking after deployment already shipped code against missing schema.
       # This remains read-only: the suspended migration publisher is unchanged.
+      #
+      # app-directory matters here: from a monorepo root this step used to be
+      # skipped entirely, silently, because .publication/d1-migrations.json
+      # lives under the app's own directory. From e.g. publications/fronts it
+      # checks 115 files -- the 105 Fronts migrations plus
+      # node_modules/@growth-labs/analytics/migrations.
       - name: D1 migration ledger tripwire
-        if: hashFiles('.publication/d1-migrations.json') != ''
+        if: hashFiles(inputs.app-directory != '' && format('{0}/.publication/d1-migrations.json', inputs.app-directory) || '.publication/d1-migrations.json') != ''
+        working-directory: ${{ inputs.app-directory || '.' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+          APP_DIRECTORY: ${{ inputs.app-directory }}
         run: |
           DB_NAME="$(node -p "JSON.parse(require('fs').readFileSync('.publication/d1-migrations.json','utf8')).databaseName || ''")"
           if [ -z "$DB_NAME" ]; then
@@ -368,10 +541,15 @@ jobs:
           }
           for (const file of missing) console.log(`::error::D1 migration never applied to the live ledger — ${file}`)
           if (missing.length > 0) process.exit(1)
+          if (process.env.APP_DIRECTORY && checked === 0) {
+            console.log('::error::zero migration files is unrun, never a pass')
+            process.exit(1)
+          }
           console.log(`D1 migration ledger tripwire: ${checked} migration file(s) across ${dirs.size} dir(s), all present in the ledger (${ledger.size} rows)`)
           D1_LEDGER_TRIPWIRE
 
       - name: Deploy with provenance
+        if: ${{ !inputs.dry-run }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
@@ -406,3 +584,299 @@ jobs:
             echo "- commit: \`${COMMIT_SHA}\`"
             echo "- build: \`${BUILD_UUID}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Mirrors fulcrum-labs/fronts pr-preview.yml "Dispatch authenticated
+      # preview journeys" (frozen; that workflow keeps its own PR-shaped
+      # payload with `source` unset). This is the deploy-shaped sibling: it
+      # dispatches on the commit that just deployed, not a PR head, so the
+      # Preview journeys gate above can later accept a check on the deployed
+      # commit itself (operating-baseline B-03, honestly this time: the sha
+      # that reaches production is the sha the journeys actually ran against).
+      # Unlike the PR-path dispatch, this step fails outright on a non-success
+      # classification -- the calling job needs to go red on the run that
+      # just shipped a regression, not only on some later deploy's gate.
+      - name: Post-deploy journeys
+        if: ${{ !inputs.dry-run && inputs.journeys-audience != '' }}
+        env:
+          JOURNEYS_CANARY_URL: ${{ inputs.journeys-canary-url }}
+          JOURNEYS_AUDIENCE: ${{ inputs.journeys-audience }}
+          JOURNEYS_TARGET_URL: ${{ inputs.journeys-target-url }}
+        run: |
+          set -euo pipefail
+          token_response="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${JOURNEYS_AUDIENCE}")"
+          oidc_token="$(jq -er '.value' <<<"$token_response")"
+          payload="$(jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg headSha "$GITHUB_SHA" \
+            --arg previewUrl "$JOURNEYS_TARGET_URL" \
+            --argjson workflowRunId "$GITHUB_RUN_ID" \
+            --argjson workflowRunAttempt "$GITHUB_RUN_ATTEMPT" \
+            '{source: "deploy", repository: $repository, headSha: $headSha, previewUrl: $previewUrl, workflowRunId: $workflowRunId, workflowRunAttempt: $workflowRunAttempt, privateVideoProofs: true}')"
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          http_code="$(curl --silent --show-error \
+            --max-time 540 \
+            -X POST \
+            -H "Authorization: Bearer ${oidc_token}" \
+            -H "Content-Type: application/json" \
+            --data "$payload" \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            "${JOURNEYS_CANARY_URL%/}/preview-journeys")"
+          result="$(cat "$response_file")"
+          if [[ ! "$http_code" =~ ^2 ]]; then
+            worker_error="$(jq -r '.error // "unknown error"' <<<"$result" 2>/dev/null || echo 'invalid JSON response')"
+            echo "::error::Preview canary returned HTTP ${http_code}: ${worker_error}"
+            exit 1
+          fi
+          jq -e '.checkUrl and .classification' <<<"$result" > /dev/null
+
+          classification="$(jq -r '.classification' <<<"$result")"
+          check_url="$(jq -r '.checkUrl' <<<"$result")"
+          {
+            echo "Fronts preview gate: ${classification}"
+            echo "Check: ${check_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$classification" != "success" ]; then
+            echo "::error::Post-deploy journeys did not pass -- classification=${classification} (${check_url})"
+            exit 1
+          fi
+
+      # A dry-run proves what a deploy WOULD change instead of just that it
+      # would build: wrangler's own --dry-run only checks the bundle compiles,
+      # it never compares against the live Worker. This step does that
+      # comparison, read-only, against the four Cloudflare endpoints that
+      # together describe a Worker's live shape (bindings/settings, crons,
+      # workers.dev/previews, and the active deployment -- the rollback
+      # target). It never calls anything that mutates the Worker.
+      - name: Dry-run binding diff
+        if: ${{ inputs.dry-run }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+          WORKER: ${{ inputs.worker-name }}
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          set -euo pipefail
+
+          # The diff reads the generated JSON config, not the wrangler.toml
+          # source -- an explicit limitation, never a silent skip, because a
+          # dry-run that quietly compared the wrong file would be worse than
+          # one that refuses to run.
+          case "${CONFIG_PATH:-}" in
+            *.json|*.jsonc) ;;
+            *)
+              echo "::error::the dry-run diff reads the generated JSON config; got \`${CONFIG_PATH:-<empty>}\`"
+              exit 1
+              ;;
+          esac
+          [ -f "$CONFIG_PATH" ] || {
+            echo "::error::config-path '$CONFIG_PATH' does not exist in this repository" >&2
+            exit 1
+          }
+
+          "$WRANGLER_BIN" deploy --dry-run --outdir "$RUNNER_TEMP/dry-run" --config "$CONFIG_PATH" \
+            | tee "$RUNNER_TEMP/dry-run-log.txt"
+
+          API="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER"
+
+          # All GETs, all read-only. Each response is asserted `success` here,
+          # loudly, rather than let a malformed or throttled response reach
+          # the diff script as if it were live truth.
+          fetch() {
+            local path="$1" out="$2"
+            curl --fail --silent --show-error \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$API$path" > "$out"
+            if [ "$(node -p "JSON.parse(require('fs').readFileSync('$out','utf8')).success === true")" != "true" ]; then
+              echo "::error::$path did not report success -- $(cat "$out")"
+              exit 1
+            fi
+          }
+
+          fetch "/settings" "$RUNNER_TEMP/live-settings.json"
+          fetch "/schedules" "$RUNNER_TEMP/live-schedules.json"
+          fetch "/subdomain" "$RUNNER_TEMP/live-subdomain.json"
+          fetch "/deployments" "$RUNNER_TEMP/live-deployments.json"
+
+          # Per-version `workers/tag` annotation for every version in the
+          # newest deployment, so the summary can show the rollback target by
+          # commit sha, not just by opaque version id.
+          echo '{}' > "$RUNNER_TEMP/live-version-tags.json"
+          version_ids="$(node -p "
+            const d = JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/live-deployments.json','utf8')).result?.deployments ?? []
+            const newest = [...d].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))[0]
+            (newest?.versions ?? []).map((v) => v.version_id).join('\n')
+          ")"
+          if [ -n "$version_ids" ]; then
+            while IFS= read -r version_id; do
+              [ -n "$version_id" ] || continue
+              fetch "/versions/$version_id" "$RUNNER_TEMP/live-version-current.json"
+              # version_id is API-sourced data, not a literal -- read through
+              # env, never interpolated into the script body, same rule as a
+              # caller-provided value.
+              VERSION_ID="$version_id" \
+              TAGS_PATH="$RUNNER_TEMP/live-version-tags.json" \
+              VERSION_PATH="$RUNNER_TEMP/live-version-current.json" \
+              node -e "
+                const fs = require('node:fs')
+                const tags = JSON.parse(fs.readFileSync(process.env.TAGS_PATH, 'utf8'))
+                const version = JSON.parse(fs.readFileSync(process.env.VERSION_PATH, 'utf8')).result
+                tags[process.env.VERSION_ID] = version?.annotations?.['workers/tag'] ?? 'unknown'
+                fs.writeFileSync(process.env.TAGS_PATH, JSON.stringify(tags))
+              "
+            done <<<"$version_ids"
+          fi
+
+          CONFIG_JSON="$CONFIG_PATH" \
+          SETTINGS_JSON="$RUNNER_TEMP/live-settings.json" \
+          SCHEDULES_JSON="$RUNNER_TEMP/live-schedules.json" \
+          SUBDOMAIN_JSON="$RUNNER_TEMP/live-subdomain.json" \
+          DEPLOYMENTS_JSON="$RUNNER_TEMP/live-deployments.json" \
+          VERSION_TAGS_JSON="$RUNNER_TEMP/live-version-tags.json" \
+          node - <<'BINDING_DIFF' | tee -a "$GITHUB_STEP_SUMMARY"
+          // Diffs a built wrangler config against a live Worker's settings,
+          // schedules and subdomain, so a dry-run proves what a real deploy
+          // would change instead of just that it *would deploy*. Ported from
+          // fronts-deploy-design-evidence/binding-diff.mjs and extended: an
+          // unhandled binding class fails loudly rather than being silently
+          // skipped, and settings/crons/workers_dev join the comparison,
+          // sourced from wrangler's own config-schema.json (RawConfig) so the
+          // "other binding classes" list isn't a guess.
+          const fs = require('node:fs')
+          const readJson = (path) => JSON.parse(fs.readFileSync(path, 'utf8'))
+
+          const built = readJson(process.env.CONFIG_JSON)
+          const settingsResp = readJson(process.env.SETTINGS_JSON)
+          const live = settingsResp.result
+          const schedulesResp = readJson(process.env.SCHEDULES_JSON)
+          const subdomainResp = readJson(process.env.SUBDOMAIN_JSON)
+          const deploymentsResp = readJson(process.env.DEPLOYMENTS_JSON)
+          const versionTags = process.env.VERSION_TAGS_JSON ? readJson(process.env.VERSION_TAGS_JSON) : {}
+
+          let failed = false
+
+          // Handled classes translate to a comparable "NAME type target" row.
+          // Every other binding-shaped RawConfig key that is non-empty fails
+          // the dry-run instead of being silently skipped, because a binding
+          // this script cannot compare is a binding it cannot prove safe.
+          // tail_consumers is compared under Settings, not here; `secrets` is
+          // wrangler's local-dev-only value map and never ships a live binding.
+          const UNHANDLED_BINDING_CLASSES = [
+            'durable_objects', 'workflows', 'hyperdrive', 'dispatch_namespaces',
+            'mtls_certificates', 'pipelines', 'ai_search_namespaces', 'ai_search',
+            'images', 'media', 'stream', 'containers', 'cloudchamber',
+            'worker_loaders', 'vpc_services', 'vpc_networks', 'unsafe_hello_world',
+            'flagship', 'wasm_modules', 'text_blobs', 'data_blobs', 'site',
+          ]
+          const isNonEmptyBindingClass = (key, value) => {
+            if (value == null) return false
+            if (key === 'durable_objects') return Array.isArray(value.bindings) && value.bindings.length > 0
+            if (Array.isArray(value)) return value.length > 0
+            if (typeof value === 'object') return Object.keys(value).length > 0
+            return Boolean(value)
+          }
+          const unhandled = UNHANDLED_BINDING_CLASSES.filter((key) => isNonEmptyBindingClass(key, built[key]))
+          for (const key of unhandled) {
+            console.log(`::error::unhandled binding class \`${key}\` — this dry-run cannot compare it against live; extend the diff before deploying`)
+          }
+          if (unhandled.length > 0) process.exit(1)
+
+          const builtRows = new Set()
+          const add = (n, t, x = '') => builtRows.add(`${n} ${t} ${x}`.trim())
+          for (const [k, v] of Object.entries(built.vars ?? {})) add(k, typeof v === 'string' ? 'plain_text' : 'json', typeof v === 'string' ? v : JSON.stringify(v))
+          for (const b of built.kv_namespaces ?? []) add(b.binding, 'kv_namespace', b.id)
+          for (const b of built.d1_databases ?? []) add(b.binding, 'd1', b.database_id)
+          for (const b of built.r2_buckets ?? []) add(b.binding, 'r2_bucket', b.bucket_name)
+          for (const b of built.services ?? []) add(b.binding, 'service', b.service + (b.entrypoint ? '#' + b.entrypoint : ''))
+          for (const b of built.queues?.producers ?? []) add(b.binding, 'queue', b.queue)
+          for (const b of built.analytics_engine_datasets ?? []) add(b.binding, 'analytics_engine', b.dataset)
+          for (const b of built.vectorize ?? []) add(b.binding, 'vectorize', b.index_name)
+          for (const b of built.secrets_store_secrets ?? []) add(b.binding, 'secrets_store_secret', `${b.store_id}/${b.secret_name}`)
+          for (const b of built.ratelimits ?? []) add(b.name, 'ratelimit', `${b.namespace_id}:${b.simple?.limit}/${b.simple?.period}`)
+          for (const b of built.send_email ?? []) add(b.name, 'send_email')
+          if (built.ai) add(built.ai.binding, 'ai')
+          if (built.browser) add(built.browser.binding, 'browser')
+          if (built.assets?.binding) add(built.assets.binding, 'assets')
+          if (built.version_metadata) add(built.version_metadata.binding, 'version_metadata')
+
+          const liveRows = new Set()
+          let secretTextCount = 0
+          for (const b of live.bindings ?? []) {
+            const t = b.type
+            if (t === 'secret_text') { secretTextCount += 1; continue }
+            let x = ''
+            if (t === 'plain_text') x = b.text
+            else if (t === 'json') x = JSON.stringify(b.json)
+            else if (t === 'kv_namespace') x = b.namespace_id
+            else if (t === 'd1') x = b.id ?? b.database_id
+            else if (t === 'r2_bucket') x = b.bucket_name
+            else if (t === 'service') x = b.service + (b.entrypoint ? '#' + b.entrypoint : '')
+            else if (t === 'queue') x = b.queue_name
+            else if (t === 'analytics_engine') x = b.dataset
+            else if (t === 'vectorize') x = b.index_name
+            else if (t === 'secrets_store_secret') x = `${b.store_id}/${b.secret_name}`
+            else if (t === 'ratelimit') x = `${b.namespace_id}:${b.simple?.limit}/${b.simple?.period}`
+            liveRows.add(`${b.name} ${t} ${x}`.trim())
+          }
+
+          const onlyBuilt = [...builtRows].filter((r) => !liveRows.has(r)).sort()
+          const onlyLive = [...liveRows].filter((r) => !builtRows.has(r)).sort()
+          if (onlyBuilt.length > 0 || onlyLive.length > 0) failed = true
+          if (builtRows.size === 0 || liveRows.size === 0) failed = true
+
+          const sortedJson = (arr) => JSON.stringify([...(arr ?? [])].sort())
+          const settingsRows = [
+            ['compatibility date', built.compatibility_date ?? '', live.compatibility_date ?? ''],
+            ['compatibility flags', sortedJson(built.compatibility_flags), sortedJson(live.compatibility_flags)],
+            ['placement mode', built.placement?.mode ?? 'off', live.placement?.mode ?? 'off'],
+            ['tail consumer services', sortedJson((built.tail_consumers ?? []).map((t) => t.service)), sortedJson((live.tail_consumers ?? []).map((t) => t.service))],
+            ['observability enabled', String(built.observability?.enabled ?? false), String(live.observability?.enabled ?? false)],
+            ['logs enabled', String(built.observability?.logs?.enabled ?? built.observability?.enabled ?? false), String(live.observability?.logs?.enabled ?? live.observability?.enabled ?? false)],
+            ['crons', sortedJson(built.triggers?.crons), sortedJson((schedulesResp.result?.schedules ?? []).map((s) => s.cron))],
+            ['workers_dev enabled', String(built.workers_dev ?? false), String(subdomainResp.result?.enabled ?? false)],
+            ['previews enabled', String(built.preview_urls ?? built.workers_dev ?? false), String(subdomainResp.result?.previews_enabled ?? false)],
+          ]
+          for (const row of settingsRows) if (row[1] !== row[2]) failed = true
+
+          const queueConsumers = (built.queues?.consumers ?? []).map((c) => c.queue)
+
+          const deployments = [...(deploymentsResp.result?.deployments ?? [])].sort(
+            (a, b) => new Date(b.created_on || 0).getTime() - new Date(a.created_on || 0).getTime(),
+          )
+          const activeDeployment = deployments[0]
+
+          const lines = []
+          lines.push('### Dry-run binding diff')
+          lines.push('')
+          lines.push(`built non-secret bindings: ${builtRows.size}; live bindings: ${(live.bindings ?? []).length} (${secretTextCount} secret_text kept across deploys, ${liveRows.size} other)`)
+          lines.push(`only in built (${onlyBuilt.length}):`)
+          for (const r of onlyBuilt) lines.push('  + ' + r)
+          lines.push(`only in live (${onlyLive.length}):`)
+          for (const r of onlyLive) lines.push('  - ' + r)
+          lines.push('')
+          lines.push('settings:')
+          for (const [name, builtValue, liveValue] of settingsRows) {
+            lines.push(`  ${name}: built=${builtValue} live=${liveValue} — ${builtValue === liveValue ? 'same' : 'DIFF'}`)
+          }
+          lines.push('')
+          lines.push(`queue consumers (not compared): ${queueConsumers.length === 0 ? '(none)' : queueConsumers.join(', ')}`)
+          lines.push('')
+          if (activeDeployment) {
+            lines.push(`active deployment ${activeDeployment.id} — rollback target:`)
+            for (const v of activeDeployment.versions ?? []) {
+              lines.push(`  version ${v.version_id} at ${v.percentage}% — tag ${versionTags[v.version_id] ?? 'unknown'}`)
+            }
+          } else {
+            lines.push('active deployment: none found')
+          }
+          console.log(lines.join('\n'))
+
+          if (builtRows.size === 0) console.log('::error::built binding count is 0 — a zero is unrun, never a pass')
+          if (liveRows.size === 0) console.log('::error::live binding count is 0 — a zero is unrun, never a pass')
+
+          process.exit(failed ? 1 : 0)
+          BINDING_DIFF

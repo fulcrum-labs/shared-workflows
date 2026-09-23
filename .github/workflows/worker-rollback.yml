@@ -1,0 +1,194 @@
+name: Worker Rollback (Reusable)
+
+# No Worker rollback path existed anywhere in the fleet before this: a
+# rollback meant a hand `wrangler rollback` run from someone's laptop, with no
+# provenance and nothing stopping it from racing a deploy of the same target.
+# This gives the fleet one reviewable path, and the Fronts rollback rehearsal
+# (M2-14 Acceptance 2) runs through it, not by hand.
+
+on:
+  workflow_call:
+    inputs:
+      account-id:
+        type: string
+        required: true
+        description: 'Cloudflare account ID owning the Worker.'
+      worker-name:
+        type: string
+        required: true
+        description: 'Worker script name to roll back.'
+      version-id:
+        type: string
+        required: true
+        description: 'Version id to roll back to (a UUID, as `wrangler versions list` shows).'
+      reason:
+        type: string
+        required: true
+        description: >-
+          Why this rollback is happening. Recorded in the wrangler rollback
+          message and the job summary. Must be non-empty after trimming.
+      environment:
+        type: string
+        default: 'production'
+        description: 'GitHub environment the job runs in, and where its CF_DEPLOY_API_TOKEN lives.'
+      wrangler-version:
+        type: string
+        default: '4.94.0'
+        description: 'Wrangler version installed into RUNNER_TEMP for the rollback.'
+    secrets:
+      CF_DEPLOY_API_TOKEN:
+        required: true
+        description: 'Cloudflare API token with Workers Scripts: Edit on the target account, stored as an environment secret.'
+
+# No `permissions:` key, deliberately -- same reasoning as deploy-gate.yml. A
+# rollback grants itself no repo scopes; it only ever calls the Cloudflare API.
+
+# The SAME group expression deploy-gate.yml uses, so a rollback and a deploy
+# of one target serialize instead of racing the same Worker.
+concurrency:
+  group: deploy-gate-${{ github.repository }}${{ inputs.environment != 'production' && format('-{0}', inputs.environment) || '' }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: [self-hosted, Linux, X64]
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 10
+    steps:
+      - name: Preflight
+        env:
+          CF_DEPLOY_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          VERSION_ID: ${{ inputs.version-id }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CF_DEPLOY_API_TOKEN" ]; then
+            echo "::error::CF_DEPLOY_API_TOKEN is empty"
+            exit 1
+          fi
+          if ! printf '%s' "$VERSION_ID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+            echo "::error::version-id '$VERSION_ID' is not a UUID"
+            exit 1
+          fi
+          if [ -z "$(printf '%s' "$REASON" | xargs)" ]; then
+            echo "::error::reason must not be empty"
+            exit 1
+          fi
+
+      - name: Install wrangler
+        run: |
+          WRANGLER_DIR="$RUNNER_TEMP/wrangler-install"
+          mkdir -p "$WRANGLER_DIR"
+          npm install --prefix "$WRANGLER_DIR" --no-audit --no-fund wrangler@${{ inputs.wrangler-version }}
+          WRANGLER_BIN="$WRANGLER_DIR/node_modules/.bin/wrangler"
+          "$WRANGLER_BIN" --version
+          echo "WRANGLER_BIN=$WRANGLER_BIN" >> "$GITHUB_ENV"
+
+      # `wrangler deployments status --json` (4.94.0) prints a non-JSON
+      # banner line ("Cloudflare agent skills are available for: ...") before
+      # the JSON on stdout, so it cannot be parsed reliably here -- whether a
+      # given runner's wrangler install prints it is not something a rollback
+      # safety net can depend on. Reads the active deployment from the
+      # Cloudflare API directly instead: the same endpoint and response shape
+      # the gate's dry-run diff already trusts (`/deployments` ->
+      # `result.deployments`, newest by `created_on`), so there is one shape
+      # to get right, not two. `wrangler rollback` remains the mutating step.
+      - name: Before
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+          WORKER: ${{ inputs.worker-name }}
+          VERSION_ID: ${{ inputs.version-id }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER/deployments" \
+            > "$RUNNER_TEMP/rollback-deployments-before.json"
+          if [ "$(node -p "JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-deployments-before.json','utf8')).success === true")" != "true" ]; then
+            echo "::error::/deployments did not report success -- $(cat "$RUNNER_TEMP/rollback-deployments-before.json")"
+            exit 1
+          fi
+          node -e "
+            const fs = require('node:fs')
+            const d = JSON.parse(fs.readFileSync('$RUNNER_TEMP/rollback-deployments-before.json', 'utf8'))
+            const deployments = [...(d.result?.deployments ?? [])].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))
+            fs.writeFileSync('$RUNNER_TEMP/rollback-active-before.json', JSON.stringify(deployments[0] ?? null, null, 2))
+          "
+          {
+            echo "### Before"
+            echo '```json'
+            cat "$RUNNER_TEMP/rollback-active-before.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          already_active="$(node -p "
+            const d = JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-active-before.json', 'utf8'))
+            const versions = d?.versions ?? []
+            versions.length === 1 && versions[0].version_id === process.env.VERSION_ID && versions[0].percentage === 100
+          ")"
+          if [ "$already_active" = "true" ]; then
+            echo "Version \`$VERSION_ID\` is already active at 100%; nothing to roll back." >> "$GITHUB_STEP_SUMMARY"
+            echo "ALREADY_ACTIVE=true" >> "$GITHUB_ENV"
+          else
+            echo "ALREADY_ACTIVE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Roll back
+        if: ${{ env.ALREADY_ACTIVE != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+          WORKER: ${{ inputs.worker-name }}
+          VERSION_ID: ${{ inputs.version-id }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          "$WRANGLER_BIN" rollback "$VERSION_ID" --name "$WORKER" \
+            --message "$REASON (run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)" \
+            --yes
+
+      - name: After
+        if: ${{ env.ALREADY_ACTIVE != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+          WORKER: ${{ inputs.worker-name }}
+          VERSION_ID: ${{ inputs.version-id }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER/deployments" \
+            > "$RUNNER_TEMP/rollback-deployments-after.json"
+          if [ "$(node -p "JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-deployments-after.json','utf8')).success === true")" != "true" ]; then
+            echo "::error::/deployments did not report success -- $(cat "$RUNNER_TEMP/rollback-deployments-after.json")"
+            exit 1
+          fi
+          node -e "
+            const fs = require('node:fs')
+            const d = JSON.parse(fs.readFileSync('$RUNNER_TEMP/rollback-deployments-after.json', 'utf8'))
+            const deployments = [...(d.result?.deployments ?? [])].sort((a, b) => new Date(b.created_on || 0) - new Date(a.created_on || 0))
+            fs.writeFileSync('$RUNNER_TEMP/rollback-active-after.json', JSON.stringify(deployments[0] ?? null, null, 2))
+          "
+          # The design needs the real workers/triggered_by value a rollback
+          # produces (a normal deploy shows 'deployment'), so print the full
+          # annotations here rather than just the versions.
+          {
+            echo "### After"
+            echo '```json'
+            cat "$RUNNER_TEMP/rollback-active-after.json"
+            echo '```'
+            echo ""
+            echo "workers/triggered_by: \`$(node -p "JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-active-after.json','utf8'))?.annotations?.['workers/triggered_by'] ?? 'unknown'")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ok="$(node -p "
+            const d = JSON.parse(require('fs').readFileSync('$RUNNER_TEMP/rollback-active-after.json', 'utf8'))
+            const versions = d?.versions ?? []
+            versions.length === 1 && versions[0].version_id === process.env.VERSION_ID && versions[0].percentage === 100
+          ")"
+          if [ "$ok" != "true" ]; then
+            echo "::error::rollback did not converge on a single version at 100% -- actual state: $(cat "$RUNNER_TEMP/rollback-active-after.json")"
+            exit 1
+          fi
