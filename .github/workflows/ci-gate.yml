@@ -187,8 +187,72 @@ jobs:
           echo "workers=$VITEST_CAP" >> "$GITHUB_OUTPUT"
           echo "vitest workers capped at $VITEST_CAP (VITEST_MAX_WORKERS, VITEST_MAX_THREADS, VITEST_MAX_FORKS)"
 
+      - name: Refuse a Turbo strict env that would strip the Vitest cap
+        # Turbo 2 runs tasks in strict env mode (the default, and declared by
+        # growth-labs/packages and publishing): a variable not in
+        # globalPassThroughEnv never reaches the task, so VITEST_MAX_* would
+        # be set here and every vitest would still start
+        # os.availableParallelism() workers while the line above said
+        # "capped". A repo that runs vitest under strict Turbo must pass the
+        # three through; this says so by name instead of letting it look capped.
+        run: |
+          node - <<'VITEST_PASSTHROUGH'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          if (!fs.existsSync('turbo.json')) process.exit(0)
+          const text = fs.readFileSync('turbo.json', 'utf8')
+            .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/,(\s*[}\]])/g, '$1')
+          const turbo = JSON.parse(text)
+          if ((turbo.envMode ?? 'strict') !== 'strict') process.exit(0)
+          const SKIP = new Set(['node_modules', '.git', 'dist', '.worktrees', '.turbo'])
+          let usesVitest = false
+          const walk = (dir, depth) => {
+            if (usesVitest || depth > 4) return
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (SKIP.has(entry.name)) continue
+              const full = path.join(dir, entry.name)
+              if (entry.isDirectory()) walk(full, depth + 1)
+              else if (entry.name === 'package.json' && /"vitest"/.test(fs.readFileSync(full, 'utf8'))) usesVitest = true
+            }
+          }
+          walk('.', 0)
+          if (!usesVitest) process.exit(0)
+          const pass = turbo.globalPassThroughEnv ?? []
+          const missing = ['VITEST_MAX_WORKERS', 'VITEST_MAX_THREADS', 'VITEST_MAX_FORKS'].filter(v => !pass.includes(v))
+          if (missing.length > 0) {
+            console.log(`::error::turbo.json runs in strict env mode and does not pass ${missing.join(', ')} through (globalPassThroughEnv), so the Vitest worker cap never reaches a test task. Add them to globalPassThroughEnv.`)
+            process.exit(1)
+          }
+          VITEST_PASSTHROUGH
+
       - name: CI gate (typecheck + lint + test + build)
-        run: ${{ inputs.check-command }}
+        # The cap line above is what was asked for; the observer here is what
+        # happened: it samples the fork-pool workers every second and prints
+        # the most that ran at once (per vitest process, and in total), so the
+        # acceptance reads a real count, not the request.
+        run: |
+          observe() {
+            max_total=0 max_per=0
+            while :; do
+              counts="$(ps -eo ppid=,args= 2>/dev/null | awk '$2 ~ /(^|\/)node$/ && $3 ~ /vitest\/dist\/workers\/forks\.m?js$/ {print $1}' | sort | uniq -c | awk '{print $1}')"
+              total=0 per=0
+              for c in $counts; do total=$((total + c)); [ "$c" -gt "$per" ] && per=$c; done
+              [ "$total" -gt "$max_total" ] && max_total=$total
+              [ "$per" -gt "$max_per" ] && max_per=$per
+              echo "$max_per $max_total" > "$RUNNER_TEMP/vitest-workers-observed"
+              sleep 1
+            done
+          }
+          observe &
+          observer=$!
+          set +e
+          ${{ inputs.check-command }}
+          status=$?
+          set -e
+          kill "$observer" 2>/dev/null || true
+          read -r per total < "$RUNNER_TEMP/vitest-workers-observed" 2>/dev/null || { per=0; total=0; }
+          echo "vitest workers observed: at most $per fork workers under one vitest process, $total at once in total (cap $VITEST_MAX_WORKERS)"
+          exit "$status"
         env:
           VITEST_MAX_WORKERS: ${{ steps.vitest-cap.outputs.workers }}
           VITEST_MAX_THREADS: ${{ steps.vitest-cap.outputs.workers }}

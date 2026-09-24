@@ -33,9 +33,6 @@ on:
         type: string
         default: '.'
         description: 'Directory the build-command runs in.'
-      timeout-minutes:
-        type: number
-        default: 30
 
 permissions:
   contents: read
@@ -49,16 +46,20 @@ jobs:
     name: cold-cache / build
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # A literal, never an input: a caller cannot hold a runner slot longer
+    # than this leg needs (execution-substrate I10).
+    timeout-minutes: 30
     env:
       GOTOOLCHAIN: local
       GOFLAGS: ${{ inputs.go-flags }}
     steps:
-      - uses: actions/checkout@v5
+      # SHA-pinned: this leg builds release packages, so it is
+      # supply-chain-facing (the same pins fulcrum-labs/foundry's ci.yml uses).
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v5
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: ${{ inputs.go-version }}
           cache: false
@@ -72,10 +73,13 @@ jobs:
           if [ -e "$cold" ]; then chmod -R u+w "$cold"; fi
           rm -rf "$cold"
           mkdir -p "$cold/go-build" "$cold/go-mod" "$cold/tmp"
+          # TMPDIR too: a test's os.MkdirTemp("") would otherwise land in /tmp,
+          # which is a tmpfs on the colossus ci guest.
           {
             echo "GOCACHE=$cold/go-build"
             echo "GOMODCACHE=$cold/go-mod"
             echo "GOTMPDIR=$cold/tmp"
+            echo "TMPDIR=$cold/tmp"
           } >> "$GITHUB_ENV"
 
       - name: Prove the caches are cold
