@@ -608,13 +608,20 @@ function initAncestryTempRepo() {
 
 function runAncestryDecision(script, dir, liveTag, githubSha) {
   const summaryFile = join(dir, '.gh-summary');
+  const outputFile = join(dir, '.gh-output');
   writeFileSync(summaryFile, '');
+  writeFileSync(outputFile, '');
   const result = spawnSync('bash', ['-c', script], {
     cwd: dir,
     encoding: 'utf8',
-    env: { ...process.env, LIVE_TAG: liveTag, GITHUB_SHA: githubSha, GITHUB_STEP_SUMMARY: summaryFile },
+    env: { ...process.env, LIVE_TAG: liveTag, GITHUB_SHA: githubSha, GITHUB_STEP_SUMMARY: summaryFile, GITHUB_OUTPUT: outputFile },
   });
-  return { ...result, summary: readFileSync(summaryFile, 'utf8') };
+  const outputs = {};
+  for (const line of readFileSync(outputFile, 'utf8').split('\n')) {
+    const [key, ...rest] = line.split('=');
+    if (key) outputs[key] = rest.join('=');
+  }
+  return { ...result, summary: readFileSync(summaryFile, 'utf8'), outputs };
 }
 
 test('proceeds when the live tag is an ancestor of GITHUB_SHA (the ordinary forward-progress case)', () => {
@@ -629,19 +636,30 @@ test('proceeds when the live tag is an ancestor of GITHUB_SHA (the ordinary forw
   }
 });
 
-test('refuses (H1 case) when GITHUB_SHA is OLDER than the live tag -- a stale-but-green trigger racing a newer deploy that already landed', () => {
+test('C2: stays GREEN (exit 0, warning, proceed=false) when GITHUB_SHA is OLDER than the live tag -- superseded-at-deploy-time is the CORRECT outcome of a race, not a failure', () => {
   const script = extractAncestryDecisionScript();
   const { dir, first, second } = initAncestryTempRepo();
   try {
     // live is `second` (newer, already deployed by a faster-racing trigger);
-    // this run's own tip is `first` (older) -- must refuse, never deploy
-    // backwards over what already shipped.
+    // this run's own tip is `first` (older) -- must skip the deploy (never
+    // deploy backwards over what already shipped), but the JOB stays green:
+    // this is the race resolving as designed, not an error.
     const result = runAncestryDecision(script, dir, second, first);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /live tag .* is NEWER/);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /::warning::.*live tag .* is NEWER/);
+    assert.match(result.summary, /superseded at deploy time/);
+    assert.equal(result.outputs.proceed, 'false');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('the "Deploy with provenance" step skips itself (never runs) when require-descends-from-live reports proceed=false', () => {
+  const deployStep = workflow.slice(workflow.indexOf('      - name: Deploy with provenance'));
+  assert.match(
+    deployStep,
+    /if: \$\{\{ !inputs\.dry-run && steps\.require-descends-from-live\.outputs\.proceed != 'false' \}\}/,
+  );
 });
 
 test('refuses loudly on diverged history (neither commit is an ancestor of the other)', () => {
@@ -663,12 +681,27 @@ test('refuses loudly on diverged history (neither commit is an ancestor of the o
   }
 });
 
-test('proceeds without an ancestry check when the live tag is not a commit of this repository', () => {
+test('proceeds (with a warning, proceed=true) when the live tag is not a commit of this repository', () => {
   const script = extractAncestryDecisionScript();
   const { dir, second } = initAncestryTempRepo();
   try {
     const result = runAncestryDecision(script, dir, 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', second);
     assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /::warning::/);
+    assert.equal(result.outputs.proceed, 'true');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('C1: proceeds (with a warning, proceed=true) on an EMPTY live tag, same as foreign -- a version deployed without --tag must not deadlock every future gated deploy', () => {
+  const script = extractAncestryDecisionScript();
+  const { dir, second } = initAncestryTempRepo();
+  try {
+    const result = runAncestryDecision(script, dir, '', second);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /::warning::.*no workers\/tag annotation/);
+    assert.equal(result.outputs.proceed, 'true');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
