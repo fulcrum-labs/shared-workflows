@@ -23,6 +23,11 @@
 # the site 5xx'd for ~14 minutes. CF Builds only runs `wrangler deploy`
 # — it does NOT apply migrations. This workflow closes that gap.
 # KB: fronts-d1-migration-and-monitoring-gap-2026-05-25.
+#
+# `dry-run: true` lists what apply-missing would do (repo migrations not yet
+# in d1_migrations) and exits without applying anything or writing to the
+# ledger. Added for a staging catch-up dispatch previewing before commit;
+# default false leaves every existing caller applying exactly as before.
 
 name: D1 migrations apply (reusable)
 
@@ -49,6 +54,14 @@ on:
         type: string
         default: "main"
         description: "Git ref of fulcrum-labs/shared-workflows to check out alongside the consumer repo (for the apply-d1-migrations.mjs script)."
+      dry-run:
+        type: boolean
+        default: false
+        description: "List pending migrations and exit without applying anything or writing to d1_migrations. Default false keeps every existing caller applying exactly as before this input existed."
+      database-id:
+        type: string
+        default: ""
+        description: "Cloudflare D1 database uuid. When set, verified (via the account's D1 list endpoint, read-only) against what database-name actually resolves to, before any D1 interaction and regardless of dry-run -- refuses on a mismatch. Name alone is otherwise the only selector against the same account and token as prod, so a staging config carrying prod's uuid would otherwise silently write prod. Optional and unverified when empty, keeping every existing caller unchanged."
     secrets:
       CF_API_TOKEN:
         required: true
@@ -58,7 +71,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: d1-migrations-${{ github.repository }}-${{ github.ref }}
+  # Keyed on the DATABASE, not the ref: a staging catch-up dispatch and a
+  # prod push-apply are different refs but can hit the SAME database when a
+  # caller's database-name input is misconfigured, and even when they don't,
+  # keying on ref meant a staging dispatch (a different ref) could CANCEL a
+  # pending prod push-apply in the same repo (one pending run per group;
+  # cancel-in-progress stays false, so a same-database queue still waits
+  # rather than clobbers). account-id included too: a database-name string
+  # is only unique within one Cloudflare account, so two different accounts
+  # (this workflow is shared across every Fulcrum repo) with a same-named
+  # database would otherwise share one group despite being unrelated.
+  group: d1-migrations-${{ github.repository }}-${{ inputs.account-id }}-${{ inputs.database-name }}
   cancel-in-progress: false
 
 jobs:
@@ -71,6 +94,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
       D1_DATABASE_NAME: ${{ inputs.database-name }}
       D1_MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+      D1_MIGRATIONS_DRY_RUN: ${{ inputs.dry-run && '1' || '' }}
     steps:
       - name: Checkout consumer repo
         uses: actions/checkout@v5
