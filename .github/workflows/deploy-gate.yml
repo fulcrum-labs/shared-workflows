@@ -130,6 +130,19 @@ on:
           only consider runs where `run.app.slug` equals this value, so a
           same-named check from an unrelated workflow or App cannot satisfy
           the gate.
+      require-descends-from-live:
+        type: boolean
+        default: false
+        description: >-
+          Close the TOCTOU window between a caller's own live-tag-vs-tip
+          decision and the actual deploy: immediately before deploying,
+          re-read the live Worker's `workers/tag` annotation fresh and refuse
+          unless it is an ancestor of (or equal to) $GITHUB_SHA. Guards
+          against a stale-but-green trigger deploying older code over a
+          newer commit that raced it to live in between (deploy-workflow-
+          run-starvation, H1). Requires `worker-name` and a full-history
+          checkout (fetch-depth: 0, already the gate's default). Default
+          false preserves every existing caller's behaviour unchanged.
     secrets:
       CF_DEPLOY_API_TOKEN:
         required: true
@@ -547,6 +560,73 @@ jobs:
           }
           console.log(`D1 migration ledger tripwire: ${checked} migration file(s) across ${dirs.size} dir(s), all present in the ledger (${ledger.size} rows)`)
           D1_LEDGER_TRIPWIRE
+
+      - name: Refuse a deploy older than the live tag (re-checked immediately before deploy)
+        if: ${{ !inputs.dry-run && inputs.require-descends-from-live }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
+          WORKER: ${{ inputs.worker-name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WORKER" ]; then
+            echo "::error::require-descends-from-live is true but worker-name is empty -- the check needs a live Worker to read" >&2
+            exit 1
+          fi
+          API="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER"
+
+          # Every GET asserted `success`, loudly, rather than let a malformed
+          # or throttled response fall through to a quiet "proceed" -- an
+          # upstream failure here must refuse the deploy, never wave it
+          # through unchecked.
+          DEPLOYMENTS_JSON="$RUNNER_TEMP/require-descends-live-deployments.json"
+          if ! curl --fail --silent --show-error -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$API/deployments" > "$DEPLOYMENTS_JSON"; then
+            echo "::error::failed to read live deployments for $WORKER -- refusing to deploy without confirming ancestry" >&2
+            exit 1
+          fi
+          LIVE_VERSION_ID=$(node -e "
+            const fs = require('node:fs')
+            const raw = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'))
+            if (raw.success !== true) { console.error('::error::deployments read returned success=false'); process.exit(1) }
+            const deployments = raw.result && raw.result.deployments ? raw.result.deployments : []
+            if (deployments.length === 0) { console.error('::error::no deployments found for ' + process.argv[2]); process.exit(1) }
+            const sorted = deployments.slice().sort((a, b) => new Date(b.created_on).getTime() - new Date(a.created_on).getTime())
+            const versions = sorted[0].versions || []
+            if (versions.length !== 1) { console.error('::error::live deployment is not a single 100% version (' + versions.length + ' version(s)) -- refusing until it settles'); process.exit(1) }
+            process.stdout.write(versions[0].version_id)
+          " "$DEPLOYMENTS_JSON" "$WORKER")
+          VERSION_JSON="$RUNNER_TEMP/require-descends-live-version.json"
+          if ! curl --fail --silent --show-error -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$API/versions/$LIVE_VERSION_ID" > "$VERSION_JSON"; then
+            echo "::error::failed to read live version $LIVE_VERSION_ID -- refusing to deploy without confirming ancestry" >&2
+            exit 1
+          fi
+          LIVE_TAG=$(node -e "
+            const fs = require('node:fs')
+            const raw = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'))
+            if (raw.success !== true) { console.error('::error::version read returned success=false'); process.exit(1) }
+            const version = raw.result || {}
+            process.stdout.write(((version.annotations || {})['workers/tag']) || '')
+          " "$VERSION_JSON")
+          if [ -z "$LIVE_TAG" ]; then
+            echo "::error::live version $LIVE_VERSION_ID has no workers/tag annotation -- cannot confirm ancestry, refusing to deploy" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$LIVE_TAG" | grep -Eq '^[0-9a-f]{40}$' || ! git cat-file -e "$LIVE_TAG^{commit}" 2>/dev/null; then
+            echo "::notice::live tag $LIVE_TAG is not a commit of this repository -- nothing to compare ancestry against, proceeding"
+            exit 0
+          fi
+          if git merge-base --is-ancestor "$LIVE_TAG" "$GITHUB_SHA"; then
+            echo "live tag $LIVE_TAG confirmed an ancestor of $GITHUB_SHA immediately before deploy" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if git merge-base --is-ancestor "$GITHUB_SHA" "$LIVE_TAG"; then
+            echo "::error::refusing to deploy $GITHUB_SHA: live tag $LIVE_TAG is NEWER than it (another deploy landed after this one was queued)" >&2
+            exit 1
+          fi
+          echo "::error::refusing to deploy $GITHUB_SHA: live tag $LIVE_TAG shares no ancestry with it (diverged history)" >&2
+          exit 1
 
       - name: Deploy with provenance
         if: ${{ !inputs.dry-run }}
