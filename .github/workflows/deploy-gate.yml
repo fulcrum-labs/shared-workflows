@@ -538,17 +538,29 @@ jobs:
           # platform-foundations' extended `.publication/d1-migrations.json`
           # once a project opts into `d1Role.staging`
           # (fulcrum-labs/platform-foundations#1006). No new input: this
-          # branches on `environment`, which every caller already sets.
-          # Falling back to the top-level `databaseName` when `.staging` is
-          # absent keeps EVERY existing caller's behaviour byte-identical --
-          # including a staging deploy for a project that hasn't opted in
-          # yet, which still checks prod's ledger exactly as it does today.
+          # branches on `environment`, which every caller already sets. A
+          # `-production` environment always reads the unchanged top-level
+          # `databaseName`, exactly as before this existed.
           DB_NAME="$(node -p "
             const data = JSON.parse(require('fs').readFileSync('.publication/d1-migrations.json', 'utf8'));
             const env = process.env.GATE_ENVIRONMENT || 'production';
-            (env.endsWith('-staging') && data.staging && data.staging.databaseName) || data.databaseName || '';
+            const staging = env.endsWith('-staging');
+            (staging ? (data.staging && data.staging.databaseName) : data.databaseName) || '';
           ")"
           if [ -z "$DB_NAME" ]; then
+            # On a -staging environment before a project opts into
+            # d1Role.staging, this is expected, not a failure -- and checking
+            # PROD's ledger during a STAGING deploy (the old single-field
+            # behaviour) would be worse than not checking at all: it gives
+            # false confidence that staging's own migrations are fine when
+            # this never looked at staging. Skip cleanly and say so loudly,
+            # rather than silently substituting the wrong database or
+            # failing a deploy over a gap the project hasn't been asked to
+            # close yet.
+            if [[ "$GATE_ENVIRONMENT" == *-staging ]]; then
+              echo "::notice::.publication/d1-migrations.json has no staging.databaseName yet for $GATE_ENVIRONMENT -- skipping the D1 migration ledger tripwire until this project opts into d1Role.staging (fulcrum-labs/platform-foundations#1006)"
+              exit 0
+            fi
             echo "::error::.publication/d1-migrations.json has no databaseName" >&2
             exit 1
           fi

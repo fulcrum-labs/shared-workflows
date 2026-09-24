@@ -24,6 +24,36 @@ function extractDbNameScript(step) {
   return match[1];
 }
 
+// The skip-cleanly-with-a-::notice behaviour lives in the shell AROUND
+// DB_NAME, not inside the node -p script itself, so it needs the actual
+// bash step run for real (not the node -p script in isolation).
+function extractDbNameResolutionShellBlock(step) {
+  const marker = 'run: |\n';
+  const start = step.indexOf(marker);
+  assert.ok(start >= 0, 'the tripwire step must have a run: block');
+  const bodyStart = start + marker.length;
+  const end = step.indexOf('if ! "$WRANGLER_BIN"', bodyStart);
+  assert.ok(end >= 0, 'the run: block must reach the wrangler d1 execute check');
+  return step.slice(bodyStart, end).replace(/^ {10}/gm, '');
+}
+
+function runShellBlock(script, files, env) {
+  const root = mkdtempSync(join(tmpdir(), 'd1-shell-'));
+  try {
+    for (const [rel, body] of Object.entries(files)) {
+      mkdirSync(join(root, rel, '..'), { recursive: true });
+      writeFileSync(join(root, rel), body);
+    }
+    return spawnSync('bash', ['-c', script], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ...env },
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function resolveDbName(script, files, env) {
   const root = mkdtempSync(join(tmpdir(), 'd1-dbname-'));
   try {
@@ -133,7 +163,12 @@ test('DB_NAME reads .staging.databaseName on a -staging environment once a proje
   assert.equal(prod.stdout.trim(), 'fronts-data', 'a -production environment must never read .staging, even when it exists');
 });
 
-test('DB_NAME falls back to the top-level databaseName on a -staging environment until a project opts in -- unchanged from before this existed', () => {
+test('DB_NAME resolves empty (never falls back to prod) on a -staging environment until a project opts in', () => {
+  // Checking PROD's ledger during a STAGING deploy would be worse than not
+  // checking at all -- false confidence that staging's own migrations are
+  // fine when this never looked at staging. The surrounding shell (tested
+  // below, not this node -p script alone) is what turns an empty DB_NAME on
+  // a -staging environment into a clean skip instead of a hard error.
   const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
   const script = extractDbNameScript(step);
   const files = {
@@ -142,7 +177,7 @@ test('DB_NAME falls back to the top-level databaseName on a -staging environment
 
   const result = resolveDbName(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), 'fronts-data');
+  assert.equal(result.stdout.trim(), '');
 });
 
 test('DB_NAME defaults GATE_ENVIRONMENT to production when unset, matching the environment input\'s own default', () => {
@@ -158,6 +193,51 @@ test('DB_NAME defaults GATE_ENVIRONMENT to production when unset, matching the e
   const result = resolveDbName(script, files, {});
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), 'fronts-data');
+});
+
+test('an undefined staging.databaseName on a -staging environment skips the tripwire cleanly with a ::notice, exit 0 -- never silently, never a failure', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameResolutionShellBlock(step);
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({ databaseName: 'fronts-data' }),
+  };
+
+  const result = runShellBlock(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(
+    result.stdout,
+    /::notice::\.publication\/d1-migrations\.json has no staging\.databaseName yet for fronts-staging -- skipping the D1 migration ledger tripwire/,
+  );
+  assert.doesNotMatch(result.stdout, /::error::/);
+});
+
+test('a -production environment with no databaseName at all still hard-errors, exactly as before this existed', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameResolutionShellBlock(step);
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({ staging: { databaseName: 'fronts-data-staging' } }),
+  };
+
+  const result = runShellBlock(script, files, { GATE_ENVIRONMENT: 'fronts-production' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout + result.stderr, /::error::\.publication\/d1-migrations\.json has no databaseName/);
+  assert.doesNotMatch(result.stdout, /::notice::/);
+});
+
+test('a configured staging.databaseName on a -staging environment proceeds past the DB_NAME check without a notice or an error', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameResolutionShellBlock(step) + '\necho "REACHED: $DB_NAME"\n';
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      staging: { databaseName: 'fronts-data-staging' },
+    }),
+  };
+
+  const result = runShellBlock(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /REACHED: fronts-data-staging/);
+  assert.doesNotMatch(result.stdout, /::notice::|::error::/);
 });
 
 // Same discipline as the dry-run version-listing snippet's own equivalent
