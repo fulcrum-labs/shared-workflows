@@ -23,7 +23,8 @@
 // with their D1_DATABASE_NAME and CLOUDFLARE_ACCOUNT_ID.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const DB_NAME = process.env.D1_DATABASE_NAME;
@@ -98,13 +99,45 @@ async function verifyDatabaseId() {
 
 await verifyDatabaseId();
 
+// The API-list verification above proves the ACCOUNT has a database named
+// DB_NAME with uuid DATABASE_ID. It does NOT prove `wrangler d1 execute
+// DB_NAME` actually TARGETS that uuid: wrangler resolves DB_NAME through
+// the CONSUMER REPO's own checked-out wrangler.toml/json first, matching
+// by database_name (or binding) and then using THAT entry's database_id --
+// never re-resolving against the live account. A consumer's wrangler
+// config mapping the staging name to prod's id would pass the check above
+// and still write prod. Once DATABASE_ID is set, every wrangler d1 call
+// below is pinned to a generated, minimal config containing ONLY the one
+// verified {name, id} pair, so the consumer's own config can never
+// intervene in what gets targeted.
+const WRANGLER_CONFIG_ARGS = DATABASE_ID
+	? (() => {
+			const configDir = mkdtempSync(
+				join(process.env.RUNNER_TEMP || tmpdir(), "d1-migrations-config-"),
+			);
+			const configPath = join(configDir, "wrangler.json");
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					d1_databases: [
+						{ binding: "DB", database_name: DB_NAME, database_id: DATABASE_ID },
+					],
+				}),
+			);
+			log(
+				`pinning every wrangler d1 call to a generated config: database_name=${DB_NAME} database_id=${DATABASE_ID}`,
+			);
+			return ["--config", configPath];
+		})()
+	: [];
+
 // Self-hosted runners do not expose the global npm bin dir on PATH, so a bare
 // "wrangler" spawn ENOENTs there. The workflow resolves the absolute binary
 // path at install time and passes it via WRANGLER_BIN.
 const WRANGLER_BIN = process.env.WRANGLER_BIN || "wrangler";
 
 const wranglerJson = (args) => {
-	const out = execFileSync(WRANGLER_BIN, args, {
+	const out = execFileSync(WRANGLER_BIN, [...args, ...WRANGLER_CONFIG_ARGS], {
 		encoding: "utf8",
 		env: { ...process.env, NO_COLOR: "1" },
 		stdio: ["ignore", "pipe", "inherit"],
@@ -123,7 +156,7 @@ const wranglerJson = (args) => {
 };
 
 const wrangler = (args) =>
-	execFileSync(WRANGLER_BIN, args, {
+	execFileSync(WRANGLER_BIN, [...args, ...WRANGLER_CONFIG_ARGS], {
 		encoding: "utf8",
 		env: { ...process.env, NO_COLOR: "1" },
 		stdio: ["ignore", "inherit", "inherit"],

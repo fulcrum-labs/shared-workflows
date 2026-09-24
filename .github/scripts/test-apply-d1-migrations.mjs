@@ -29,10 +29,30 @@ function startFixtureD1ListServer(databases) {
 // FAKE_WRANGLER_LOG and returns the canned ledger a real `d1 execute --json
 // --command "SELECT name FROM d1_migrations"` would, so the script's own
 // diff/apply/dry-run logic runs for real against a fake D1, not a live one.
+//
+// It also records which database_id it was actually "targeting" for each
+// call, to FAKE_WRANGLER_TARGETED_LOG: if `--config <path>` was passed, the
+// id named THERE (proving the generated config -- not the consumer's own
+// wrangler.toml -- decided the target); otherwise a crude sniff of a real
+// wrangler.toml in the cwd, the same resolution a real wrangler binary
+// would do without an explicit --config override.
 const FAKE_WRANGLER = `#!/usr/bin/env node
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_WRANGLER_LOG, JSON.stringify(args) + '\\n');
+let targetedId = null;
+const configIndex = args.indexOf('--config');
+if (configIndex !== -1) {
+  const config = JSON.parse(readFileSync(args[configIndex + 1], 'utf8'));
+  targetedId = config.d1_databases?.[0]?.database_id ?? null;
+} else if (existsSync('wrangler.toml')) {
+  const text = readFileSync('wrangler.toml', 'utf8');
+  const match = text.match(/database_id\\s*=\\s*"([^"]+)"/);
+  targetedId = match ? match[1] : null;
+}
+if (process.env.FAKE_WRANGLER_TARGETED_LOG) {
+  appendFileSync(process.env.FAKE_WRANGLER_TARGETED_LOG, (targetedId ?? '') + '\\n');
+}
 if (args.includes('--json')) {
   const applied = JSON.parse(process.env.FAKE_WRANGLER_APPLIED || '[]');
   process.stdout.write('some wrangler banner line\\n');
@@ -47,18 +67,23 @@ process.exit(0);
 // the child's connection to that server -- a real deadlock, caught by hand
 // (the first run of these tests hung until killed) before it became a CI
 // hang instead of a red test.
-function runApply({ migrationFiles, appliedLedgerNames, dryRun, databaseId, cfApiBase, databaseName }) {
+function runApply({ migrationFiles, appliedLedgerNames, dryRun, databaseId, cfApiBase, databaseName, wranglerTomlContent }) {
   const dir = mkdtempSync(join(tmpdir(), 'd1-apply-test-'));
   const migrationsDir = join(dir, 'migrations');
   mkdirSync(migrationsDir);
   for (const name of migrationFiles) {
     writeFileSync(join(migrationsDir, name), `-- ${name}\nSELECT 1;\n`);
   }
+  if (wranglerTomlContent) {
+    writeFileSync(join(dir, 'wrangler.toml'), wranglerTomlContent);
+  }
   const wranglerPath = join(dir, 'fake-wrangler.mjs');
   writeFileSync(wranglerPath, FAKE_WRANGLER);
   chmodSync(wranglerPath, 0o755);
   const logPath = join(dir, 'wrangler-invocations.log');
   writeFileSync(logPath, '');
+  const targetedIdsLogPath = join(dir, 'wrangler-targeted-ids.log');
+  writeFileSync(targetedIdsLogPath, '');
 
   return new Promise((resolvePromise) => {
     const child = spawn(
@@ -74,6 +99,7 @@ function runApply({ migrationFiles, appliedLedgerNames, dryRun, databaseId, cfAp
           CLOUDFLARE_API_TOKEN: 'test-token',
           WRANGLER_BIN: wranglerPath,
           FAKE_WRANGLER_LOG: logPath,
+          FAKE_WRANGLER_TARGETED_LOG: targetedIdsLogPath,
           FAKE_WRANGLER_APPLIED: JSON.stringify(appliedLedgerNames),
           ...(dryRun ? { D1_MIGRATIONS_DRY_RUN: '1' } : {}),
           ...(databaseId ? { D1_DATABASE_ID: databaseId } : {}),
@@ -91,8 +117,12 @@ function runApply({ migrationFiles, appliedLedgerNames, dryRun, databaseId, cfAp
         .split('\n')
         .filter(Boolean)
         .map((line) => JSON.parse(line));
+      const targetedIds = readFileSync(targetedIdsLogPath, 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean);
       rmSync(dir, { recursive: true, force: true });
-      resolvePromise({ result: { status, stdout, stderr }, invocations });
+      resolvePromise({ result: { status, stdout, stderr }, invocations, targetedIds });
     });
   });
 }
@@ -239,4 +269,79 @@ test('database-id verification filters the list endpoint\'s own substring match 
   } finally {
     server.close();
   }
+});
+
+// reviewer-foundry MED on #58: the API-list check above proves the
+// ACCOUNT has a database named X with uuid Y, but wrangler resolves the
+// database-name argument through the CONSUMER REPO's own checked-out
+// wrangler.toml first, using THAT entry's id -- never re-resolving
+// against the live account. A consumer config mapping the staging name to
+// PROD's uuid would pass verifyDatabaseId and still silently write prod.
+test('a misconfigured consumer wrangler.toml (staging name mapped to prod\'s uuid) is overridden -- every wrangler call targets the verified id, never the file\'s', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+    { name: 'fronts-data', uuid: 'bbbbbbbb-0000-0000-0000-000000000002' },
+  ]);
+  try {
+    const { port } = server.address();
+    // The fixture repo's OWN wrangler.toml wrongly maps the staging name to
+    // PROD's uuid -- exactly the misconfiguration this fix defends against.
+    const wranglerTomlContent = [
+      '[[d1_databases]]',
+      'binding = "DB"',
+      'database_name = "fronts-data-staging"',
+      'database_id = "bbbbbbbb-0000-0000-0000-000000000002"',
+      '',
+    ].join('\n');
+
+    const { result, invocations, targetedIds } = await runApply({
+      migrationFiles: ['0001_a.sql', '0002_b.sql'],
+      appliedLedgerNames: ['0001_a.sql'],
+      dryRun: false,
+      databaseName: 'fronts-data-staging',
+      databaseId: 'aaaaaaaa-0000-0000-0000-000000000001',
+      cfApiBase: `http://127.0.0.1:${port}`,
+      wranglerTomlContent,
+    });
+
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    // SELECT, --file apply, INSERT -- every single wrangler d1 call, not
+    // just the first one, must have targeted the verified id.
+    assert.equal(invocations.length, 3);
+    assert.deepEqual(
+      targetedIds,
+      ['aaaaaaaa-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000001'],
+      'every wrangler call must target the API-verified uuid, never the misconfigured wrangler.toml\'s',
+    );
+    for (const call of invocations) {
+      assert.ok(call.includes('--config'), `every wrangler call must carry --config once database-id is set: ${JSON.stringify(call)}`);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test('without database-id, wrangler resolves through the consumer\'s own wrangler.toml exactly as before this existed', async () => {
+  const wranglerTomlContent = [
+    '[[d1_databases]]',
+    'binding = "DB"',
+    'database_name = "fronts-data-staging"',
+    'database_id = "cccccccc-0000-0000-0000-000000000003"',
+    '',
+  ].join('\n');
+
+  const { result, invocations, targetedIds } = await runApply({
+    migrationFiles: ['0001_a.sql'],
+    appliedLedgerNames: ['0001_a.sql'],
+    dryRun: true,
+    databaseName: 'fronts-data-staging',
+    wranglerTomlContent,
+    // No databaseId, no cfApiBase -- must never touch the network, and
+    // must never pass --config.
+  });
+
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(invocations.length, 1);
+  assert.ok(!invocations[0].includes('--config'), 'no database-id means no generated config, exactly as before this existed');
+  assert.deepEqual(targetedIds, ['cccccccc-0000-0000-0000-000000000003']);
 });

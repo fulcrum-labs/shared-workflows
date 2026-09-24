@@ -77,8 +77,11 @@ concurrency:
   # keying on ref meant a staging dispatch (a different ref) could CANCEL a
   # pending prod push-apply in the same repo (one pending run per group;
   # cancel-in-progress stays false, so a same-database queue still waits
-  # rather than clobbers).
-  group: d1-migrations-${{ github.repository }}-${{ inputs.database-name }}
+  # rather than clobbers). account-id included too: a database-name string
+  # is only unique within one Cloudflare account, so two different accounts
+  # (this workflow is shared across every Fulcrum repo) with a same-named
+  # database would otherwise share one group despite being unrelated.
+  group: d1-migrations-${{ github.repository }}-${{ inputs.account-id }}-${{ inputs.database-name }}
   cancel-in-progress: false
 
 jobs:
