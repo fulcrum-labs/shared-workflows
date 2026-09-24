@@ -1,0 +1,64 @@
+# Fetch github.com/growth-labs/packages-go privately (execution-substrate ES-10).
+#
+# packages-go goes private: nothing runs on GitHub-hosted runners and the
+# self-hosted fleet never serves a public repo (operator ruling 2026-09-19), so
+# a public shared library would have no CI at all. A consumer job that resolves
+# Go modules runs this step before any `go` command. It:
+#   - mints a per-job installation token of the existing fulcrum-platform-automation
+#     GitHub App, scoped to contents:read on growth-labs/packages-go only;
+#   - sets GOPRIVATE and GONOSUMDB for github.com/growth-labs/* (the go command
+#     fetches those modules directly, never through proxy.golang.org or
+#     sum.golang.org; go.sum still pins every hash);
+#   - gives git the token through GIT_CONFIG_COUNT/KEY/VALUE in the job's
+#     environment -- never a global git config, which on a shared self-hosted
+#     runner would outlive the job.
+# The token is never echoed: create-github-app-token masks it, and it only
+# reaches $GITHUB_ENV.
+#
+# Usage:
+#   - uses: fulcrum-labs/shared-workflows/.github/actions/go-private-modules@<sha>
+#     with:
+#       app-id: ${{ secrets.FULCRUM_APP_ID }}
+#       private-key: ${{ secrets.FULCRUM_APP_PRIVATE_KEY }}
+name: Go private modules (growth-labs/packages-go)
+description: Per-job read access to growth-labs/packages-go for the go command, with GOPRIVATE/GONOSUMDB and job-scoped git auth.
+inputs:
+  app-id:
+    description: fulcrum-platform-automation App id (secrets.FULCRUM_APP_ID).
+    required: true
+  private-key:
+    description: fulcrum-platform-automation App private key (secrets.FULCRUM_APP_PRIVATE_KEY).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Mint a packages-go read token
+      id: token
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: growth-labs
+        repositories: packages-go
+        permission-contents: read
+    - name: Point the go command at packages-go privately
+      shell: bash
+      env:
+        PACKAGES_GO_TOKEN: ${{ steps.token.outputs.token }}
+      run: |
+        set -euo pipefail
+        if [ -z "${PACKAGES_GO_TOKEN}" ]; then
+          echo '::error::go-private-modules: the App token is empty; packages-go cannot be fetched.' >&2
+          exit 1
+        fi
+        pattern='github.com/growth-labs/*'
+        append() { if [ -n "$1" ]; then printf '%s,%s' "$1" "$pattern"; else printf '%s' "$pattern"; fi; }
+        n="${GIT_CONFIG_COUNT:-0}"
+        {
+          echo "GOPRIVATE=$(append "${GOPRIVATE:-}")"
+          echo "GONOSUMDB=$(append "${GONOSUMDB:-}")"
+          echo "GIT_CONFIG_COUNT=$((n + 1))"
+          echo "GIT_CONFIG_KEY_${n}=url.https://x-access-token:${PACKAGES_GO_TOKEN}@github.com/growth-labs/packages-go.insteadOf"
+          echo "GIT_CONFIG_VALUE_${n}=https://github.com/growth-labs/packages-go"
+        } >> "$GITHUB_ENV"
+        echo "go-private-modules: GOPRIVATE/GONOSUMDB set for ${pattern}; git auth for growth-labs/packages-go is job-scoped (GIT_CONFIG_KEY_${n})."
