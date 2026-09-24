@@ -231,14 +231,30 @@ jobs:
         # the most that ran at once (per vitest process, and in total), so the
         # acceptance reads a real count, not the request.
         run: |
+          # Only this step's own process tree is counted: on a guest shared
+          # by 23 runners, a neighbour's uncapped job must not show up in
+          # this job's "observed" line. A worker is a node process with
+          # vitest's fork-worker script anywhere in its argv, so execArgv or
+          # --conditions placed before the script do not hide it.
           observe() {
+            root=$$
             max_total=0 max_per=0
             while :; do
-              counts="$(ps -eo ppid=,args= 2>/dev/null | awk '$2 ~ /(^|\/)node$/ && $3 ~ /vitest\/dist\/workers\/forks\.m?js$/ {print $1}' | sort | uniq -c | awk '{print $1}')"
-              total=0 per=0
-              for c in $counts; do total=$((total + c)); [ "$c" -gt "$per" ] && per=$c; done
-              [ "$total" -gt "$max_total" ] && max_total=$total
-              [ "$per" -gt "$max_per" ] && max_per=$per
+              read -r per total <<EOF_COUNT
+          $(ps -eo pid=,ppid=,args= 2>/dev/null | awk -v root="$root" '
+            { ppid[$1] = $2; is[$1] = 0
+              if ($3 ~ /(^|\/)node$/) for (i = 4; i <= NF; i++) if ($i ~ /vitest\/dist\/workers\/forks\.m?js$/) { is[$1] = 1; break } }
+            END {
+              desc[root] = 1; changed = 1
+              while (changed) { changed = 0; for (p in ppid) if (!(p in desc) && (ppid[p] in desc)) { desc[p] = 1; changed = 1 } }
+              for (p in is) if (is[p] && (p in desc)) count[ppid[p]]++
+              total = 0; per = 0
+              for (q in count) { total += count[q]; if (count[q] > per) per = count[q] }
+              print per, total
+            }')
+          EOF_COUNT
+              [ "${total:-0}" -gt "$max_total" ] && max_total=$total
+              [ "${per:-0}" -gt "$max_per" ] && max_per=$per
               echo "$max_per $max_total" > "$RUNNER_TEMP/vitest-workers-observed"
               sleep 1
             done
@@ -251,7 +267,7 @@ jobs:
           set -e
           kill "$observer" 2>/dev/null || true
           read -r per total < "$RUNNER_TEMP/vitest-workers-observed" 2>/dev/null || { per=0; total=0; }
-          echo "vitest workers observed: at most $per fork workers under one vitest process, $total at once in total (cap $VITEST_MAX_WORKERS)"
+          echo "vitest workers observed (this step only): at most $per fork workers under one vitest process, $total at once in total (cap $VITEST_MAX_WORKERS)"
           exit "$status"
         env:
           VITEST_MAX_WORKERS: ${{ steps.vitest-cap.outputs.workers }}

@@ -323,9 +323,11 @@ test('a strict Turbo repo that runs vitest must pass the cap through, or the gat
 test('the gate reports the vitest worker count it observed, not only the cap it set', () => {
   const gateStart = workflow.indexOf('      - name: CI gate (typecheck + lint + test + build)')
   const gate = workflow.slice(gateStart, workflow.indexOf('      - name: Lockfile integrity'))
-  // Counted: node processes whose script IS vitest's fork worker, grouped by
-  // parent -- never a shell whose command line merely mentions the path.
-  assert.match(gate, /\$2 ~ \/\(\^\|\\\/\)node\$\/ && \$3 ~ \/vitest\\\/dist\\\/workers\\\/forks/)
-  assert.match(gate, /vitest workers observed: at most \$per fork workers/)
+  // Counted: node processes with vitest's fork-worker script anywhere in
+  // argv, and only inside this step's own process tree (root=$$).
+  assert.match(gate, /root=\$\$/)
+  assert.match(gate, /for \(i = 4; i <= NF; i\+\+\) if \(\$i ~ \/vitest/)
+  assert.match(gate, /\(ppid\[p\] in desc\)/)
+  assert.match(gate, /vitest workers observed \(this step only\): at most \$per fork workers/)
   assert.match(gate, /exit "\$status"/)
 })
