@@ -591,8 +591,23 @@ jobs:
           # #58(ii) closed for the apply workflow. Same technique here: a
           # generated, minimal --config pins wrangler to the verified id
           # instead of letting the consumer's own wrangler.toml/json decide.
+          #
+          # Gated on NEEDS_FALLBACK_NOTICE being EMPTY, not merely on
+          # D1_STAGING_JSON being non-empty: a staging block that declares
+          # databaseId but no databaseName still leaves DB_NAME resolved to
+          # PROD's name (the fallback above), and generating a config from
+          # THAT combination would map prod's name to staging's uuid --
+          # reading staging while the notice claims prod. Only bind the
+          # config when the staging branch genuinely supplied its own name
+          # (the exact condition NEEDS_FALLBACK_NOTICE already computed).
           D1_CONFIG_ARGS=()
-          if [ -n "$D1_STAGING_JSON" ]; then
+          if [ -z "$NEEDS_FALLBACK_NOTICE" ] && [ -n "$D1_STAGING_JSON" ]; then
+            # Written under $RUNNER_TEMP, not a self-managed mkdtemp path
+            # (contrast fulcrum-labs/shared-workflows#58's Node script,
+            # which falls back to the OS tmpdir and so needed its own
+            # explicit rmSync): this one file is cleaned by the runner at
+            # job end along with the rest of $RUNNER_TEMP, nothing here
+            # removes it itself.
             D1_CONFIG_PATH="$(D1_STAGING_JSON="$D1_STAGING_JSON" DB_NAME="$DB_NAME" node -p "
               const fs = require('fs');
               const path = require('path');

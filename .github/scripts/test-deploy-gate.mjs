@@ -398,6 +398,32 @@ test('without a databaseId, the ledger read carries no --config at all -- unchan
   assert.match(result.stdout, /d1 execute fronts-data-staging/);
 });
 
+// reviewer-foundry LOW on #59's approval: the config gate checked
+// staging.databaseId alone, not whether DB_NAME actually came from
+// staging. A staging block declaring databaseId but no databaseName still
+// falls back to PROD's name (the resolution above), and binding THAT name
+// to staging's uuid would read staging while the ::notice claims prod.
+test('a staging.databaseId with no staging.databaseName never generates a --config -- DB_NAME already fell back to prod, and binding prod\'s name to staging\'s uuid would read staging while the notice claims prod', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = withFakeWranglerPrefix(extractResolutionAndLedgerReadBlock(step)) + '\ncat "$(pwd)/wrangler-argv.log"\n';
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      // No databaseName here -- only databaseId, the exact shape that
+      // slipped through before this fix.
+      staging: { enabled: true, reconciliation: 'exact', databaseId: 'aaaa-staging-uuid-should-never-be-used' },
+    }),
+    'bin/wrangler': FAKE_WRANGLER_ARGV_STUB,
+  };
+
+  const result = runShellBlock(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout, /--config/);
+  assert.doesNotMatch(result.stdout, /aaaa-staging-uuid-should-never-be-used/);
+  assert.match(result.stdout, /d1 execute fronts-data --remote/, 'must target prod\'s name, unmodified by any generated config');
+  assert.doesNotMatch(result.stdout, /fronts-data-staging/);
+});
+
 // The catch-up tolerance itself lives in the ledger-tripwire heredoc (it
 // needs the missing-file diff already computed there), fed by
 // D1_STAGING_JSON -- these run the actual extracted heredoc, the same
