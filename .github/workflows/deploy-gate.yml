@@ -531,8 +531,23 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
           APP_DIRECTORY: ${{ inputs.app-directory }}
+          GATE_ENVIRONMENT: ${{ inputs.environment }}
         run: |
-          DB_NAME="$(node -p "JSON.parse(require('fs').readFileSync('.publication/d1-migrations.json','utf8')).databaseName || ''")"
+          # A `-staging` environment (the caller's deploy-staging job, e.g.
+          # `fronts-staging`) reads `.staging.databaseName` out of
+          # platform-foundations' extended `.publication/d1-migrations.json`
+          # once a project opts into `d1Role.staging`
+          # (fulcrum-labs/platform-foundations#1006). No new input: this
+          # branches on `environment`, which every caller already sets.
+          # Falling back to the top-level `databaseName` when `.staging` is
+          # absent keeps EVERY existing caller's behaviour byte-identical --
+          # including a staging deploy for a project that hasn't opted in
+          # yet, which still checks prod's ledger exactly as it does today.
+          DB_NAME="$(node -p "
+            const data = JSON.parse(require('fs').readFileSync('.publication/d1-migrations.json', 'utf8'));
+            const env = process.env.GATE_ENVIRONMENT || 'production';
+            (env.endsWith('-staging') && data.staging && data.staging.databaseName) || data.databaseName || '';
+          ")"
           if [ -z "$DB_NAME" ]; then
             echo "::error::.publication/d1-migrations.json has no databaseName" >&2
             exit 1

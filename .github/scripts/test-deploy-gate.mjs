@@ -16,6 +16,36 @@ function extractHeredoc(step, marker) {
   return match[1].replace(/^ {10}/gm, '');
 }
 
+// Different shape from extractHeredoc: DB_NAME resolves via a `node -p "..."`
+// command substitution, not a `node - <<'MARKER'` heredoc.
+function extractDbNameScript(step) {
+  const match = step.match(/DB_NAME="\$\(node -p "\n([\s\S]*?)\n\s*"\)"/);
+  assert.ok(match, 'the DB_NAME node -p script must be embedded in the step');
+  return match[1];
+}
+
+function resolveDbName(script, files, env) {
+  const root = mkdtempSync(join(tmpdir(), 'd1-dbname-'));
+  try {
+    for (const [rel, body] of Object.entries(files)) {
+      mkdirSync(join(root, rel, '..'), { recursive: true });
+      writeFileSync(join(root, rel), body);
+    }
+    // A real `node -p`, not piped stdin: this is the ASI/TDZ-sensitive shape
+    // (KB flake-signature-checkout-freshness..., and the sibling fix in
+    // #53 for this exact repo) -- a missing semicolon between two
+    // unparenthesized statements silently changes what gets parsed, so this
+    // must execute the actual extracted string, never a hand-retyped copy.
+    return spawnSync(process.execPath, ['-p', script], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ...env },
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function runTripwire(script, files, ledgerNames) {
   const root = mkdtempSync(join(tmpdir(), 'd1-ledger-'));
   try {
@@ -78,6 +108,69 @@ test('the ledger tripwire fails on migration files missing from the live ledger'
   assert.match(drifted.stdout, /::error::D1 migration never applied to the live ledger — migrations\/0074_b.sql/);
   assert.match(drifted.stdout, /never applied to the live ledger — node_modules\/@growth-labs\/analytics\/migrations\/0006_identity.sql/);
   assert.doesNotMatch(drifted.stdout, /0073_a.sql/);
+});
+
+// fulcrum-labs/platform-foundations#1006 extends .publication/d1-migrations.json
+// with a sibling `staging` object; these tests run the actual extracted
+// DB_NAME resolution script (not a hand-retyped copy) against real fixture
+// files, the same discipline the ledger-tripwire tests above already apply.
+test('DB_NAME reads .staging.databaseName on a -staging environment once a project opts in', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameScript(step);
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      staging: { databaseName: 'fronts-data-staging' },
+    }),
+  };
+
+  const staging = resolveDbName(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(staging.status, 0, staging.stderr);
+  assert.equal(staging.stdout.trim(), 'fronts-data-staging');
+
+  const prod = resolveDbName(script, files, { GATE_ENVIRONMENT: 'fronts-production' });
+  assert.equal(prod.status, 0, prod.stderr);
+  assert.equal(prod.stdout.trim(), 'fronts-data', 'a -production environment must never read .staging, even when it exists');
+});
+
+test('DB_NAME falls back to the top-level databaseName on a -staging environment until a project opts in -- unchanged from before this existed', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameScript(step);
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({ databaseName: 'fronts-data' }),
+  };
+
+  const result = resolveDbName(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), 'fronts-data');
+});
+
+test('DB_NAME defaults GATE_ENVIRONMENT to production when unset, matching the environment input\'s own default', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameScript(step);
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      staging: { databaseName: 'fronts-data-staging' },
+    }),
+  };
+
+  const result = resolveDbName(script, files, {});
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), 'fronts-data');
+});
+
+// Same discipline as the dry-run version-listing snippet's own equivalent
+// test below: a missing semicolon between two unparenthesized statements is
+// exactly how this repo's own worst ASI/TDZ incident (run 35916382952)
+// happened. Caught live while drafting this script -- the unsemicoloned
+// version silently returned `undefined` for every input.
+test('the DB_NAME node -p script is free of unsemicoloned statements', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameScript(step);
+  for (const statement of script.split('\n').filter((line) => line.trim() !== '')) {
+    assert.match(statement.trim(), /;$/, `every statement must end in an explicit semicolon: ${statement}`);
+  }
 });
 
 // ─── Risk-matched journey gate (operating-baseline B-03) ───
