@@ -717,7 +717,11 @@ jobs:
       # classification -- the calling job needs to go red on the run that
       # just shipped a regression, not only on some later deploy's gate.
       - name: Post-deploy journeys
-        if: ${{ !inputs.dry-run && inputs.journeys-audience != '' }}
+        # Must not run when the deploy itself was skipped as superseded
+        # (require-descends-from-live's proceed=false) -- otherwise this
+        # tests the newer live version that already deployed under THIS
+        # run's (older) SHA, a false-positive-shaped canary run.
+        if: ${{ !inputs.dry-run && inputs.journeys-audience != '' && steps.require-descends-from-live.outputs.proceed != 'false' }}
         env:
           JOURNEYS_CANARY_URL: ${{ inputs.journeys-canary-url }}
           JOURNEYS_AUDIENCE: ${{ inputs.journeys-audience }}

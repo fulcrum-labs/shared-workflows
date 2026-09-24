@@ -662,6 +662,15 @@ test('the "Deploy with provenance" step skips itself (never runs) when require-d
   );
 });
 
+test('"Post-deploy journeys" also skips when require-descends-from-live reports proceed=false -- it must not canary-test the newer version that already deployed under this run\'s SHA', () => {
+  const journeysStart = workflow.indexOf('      - name: Post-deploy journeys');
+  const journeysStep = workflow.slice(journeysStart, workflow.indexOf('\n\n', journeysStart));
+  assert.match(
+    journeysStep,
+    /if: \$\{\{ !inputs\.dry-run && inputs\.journeys-audience != '' && steps\.require-descends-from-live\.outputs\.proceed != 'false' \}\}/,
+  );
+});
+
 test('refuses loudly on diverged history (neither commit is an ancestor of the other)', () => {
   const script = extractAncestryDecisionScript();
   const { dir } = initAncestryTempRepo();
