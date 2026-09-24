@@ -23,6 +23,11 @@
 # the site 5xx'd for ~14 minutes. CF Builds only runs `wrangler deploy`
 # — it does NOT apply migrations. This workflow closes that gap.
 # KB: fronts-d1-migration-and-monitoring-gap-2026-05-25.
+#
+# `dry-run: true` lists what apply-missing would do (repo migrations not yet
+# in d1_migrations) and exits without applying anything or writing to the
+# ledger. Added for a staging catch-up dispatch previewing before commit;
+# default false leaves every existing caller applying exactly as before.
 
 name: D1 migrations apply (reusable)
 
@@ -49,6 +54,10 @@ on:
         type: string
         default: "main"
         description: "Git ref of fulcrum-labs/shared-workflows to check out alongside the consumer repo (for the apply-d1-migrations.mjs script)."
+      dry-run:
+        type: boolean
+        default: false
+        description: "List pending migrations and exit without applying anything or writing to d1_migrations. Default false keeps every existing caller applying exactly as before this input existed."
     secrets:
       CF_API_TOKEN:
         required: true
@@ -71,6 +80,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account-id }}
       D1_DATABASE_NAME: ${{ inputs.database-name }}
       D1_MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
+      D1_MIGRATIONS_DRY_RUN: ${{ inputs.dry-run && '1' || '' }}
     steps:
       - name: Checkout consumer repo
         uses: actions/checkout@v5

@@ -30,6 +30,11 @@ const DB_NAME = process.env.D1_DATABASE_NAME;
 const MIGRATIONS_DIR = process.env.D1_MIGRATIONS_DIR || "migrations";
 const ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 const API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+// List pending migrations and exit 0 without applying anything or writing
+// to d1_migrations. Read-only end to end (the ledger SELECT above already
+// runs either way) -- for a staging catch-up dispatch previewing what
+// apply-missing would do before committing to it.
+const DRY_RUN = process.env.D1_MIGRATIONS_DRY_RUN === "1";
 
 if (!DB_NAME) throw new Error("D1_DATABASE_NAME is required");
 if (!ACCOUNT_ID) throw new Error("CLOUDFLARE_ACCOUNT_ID is required");
@@ -107,6 +112,11 @@ if (pending.length === 0) {
 }
 
 log(`${pending.length} pending: ${pending.join(", ")}`);
+
+if (DRY_RUN) {
+	log("dry run: not applying (D1_MIGRATIONS_DRY_RUN=1)");
+	process.exit(0);
+}
 
 for (const file of pending) {
 	const filePath = join(migrationsDir, file);
