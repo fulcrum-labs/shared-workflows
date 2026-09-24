@@ -567,11 +567,52 @@ jobs:
             const isStaging = env === 'staging' || env.endsWith('-staging');
             isStaging && data.staging ? JSON.stringify(data.staging) : '';
           ")"
-          if { [ "$GATE_ENVIRONMENT" = "staging" ] || [[ "$GATE_ENVIRONMENT" == *-staging ]]; } && [ -z "$D1_STAGING_JSON" ]; then
+
+          # The notice fires whenever the STAGING BRANCH didn't supply a
+          # name -- not merely when D1_STAGING_JSON is empty. A manifest
+          # that declares `staging: { enabled: false }` with no
+          # databaseName makes D1_STAGING_JSON non-empty (the object
+          # exists) while DB_NAME still silently falls through to prod;
+          # checking D1_STAGING_JSON emptiness alone missed exactly that
+          # case and stayed silent about it.
+          NEEDS_FALLBACK_NOTICE="$(node -p "
+            const data = JSON.parse(require('fs').readFileSync('.publication/d1-migrations.json', 'utf8'));
+            const env = process.env.GATE_ENVIRONMENT || 'production';
+            const isStaging = env === 'staging' || env.endsWith('-staging');
+            (isStaging && !(data.staging && data.staging.databaseName)) ? '1' : '';
+          ")"
+          if [ -n "$NEEDS_FALLBACK_NOTICE" ]; then
             echo "::notice::$GATE_ENVIRONMENT has no d1Role.staging yet; checking the production ledger ($DB_NAME)"
           fi
 
-          if ! "$WRANGLER_BIN" d1 execute "$DB_NAME" --remote --json \
+          # reviewer-foundry on #59: staging.databaseId was carried into
+          # D1_STAGING_JSON but never actually used -- the ledger read below
+          # still resolved DB_NAME by NAME alone, the same class of gap
+          # #58(ii) closed for the apply workflow. Same technique here: a
+          # generated, minimal --config pins wrangler to the verified id
+          # instead of letting the consumer's own wrangler.toml/json decide.
+          D1_CONFIG_ARGS=()
+          if [ -n "$D1_STAGING_JSON" ]; then
+            D1_CONFIG_PATH="$(D1_STAGING_JSON="$D1_STAGING_JSON" DB_NAME="$DB_NAME" node -p "
+              const fs = require('fs');
+              const path = require('path');
+              const staging = JSON.parse(process.env.D1_STAGING_JSON);
+              const configPath = staging.databaseId
+                ? path.join(process.env.RUNNER_TEMP || '/tmp', 'd1-tripwire-config.json')
+                : '';
+              if (configPath) {
+                fs.writeFileSync(configPath, JSON.stringify({
+                  d1_databases: [{ binding: 'DB', database_name: process.env.DB_NAME, database_id: staging.databaseId }],
+                }));
+              }
+              configPath;
+            ")"
+            if [ -n "$D1_CONFIG_PATH" ]; then
+              D1_CONFIG_ARGS=(--config "$D1_CONFIG_PATH")
+            fi
+          fi
+
+          if ! "$WRANGLER_BIN" d1 execute "$DB_NAME" "${D1_CONFIG_ARGS[@]}" --remote --json \
               --command "SELECT name FROM d1_migrations" > "$RUNNER_TEMP/d1-ledger.json"; then
             echo "::error::D1 ledger read failed for $DB_NAME — CF_DEPLOY_API_TOKEN needs D1:Read on the account" >&2
             exit 1
@@ -618,6 +659,7 @@ jobs:
               const summary = `staging D1 in catch-up until ${staging.catchUpUntil}: ${missing.length} of ${checked} migrations missing`
               console.log(`::warning::${summary}`)
               console.log(summary)
+              if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary}\n`)
               process.exit(0)
             }
             for (const file of missing) console.log(`::error::D1 migration never applied to the live ledger — ${file}`)

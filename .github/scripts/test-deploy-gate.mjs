@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,12 +44,31 @@ function extractDbNameResolutionShellBlock(step) {
   return step.slice(bodyStart, end).replace(/^ {10}/gm, '');
 }
 
+// Captures the run: block from its start through the wrangler d1 execute
+// ledger-read call (inclusive) -- further than
+// extractDbNameResolutionShellBlock, which stops BEFORE that call. Needed
+// to observe what arguments the ledger read actually receives (e.g.
+// --config), not just what DB_NAME/D1_STAGING_JSON/notice resolve to.
+function extractResolutionAndLedgerReadBlock(step) {
+  const marker = 'run: |\n'
+  const start = step.indexOf(marker)
+  assert.ok(start >= 0, 'the tripwire step must have a run: block')
+  const bodyStart = start + marker.length
+  const end = step.indexOf("D1_LEDGER_JSON=\"$RUNNER_TEMP/d1-ledger.json\"", bodyStart)
+  assert.ok(end >= 0, 'the run: block must reach the heredoc invocation')
+  return step.slice(bodyStart, end).replace(/^ {10}/gm, '')
+}
+
 function runShellBlock(script, files, env) {
   const root = mkdtempSync(join(tmpdir(), 'd1-shell-'));
   try {
     for (const [rel, body] of Object.entries(files)) {
       mkdirSync(join(root, rel, '..'), { recursive: true });
       writeFileSync(join(root, rel), body);
+      // Harmless on a non-script fixture (e.g. .publication/d1-migrations.json);
+      // lets a fixture file with a shebang (a fake WRANGLER_BIN) be executed
+      // directly without a separate chmod step per test.
+      chmodSync(join(root, rel), 0o755);
     }
     return spawnSync('bash', ['-c', script], {
       cwd: root,
@@ -118,7 +137,11 @@ test('the ledger tripwire blocks deployment after wrangler installation, only fo
     step,
     /if: hashFiles\(inputs\.app-directory != '' && format\('\{0\}\/\.publication\/d1-migrations\.json', inputs\.app-directory\) \|\| '\.publication\/d1-migrations\.json'\) != ''/,
   );
-  assert.match(step, /d1 execute "\$DB_NAME" --remote --json/);
+  // "${D1_CONFIG_ARGS[@]}" (reviewer-foundry on #59: binds the ledger read
+  // to a verified database-id via a generated --config) sits between
+  // "$DB_NAME" and --remote once staging.databaseId is set; empty and a
+  // no-op otherwise, so the flag is optional in the match, not required.
+  assert.match(step, /d1 execute "\$DB_NAME"(?: "\$\{D1_CONFIG_ARGS\[@\]\}")? --remote --json/);
   assert.match(step, /CF_DEPLOY_API_TOKEN needs D1:Read/);
   assert.doesNotMatch(step, /continue-on-error:|d1 migrations apply/, 'the ledger check must fail closed and never apply migrations');
   assert.doesNotMatch(workflow.slice(deployStart), /if:.*(?:always|failure|cancelled)\(/,
@@ -258,6 +281,28 @@ test('an unconfigured .staging on a -staging environment emits a ::notice naming
   assert.doesNotMatch(result.stdout, /::error::/);
 });
 
+test('a declared-but-unconfigured .staging (enabled:false, no databaseName) still emits the ::notice -- checking D1_STAGING_JSON emptiness alone missed exactly this case', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameResolutionShellBlock(step);
+  const files = {
+    // .staging EXISTS (so D1_STAGING_JSON would be non-empty), but supplies
+    // no databaseName -- DB_NAME must still fall back to prod, and the
+    // fallback must still be loud, not silent.
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      staging: { enabled: false },
+    }),
+  };
+
+  const result = runShellBlock(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(
+    result.stdout,
+    /::notice::fronts-staging has no d1Role\.staging yet; checking the production ledger \(fronts-data\)/,
+  );
+  assert.doesNotMatch(result.stdout, /::error::/);
+});
+
 test('a -production environment with no databaseName at all still hard-errors, exactly as before this existed', () => {
   const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
   const script = extractDbNameResolutionShellBlock(step);
@@ -285,6 +330,72 @@ test('a configured staging.databaseName on a -staging environment proceeds past 
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /REACHED: fronts-data-staging/);
   assert.doesNotMatch(result.stdout, /::notice::|::error::/);
+});
+
+// reviewer-foundry on #59's approval: staging.databaseId was carried into
+// D1_STAGING_JSON but never actually used -- the ledger read still resolved
+// DB_NAME by name alone, the same gap #58(ii) closed for the apply
+// workflow. These run the actual resolution-through-ledger-read block
+// against a fake WRANGLER_BIN that records its own argv, so the assertion
+// is "the real invocation carried --config pointing at the right id", not
+// a guess about what the script does. WRANGLER_BIN/RUNNER_TEMP are set via
+// `$(pwd)` INSIDE the script (prepended here), since runShellBlock's temp
+// root isn't known until the script is already running in it.
+const FAKE_WRANGLER_ARGV_STUB = [
+  '#!/usr/bin/env bash',
+  'echo "$@" >> "$(pwd)/wrangler-argv.log"',
+  'if [[ "$@" == *"--json"* ]]; then echo \'[{"results":[]}]\'; fi',
+  '',
+].join('\n');
+
+function withFakeWranglerPrefix(script) {
+  return 'export WRANGLER_BIN="$(pwd)/bin/wrangler"\nmkdir -p "$(pwd)/tmp"\nexport RUNNER_TEMP="$(pwd)/tmp"\n' + script;
+}
+
+test('staging.databaseId binds the ledger read to a generated --config naming the verified id', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  // A marker line between the two `cat`s makes it unambiguous which output
+  // is the argv log and which is the generated config, from one run.
+  const script = withFakeWranglerPrefix(extractResolutionAndLedgerReadBlock(step))
+    + '\ncat "$(pwd)/wrangler-argv.log"\necho "===CONFIG==="\ncat "$RUNNER_TEMP/d1-tripwire-config.json"\n';
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      staging: {
+        enabled: true,
+        databaseName: 'fronts-data-staging',
+        reconciliation: 'exact',
+        databaseId: 'aaaa-1111-verified-uuid',
+      },
+    }),
+    'bin/wrangler': FAKE_WRANGLER_ARGV_STUB,
+  };
+
+  const result = runShellBlock(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const [argvLog, configJson] = result.stdout.split('===CONFIG===\n');
+  assert.match(argvLog, /--config \S*d1-tripwire-config\.json/);
+  assert.match(argvLog, /d1 execute fronts-data-staging/);
+  assert.deepEqual(JSON.parse(configJson.trim()), {
+    d1_databases: [{ binding: 'DB', database_name: 'fronts-data-staging', database_id: 'aaaa-1111-verified-uuid' }],
+  });
+});
+
+test('without a databaseId, the ledger read carries no --config at all -- unchanged for every project that has not opted in yet', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = withFakeWranglerPrefix(extractResolutionAndLedgerReadBlock(step)) + '\ncat "$(pwd)/wrangler-argv.log"\n';
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      staging: { enabled: true, databaseName: 'fronts-data-staging', reconciliation: 'exact' },
+    }),
+    'bin/wrangler': FAKE_WRANGLER_ARGV_STUB,
+  };
+
+  const result = runShellBlock(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout, /--config/);
+  assert.match(result.stdout, /d1 execute fronts-data-staging/);
 });
 
 // The catch-up tolerance itself lives in the ledger-tripwire heredoc (it
