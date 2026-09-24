@@ -24,6 +24,13 @@ function extractDbNameScript(step) {
   return match[1];
 }
 
+// Same shape, the sibling D1_STAGING_JSON resolution.
+function extractStagingJsonScript(step) {
+  const match = step.match(/D1_STAGING_JSON="\$\(node -p "\n([\s\S]*?)\n\s*"\)"/);
+  assert.ok(match, 'the D1_STAGING_JSON node -p script must be embedded in the step');
+  return match[1];
+}
+
 // The skip-cleanly-with-a-::notice behaviour lives in the shell AROUND
 // DB_NAME, not inside the node -p script itself, so it needs the actual
 // bash step run for real (not the node -p script in isolation).
@@ -76,7 +83,7 @@ function resolveDbName(script, files, env) {
   }
 }
 
-function runTripwire(script, files, ledgerNames) {
+function runTripwire(script, files, ledgerNames, extraEnv = {}) {
   const root = mkdtempSync(join(tmpdir(), 'd1-ledger-'));
   try {
     for (const [rel, body] of Object.entries(files)) {
@@ -89,7 +96,7 @@ function runTripwire(script, files, ledgerNames) {
       cwd: root,
       input: script,
       encoding: 'utf8',
-      env: { ...process.env, D1_LEDGER_JSON: ledgerPath },
+      env: { ...process.env, D1_LEDGER_JSON: ledgerPath, ...extraEnv },
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -163,12 +170,7 @@ test('DB_NAME reads .staging.databaseName on a -staging environment once a proje
   assert.equal(prod.stdout.trim(), 'fronts-data', 'a -production environment must never read .staging, even when it exists');
 });
 
-test('DB_NAME resolves empty (never falls back to prod) on a -staging environment until a project opts in', () => {
-  // Checking PROD's ledger during a STAGING deploy would be worse than not
-  // checking at all -- false confidence that staging's own migrations are
-  // fine when this never looked at staging. The surrounding shell (tested
-  // below, not this node -p script alone) is what turns an empty DB_NAME on
-  // a -staging environment into a clean skip instead of a hard error.
+test('DB_NAME falls back to the top-level databaseName on a -staging environment until a project opts in (paired with the ::notice below, never silent)', () => {
   const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
   const script = extractDbNameScript(step);
   const files = {
@@ -177,7 +179,22 @@ test('DB_NAME resolves empty (never falls back to prod) on a -staging environmen
 
   const result = resolveDbName(script, files, { GATE_ENVIRONMENT: 'fronts-staging' });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), '');
+  assert.equal(result.stdout.trim(), 'fronts-data');
+});
+
+test('DB_NAME treats a bare "staging" environment name the same as a "*-staging" one', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractDbNameScript(step);
+  const files = {
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      staging: { databaseName: 'fronts-data-staging' },
+    }),
+  };
+
+  const result = resolveDbName(script, files, { GATE_ENVIRONMENT: 'staging' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), 'fronts-data-staging');
 });
 
 test('DB_NAME defaults GATE_ENVIRONMENT to production when unset, matching the environment input\'s own default', () => {
@@ -195,7 +212,37 @@ test('DB_NAME defaults GATE_ENVIRONMENT to production when unset, matching the e
   assert.equal(result.stdout.trim(), 'fronts-data');
 });
 
-test('an undefined staging.databaseName on a -staging environment skips the tripwire cleanly with a ::notice, exit 0 -- never silently, never a failure', () => {
+test('D1_STAGING_JSON is empty on a -production environment even when .staging exists, and empty on a -staging environment with no .staging', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractStagingJsonScript(step);
+  const withStaging = {
+    '.publication/d1-migrations.json': JSON.stringify({
+      databaseName: 'fronts-data',
+      staging: { enabled: true, databaseName: 'fronts-data-staging', reconciliation: 'exact' },
+    }),
+  };
+  const withoutStaging = {
+    '.publication/d1-migrations.json': JSON.stringify({ databaseName: 'fronts-data' }),
+  };
+
+  const prod = resolveDbName(script, withStaging, { GATE_ENVIRONMENT: 'fronts-production' });
+  assert.equal(prod.status, 0, prod.stderr);
+  assert.equal(prod.stdout.trim(), '');
+
+  const stagingUnconfigured = resolveDbName(script, withoutStaging, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(stagingUnconfigured.status, 0, stagingUnconfigured.stderr);
+  assert.equal(stagingUnconfigured.stdout.trim(), '');
+
+  const stagingConfigured = resolveDbName(script, withStaging, { GATE_ENVIRONMENT: 'fronts-staging' });
+  assert.equal(stagingConfigured.status, 0, stagingConfigured.stderr);
+  assert.deepEqual(JSON.parse(stagingConfigured.stdout.trim()), {
+    enabled: true,
+    databaseName: 'fronts-data-staging',
+    reconciliation: 'exact',
+  });
+});
+
+test('an unconfigured .staging on a -staging environment emits a ::notice naming the environment and the production database it falls back to', () => {
   const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
   const script = extractDbNameResolutionShellBlock(step);
   const files = {
@@ -206,7 +253,7 @@ test('an undefined staging.databaseName on a -staging environment skips the trip
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(
     result.stdout,
-    /::notice::\.publication\/d1-migrations\.json has no staging\.databaseName yet for fronts-staging -- skipping the D1 migration ledger tripwire/,
+    /::notice::fronts-staging has no d1Role\.staging yet; checking the production ledger \(fronts-data\)/,
   );
   assert.doesNotMatch(result.stdout, /::error::/);
 });
@@ -224,7 +271,7 @@ test('a -production environment with no databaseName at all still hard-errors, e
   assert.doesNotMatch(result.stdout, /::notice::/);
 });
 
-test('a configured staging.databaseName on a -staging environment proceeds past the DB_NAME check without a notice or an error', () => {
+test('a configured staging.databaseName on a -staging environment proceeds past the resolution block without a notice or an error', () => {
   const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
   const script = extractDbNameResolutionShellBlock(step) + '\necho "REACHED: $DB_NAME"\n';
   const files = {
@@ -240,16 +287,102 @@ test('a configured staging.databaseName on a -staging environment proceeds past 
   assert.doesNotMatch(result.stdout, /::notice::|::error::/);
 });
 
+// The catch-up tolerance itself lives in the ledger-tripwire heredoc (it
+// needs the missing-file diff already computed there), fed by
+// D1_STAGING_JSON -- these run the actual extracted heredoc, the same
+// discipline 'the ledger tripwire fails on migration files missing...' above
+// already applies, now parameterised by a staging JSON payload.
+test('an unexpired catch-up warns with the missing count and deadline, and exits 0, instead of hard-erroring', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractHeredoc(step, 'D1_LEDGER_TRIPWIRE');
+  const files = { 'migrations/0001_a.sql': 'SELECT 1;', 'migrations/0002_b.sql': 'SELECT 1;' };
+  const staging = JSON.stringify({
+    enabled: true,
+    databaseName: 'fronts-data-staging',
+    reconciliation: 'catch-up',
+    catchUpUntil: '2099-01-01T00:00:00Z',
+  });
+
+  const result = runTripwire(script, files, ['0001_a.sql'], { D1_STAGING_JSON: staging, D1_DB_NAME: 'fronts-data-staging' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /::warning::staging D1 in catch-up until 2099-01-01T00:00:00Z: 1 of 2 migrations missing/);
+  assert.doesNotMatch(result.stdout, /::error::/);
+});
+
+test('an expired catch-up window hard-errors exactly like a fully reconciled ledger, per missing file', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractHeredoc(step, 'D1_LEDGER_TRIPWIRE');
+  const files = { 'migrations/0001_a.sql': 'SELECT 1;', 'migrations/0002_b.sql': 'SELECT 1;' };
+  const staging = JSON.stringify({
+    enabled: true,
+    databaseName: 'fronts-data-staging',
+    reconciliation: 'catch-up',
+    catchUpUntil: '2020-01-01T00:00:00Z',
+  });
+
+  const result = runTripwire(script, files, ['0001_a.sql'], { D1_STAGING_JSON: staging, D1_DB_NAME: 'fronts-data-staging' });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /::error::D1 migration never applied to the live ledger — migrations\/0002_b\.sql/);
+  assert.doesNotMatch(result.stdout, /::warning::/);
+});
+
+test('an exact reconciliation hard-errors on any missing file, same as a disabled staging block -- catch-up tolerance never applies to either', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractHeredoc(step, 'D1_LEDGER_TRIPWIRE');
+  const files = { 'migrations/0001_a.sql': 'SELECT 1;', 'migrations/0002_b.sql': 'SELECT 1;' };
+
+  const exact = JSON.stringify({ enabled: true, databaseName: 'fronts-data-staging', reconciliation: 'exact' });
+  const exactResult = runTripwire(script, files, ['0001_a.sql'], { D1_STAGING_JSON: exact, D1_DB_NAME: 'fronts-data-staging' });
+  assert.equal(exactResult.status, 1);
+  assert.match(exactResult.stdout, /::error::D1 migration never applied to the live ledger — migrations\/0002_b\.sql/);
+
+  const disabled = JSON.stringify({
+    enabled: false,
+    databaseName: 'fronts-data-staging',
+    reconciliation: 'catch-up',
+    catchUpUntil: '2099-01-01T00:00:00Z',
+  });
+  const disabledResult = runTripwire(script, files, ['0001_a.sql'], { D1_STAGING_JSON: disabled, D1_DB_NAME: 'fronts-data-staging' });
+  assert.equal(disabledResult.status, 1);
+  assert.match(disabledResult.stdout, /::error::D1 migration never applied to the live ledger — migrations\/0002_b\.sql/);
+});
+
+test('zero migration files is still a hard error regardless of catch-up state', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractHeredoc(step, 'D1_LEDGER_TRIPWIRE');
+  const staging = JSON.stringify({
+    enabled: true,
+    databaseName: 'fronts-data-staging',
+    reconciliation: 'catch-up',
+    catchUpUntil: '2099-01-01T00:00:00Z',
+  });
+
+  const result = runTripwire(script, {}, [], { D1_STAGING_JSON: staging, D1_DB_NAME: 'fronts-data-staging', APP_DIRECTORY: 'publications/fronts' });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /::error::zero migration files is unrun, never a pass/);
+});
+
+test('a clean ledger names DB_NAME in the success line', () => {
+  const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
+  const script = extractHeredoc(step, 'D1_LEDGER_TRIPWIRE');
+  const files = { 'migrations/0001_a.sql': 'SELECT 1;' };
+
+  const result = runTripwire(script, files, ['0001_a.sql'], { D1_DB_NAME: 'fronts-data-staging' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /D1 migration ledger tripwire: 1 migration file\(s\) across 1 dir\(s\), all present in the ledger \(1 rows\) for fronts-data-staging/);
+});
+
 // Same discipline as the dry-run version-listing snippet's own equivalent
 // test below: a missing semicolon between two unparenthesized statements is
 // exactly how this repo's own worst ASI/TDZ incident (run 35916382952)
 // happened. Caught live while drafting this script -- the unsemicoloned
 // version silently returned `undefined` for every input.
-test('the DB_NAME node -p script is free of unsemicoloned statements', () => {
+test('the DB_NAME and D1_STAGING_JSON node -p scripts are free of unsemicoloned statements', () => {
   const step = workflow.slice(workflow.indexOf('      - name: D1 migration ledger tripwire'));
-  const script = extractDbNameScript(step);
-  for (const statement of script.split('\n').filter((line) => line.trim() !== '')) {
-    assert.match(statement.trim(), /;$/, `every statement must end in an explicit semicolon: ${statement}`);
+  for (const script of [extractDbNameScript(step), extractStagingJsonScript(step)]) {
+    for (const statement of script.split('\n').filter((line) => line.trim() !== '')) {
+      assert.match(statement.trim(), /;$/, `every statement must end in an explicit semicolon: ${statement}`);
+    }
   }
 });
 

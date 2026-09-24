@@ -533,43 +533,50 @@ jobs:
           APP_DIRECTORY: ${{ inputs.app-directory }}
           GATE_ENVIRONMENT: ${{ inputs.environment }}
         run: |
-          # A `-staging` environment (the caller's deploy-staging job, e.g.
-          # `fronts-staging`) reads `.staging.databaseName` out of
-          # platform-foundations' extended `.publication/d1-migrations.json`
-          # once a project opts into `d1Role.staging`
-          # (fulcrum-labs/platform-foundations#1006). No new input: this
-          # branches on `environment`, which every caller already sets. A
-          # `-production` environment always reads the unchanged top-level
-          # `databaseName`, exactly as before this existed.
+          # A `-staging` (or bare `staging`) environment (the caller's
+          # deploy-staging job, e.g. `fronts-staging`) reads
+          # `.staging.databaseName` out of platform-foundations' extended
+          # `.publication/d1-migrations.json` once a project opts into
+          # d1Role.staging (fulcrum-labs/platform-foundations#1006). No new
+          # input: this branches on `environment`, which every caller
+          # already sets. A `-production` environment always reads the
+          # unchanged top-level `databaseName`, exactly as before this
+          # existed. Falls back to the top-level databaseName on a staging
+          # environment too when `.staging` is absent (every project today)
+          # -- loudly, via the ::notice below, never silently.
           DB_NAME="$(node -p "
             const data = JSON.parse(require('fs').readFileSync('.publication/d1-migrations.json', 'utf8'));
             const env = process.env.GATE_ENVIRONMENT || 'production';
-            const staging = env.endsWith('-staging');
-            (staging ? (data.staging && data.staging.databaseName) : data.databaseName) || '';
+            const isStaging = env === 'staging' || env.endsWith('-staging');
+            (isStaging && data.staging && data.staging.databaseName) || data.databaseName || '';
           ")"
           if [ -z "$DB_NAME" ]; then
-            # On a -staging environment before a project opts into
-            # d1Role.staging, this is expected, not a failure -- and checking
-            # PROD's ledger during a STAGING deploy (the old single-field
-            # behaviour) would be worse than not checking at all: it gives
-            # false confidence that staging's own migrations are fine when
-            # this never looked at staging. Skip cleanly and say so loudly,
-            # rather than silently substituting the wrong database or
-            # failing a deploy over a gap the project hasn't been asked to
-            # close yet.
-            if [[ "$GATE_ENVIRONMENT" == *-staging ]]; then
-              echo "::notice::.publication/d1-migrations.json has no staging.databaseName yet for $GATE_ENVIRONMENT -- skipping the D1 migration ledger tripwire until this project opts into d1Role.staging (fulcrum-labs/platform-foundations#1006)"
-              exit 0
-            fi
             echo "::error::.publication/d1-migrations.json has no databaseName" >&2
             exit 1
           fi
+
+          # The staging object itself (enabled/reconciliation/catchUpUntil),
+          # empty when this isn't a staging environment or the project
+          # hasn't opted in yet -- handed to the tripwire heredoc below via
+          # D1_STAGING_JSON so the resolver here and the tripwire agree on
+          # catch-up state without re-reading the file twice under different
+          # assumptions.
+          D1_STAGING_JSON="$(node -p "
+            const data = JSON.parse(require('fs').readFileSync('.publication/d1-migrations.json', 'utf8'));
+            const env = process.env.GATE_ENVIRONMENT || 'production';
+            const isStaging = env === 'staging' || env.endsWith('-staging');
+            isStaging && data.staging ? JSON.stringify(data.staging) : '';
+          ")"
+          if { [ "$GATE_ENVIRONMENT" = "staging" ] || [[ "$GATE_ENVIRONMENT" == *-staging ]]; } && [ -z "$D1_STAGING_JSON" ]; then
+            echo "::notice::$GATE_ENVIRONMENT has no d1Role.staging yet; checking the production ledger ($DB_NAME)"
+          fi
+
           if ! "$WRANGLER_BIN" d1 execute "$DB_NAME" --remote --json \
               --command "SELECT name FROM d1_migrations" > "$RUNNER_TEMP/d1-ledger.json"; then
             echo "::error::D1 ledger read failed for $DB_NAME — CF_DEPLOY_API_TOKEN needs D1:Read on the account" >&2
             exit 1
           fi
-          D1_LEDGER_JSON="$RUNNER_TEMP/d1-ledger.json" node - <<'D1_LEDGER_TRIPWIRE'
+          D1_LEDGER_JSON="$RUNNER_TEMP/d1-ledger.json" D1_STAGING_JSON="$D1_STAGING_JSON" D1_DB_NAME="$DB_NAME" node - <<'D1_LEDGER_TRIPWIRE'
           const fs = require('node:fs')
           const path = require('node:path')
           const raw = JSON.parse(fs.readFileSync(process.env.D1_LEDGER_JSON, 'utf8'))
@@ -592,13 +599,35 @@ jobs:
               if (!ledger.has(file)) missing.push(path.posix.join(dir, file))
             }
           }
-          for (const file of missing) console.log(`::error::D1 migration never applied to the live ledger — ${file}`)
-          if (missing.length > 0) process.exit(1)
+          // Catch-up (fulcrum-labs/platform-foundations#1006) is a bounded,
+          // declared tolerance for missing staging migrations -- never for
+          // prod, never past its own catchUpUntil, and never when staging
+          // has already been declared reconciled (exact). Any of those
+          // three falls straight through to the same hard-error path a
+          // fully-reconciled ledger always had.
+          const staging = process.env.D1_STAGING_JSON ? JSON.parse(process.env.D1_STAGING_JSON) : null
+          const inUnexpiredCatchUp = Boolean(
+            staging
+            && staging.enabled
+            && staging.reconciliation === 'catch-up'
+            && staging.catchUpUntil
+            && new Date(staging.catchUpUntil).getTime() > Date.now(),
+          )
+          if (missing.length > 0) {
+            if (inUnexpiredCatchUp) {
+              const summary = `staging D1 in catch-up until ${staging.catchUpUntil}: ${missing.length} of ${checked} migrations missing`
+              console.log(`::warning::${summary}`)
+              console.log(summary)
+              process.exit(0)
+            }
+            for (const file of missing) console.log(`::error::D1 migration never applied to the live ledger — ${file}`)
+            process.exit(1)
+          }
           if (process.env.APP_DIRECTORY && checked === 0) {
             console.log('::error::zero migration files is unrun, never a pass')
             process.exit(1)
           }
-          console.log(`D1 migration ledger tripwire: ${checked} migration file(s) across ${dirs.size} dir(s), all present in the ledger (${ledger.size} rows)`)
+          console.log(`D1 migration ledger tripwire: ${checked} migration file(s) across ${dirs.size} dir(s), all present in the ledger (${ledger.size} rows) for ${process.env.D1_DB_NAME}`)
           D1_LEDGER_TRIPWIRE
 
       - name: Refuse a deploy older than the live tag (re-checked immediately before deploy)
