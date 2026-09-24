@@ -490,3 +490,228 @@ test('an unhandled binding class fails the dry-run instead of being silently ski
   assert.notEqual(result.status, 0);
   assert.match(result.stdout, /::error::unhandled binding class `durable_objects`/);
 });
+
+// require-descends-from-live (deploy-workflow-run-starvation H1(b)): closes
+// the TOCTOU window between a caller's own live-tag-vs-tip decision and the
+// actual deploy by re-reading the live tag fresh, immediately before
+// `wrangler deploy`, and refusing unless it is an ancestor of $GITHUB_SHA.
+
+function extractRequireDescendsStep() {
+  const start = workflow.indexOf('      - name: Refuse a deploy older than the live tag');
+  const end = workflow.indexOf('      - name: Deploy with provenance');
+  assert.ok(start >= 0 && end > start, 'the require-descends-from-live step must precede Deploy with provenance');
+  return workflow.slice(start, end);
+}
+
+test('require-descends-from-live is inert by default and gated the same way as dry-run (never fires for an existing caller)', () => {
+  const step = extractRequireDescendsStep();
+  assert.match(step, /if: \$\{\{ !inputs\.dry-run && inputs\.require-descends-from-live \}\}/);
+});
+
+function extractLiveVersionIdScript() {
+  const step = extractRequireDescendsStep();
+  const anchor = 'node -e "\n';
+  const start = step.indexOf(anchor);
+  assert.ok(start >= 0, 'the live-version-id snippet must be present');
+  const bodyStart = start + anchor.length;
+  const end = step.indexOf('\n          " "$DEPLOYMENTS_JSON"', bodyStart);
+  assert.ok(end >= 0, 'the live-version-id snippet must close with the expected node -e invocation');
+  return step.slice(bodyStart, end).replace(/^ {12}/gm, '');
+}
+
+function extractLiveTagScript() {
+  const step = extractRequireDescendsStep();
+  const anchor = 'LIVE_TAG=$(node -e "\n';
+  const start = step.indexOf(anchor);
+  assert.ok(start >= 0, 'the live-tag snippet must be present');
+  const bodyStart = start + anchor.length;
+  const end = step.indexOf('\n          " "$VERSION_JSON")', bodyStart);
+  assert.ok(end >= 0, 'the live-tag snippet must close with the expected node -e invocation');
+  return step.slice(bodyStart, end).replace(/^ {12}/gm, '');
+}
+
+test('resolves the newest deployment\'s single-version id against the real fronts-staging shape', () => {
+  const script = extractLiveVersionIdScript();
+  const deploymentsJson = fixturePath('fronts-staging-deployments.json');
+  const result = spawnSync(process.execPath, ['-e', script, '--', deploymentsJson.pathname, 'fronts-staging'], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(result.stdout.trim(), '3bd93141-0fd0-4b4e-9db8-e57d548c6714');
+});
+
+test('refuses (non-zero) when the live deployment is a gradual/split version, rather than picking one', () => {
+  const script = extractLiveVersionIdScript();
+  const root = mkdtempSync(join(tmpdir(), 'require-descends-'));
+  try {
+    const path = join(root, 'deployments.json');
+    writeFileSync(path, JSON.stringify({
+      success: true,
+      result: {
+        deployments: [{
+          created_on: '2026-09-24T00:00:00Z',
+          versions: [{ version_id: 'v1', percentage: 50 }, { version_id: 'v2', percentage: 50 }],
+        }],
+      },
+    }));
+    const result = spawnSync(process.execPath, ['-e', script, '--', path, 'fronts-staging'], { encoding: 'utf8' });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not a single 100% version/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('resolves the live workers/tag annotation from a version response', () => {
+  const script = extractLiveTagScript();
+  const root = mkdtempSync(join(tmpdir(), 'require-descends-'));
+  try {
+    const path = join(root, 'version.json');
+    writeFileSync(path, JSON.stringify({
+      success: true,
+      result: { annotations: { 'workers/tag': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } },
+    }));
+    const result = spawnSync(process.execPath, ['-e', script, '--', path], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.equal(result.stdout.trim(), 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function extractAncestryDecisionScript() {
+  const step = extractRequireDescendsStep();
+  const start = step.indexOf('if [ -z "$LIVE_TAG" ]; then');
+  assert.ok(start >= 0, 'the ancestry-decision tail must be present');
+  const end = step.indexOf('\n\n      - name: Deploy with provenance');
+  return step.slice(start, start + (end >= 0 ? end - start : step.length - start));
+}
+
+function initAncestryTempRepo() {
+  const dir = mkdtempSync(join(tmpdir(), 'require-descends-repo-'));
+  const git = (...args) => {
+    const result = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'Test');
+  writeFileSync(join(dir, 'a.txt'), 'one');
+  git('add', '.');
+  git('commit', '-q', '-m', 'first');
+  const first = git('rev-parse', 'HEAD');
+  writeFileSync(join(dir, 'a.txt'), 'two');
+  git('add', '.');
+  git('commit', '-q', '-m', 'second');
+  const second = git('rev-parse', 'HEAD');
+  return { dir, first, second };
+}
+
+function runAncestryDecision(script, dir, liveTag, githubSha) {
+  const summaryFile = join(dir, '.gh-summary');
+  const outputFile = join(dir, '.gh-output');
+  writeFileSync(summaryFile, '');
+  writeFileSync(outputFile, '');
+  const result = spawnSync('bash', ['-c', script], {
+    cwd: dir,
+    encoding: 'utf8',
+    env: { ...process.env, LIVE_TAG: liveTag, GITHUB_SHA: githubSha, GITHUB_STEP_SUMMARY: summaryFile, GITHUB_OUTPUT: outputFile },
+  });
+  const outputs = {};
+  for (const line of readFileSync(outputFile, 'utf8').split('\n')) {
+    const [key, ...rest] = line.split('=');
+    if (key) outputs[key] = rest.join('=');
+  }
+  return { ...result, summary: readFileSync(summaryFile, 'utf8'), outputs };
+}
+
+test('proceeds when the live tag is an ancestor of GITHUB_SHA (the ordinary forward-progress case)', () => {
+  const script = extractAncestryDecisionScript();
+  const { dir, first, second } = initAncestryTempRepo();
+  try {
+    const result = runAncestryDecision(script, dir, first, second);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.summary, /confirmed an ancestor/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('C2: stays GREEN (exit 0, warning, proceed=false) when GITHUB_SHA is OLDER than the live tag -- superseded-at-deploy-time is the CORRECT outcome of a race, not a failure', () => {
+  const script = extractAncestryDecisionScript();
+  const { dir, first, second } = initAncestryTempRepo();
+  try {
+    // live is `second` (newer, already deployed by a faster-racing trigger);
+    // this run's own tip is `first` (older) -- must skip the deploy (never
+    // deploy backwards over what already shipped), but the JOB stays green:
+    // this is the race resolving as designed, not an error.
+    const result = runAncestryDecision(script, dir, second, first);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /::warning::.*live tag .* is NEWER/);
+    assert.match(result.summary, /superseded at deploy time/);
+    assert.equal(result.outputs.proceed, 'false');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the "Deploy with provenance" step skips itself (never runs) when require-descends-from-live reports proceed=false', () => {
+  const deployStep = workflow.slice(workflow.indexOf('      - name: Deploy with provenance'));
+  assert.match(
+    deployStep,
+    /if: \$\{\{ !inputs\.dry-run && steps\.require-descends-from-live\.outputs\.proceed != 'false' \}\}/,
+  );
+});
+
+test('"Post-deploy journeys" also skips when require-descends-from-live reports proceed=false -- it must not canary-test the newer version that already deployed under this run\'s SHA', () => {
+  const journeysStart = workflow.indexOf('      - name: Post-deploy journeys');
+  const journeysStep = workflow.slice(journeysStart, workflow.indexOf('\n\n', journeysStart));
+  assert.match(
+    journeysStep,
+    /if: \$\{\{ !inputs\.dry-run && inputs\.journeys-audience != '' && steps\.require-descends-from-live\.outputs\.proceed != 'false' \}\}/,
+  );
+});
+
+test('refuses loudly on diverged history (neither commit is an ancestor of the other)', () => {
+  const script = extractAncestryDecisionScript();
+  const { dir } = initAncestryTempRepo();
+  try {
+    const git = (...args) => spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
+    git('checkout', '-q', '-b', 'diverged', 'HEAD~1');
+    writeFileSync(join(dir, 'b.txt'), 'diverged');
+    git('add', '.');
+    git('commit', '-q', '-m', 'diverged commit');
+    const diverged = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).stdout.trim();
+    const main = spawnSync('git', ['rev-parse', 'main'], { cwd: dir, encoding: 'utf8' }).stdout.trim();
+    const result = runAncestryDecision(script, dir, main, diverged);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /shares no ancestry/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('proceeds (with a warning, proceed=true) when the live tag is not a commit of this repository', () => {
+  const script = extractAncestryDecisionScript();
+  const { dir, second } = initAncestryTempRepo();
+  try {
+    const result = runAncestryDecision(script, dir, 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', second);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /::warning::/);
+    assert.equal(result.outputs.proceed, 'true');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('C1: proceeds (with a warning, proceed=true) on an EMPTY live tag, same as foreign -- a version deployed without --tag must not deadlock every future gated deploy', () => {
+  const script = extractAncestryDecisionScript();
+  const { dir, second } = initAncestryTempRepo();
+  try {
+    const result = runAncestryDecision(script, dir, '', second);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /::warning::.*no workers\/tag annotation/);
+    assert.equal(result.outputs.proceed, 'true');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
