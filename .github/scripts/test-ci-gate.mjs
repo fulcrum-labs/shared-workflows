@@ -247,3 +247,32 @@ test('the D1 LIKE/GLOB pattern length step rejects literals over 50 bytes in mig
   const exactly50 = run({ 'migrations/0003.sql': `x LIKE '${'a'.repeat(50)}'` });
   assert.equal(exactly50.status, 0, exactly50.stdout + exactly50.stderr);
 });
+
+test('vitest workers are capped to the node class envelope in the gate step', () => {
+  assert.match(workflow, /vitest-max-workers:\n        type: string\n        default: '2'/);
+  const capStart = workflow.indexOf('      - name: Cap Vitest workers to the job class envelope');
+  const gateStart = workflow.indexOf('      - name: CI gate (typecheck + lint + test + build)');
+  const nextStep = workflow.indexOf('      - name: Lockfile integrity');
+  assert.ok(capStart >= 0 && gateStart > capStart && nextStep > gateStart, 'the cap step must precede the gate step');
+  const cap = workflow.slice(capStart, gateStart);
+  assert.match(cap, /\*\[!0-9\]\*\|0\) echo "::error::vitest-max-workers must be a positive integer/);
+  assert.match(cap, /vitest workers capped at \$VITEST_CAP/);
+  const gate = workflow.slice(gateStart, nextStep);
+  for (const variable of ['VITEST_MAX_WORKERS', 'VITEST_MAX_THREADS', 'VITEST_MAX_FORKS']) {
+    assert.match(gate, new RegExp(`${variable}: \\$\\{\\{ steps\\.vitest-cap\\.outputs\\.workers \\}\\}`));
+  }
+});
+
+test('the Go cold-cache leg proves its caches are empty scratch before building', () => {
+  const cold = readFileSync(new URL('../workflows/go-cold-cache.yml', import.meta.url), 'utf8');
+  assert.match(cold, /^  workflow_call:$/m);
+  assert.match(cold, /cache: false/);
+  for (const variable of ['GOCACHE', 'GOMODCACHE', 'GOTMPDIR']) {
+    assert.match(cold, new RegExp(`echo "${variable}=\\$cold/`));
+  }
+  const prove = cold.indexOf('      - name: Prove the caches are cold');
+  const build = cold.indexOf('      - name: Build from cold caches');
+  assert.ok(prove >= 0 && build > prove, 'the coldness proof must precede the build');
+  assert.match(cold.slice(prove, build), /is not empty at the start of the cold leg/);
+  assert.doesNotMatch(cold, /always\(\)/);
+});

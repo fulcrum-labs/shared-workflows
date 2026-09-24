@@ -25,6 +25,10 @@ on:
         type: string
         default: ''
         description: 'Optional. Namespace used to isolate this repository family in the shared cache.'
+      vitest-max-workers:
+        type: string
+        default: '2'
+        description: 'Vitest worker cap for the check-command (VITEST_MAX_WORKERS, and VITEST_MAX_THREADS/VITEST_MAX_FORKS for Vitest < 4). The node job class envelope is 2 vCPU (olympus execution-substrate spec §3.1); Vitest otherwise starts os.availableParallelism() workers on a shared runner host and its 5 s test timeout fires under the contention.'
       cf-worker-name:
         type: string
         default: ''
@@ -172,9 +176,23 @@ jobs:
           }
           JS
 
+      - name: Cap Vitest workers to the job class envelope
+        id: vitest-cap
+        env:
+          VITEST_CAP: ${{ inputs.vitest-max-workers }}
+        run: |
+          case "$VITEST_CAP" in
+            ''|*[!0-9]*|0) echo "::error::vitest-max-workers must be a positive integer, got '$VITEST_CAP'"; exit 1 ;;
+          esac
+          echo "workers=$VITEST_CAP" >> "$GITHUB_OUTPUT"
+          echo "vitest workers capped at $VITEST_CAP (VITEST_MAX_WORKERS, VITEST_MAX_THREADS, VITEST_MAX_FORKS)"
+
       - name: CI gate (typecheck + lint + test + build)
         run: ${{ inputs.check-command }}
         env:
+          VITEST_MAX_WORKERS: ${{ steps.vitest-cap.outputs.workers }}
+          VITEST_MAX_THREADS: ${{ steps.vitest-cap.outputs.workers }}
+          VITEST_MAX_FORKS: ${{ steps.vitest-cap.outputs.workers }}
           # Cache credentials are injected only when the eligibility step above
           # matched the trusted-event allowlist. Empty credentials leave Turbo
           # on its local cache and keep the gate fail-open when a caller has

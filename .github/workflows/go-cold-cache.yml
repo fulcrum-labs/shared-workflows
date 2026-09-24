@@ -1,0 +1,109 @@
+name: Go Cold Cache (Reusable)
+
+# The cold-cache leg for Go repositories (olympus execution-substrate spec,
+# bead ES-12; failure mode #4). Every other job builds against the runner
+# host's warm Go build and module caches. On 2026-09-23 fulcrum-projects'
+# build.sh broke on a cold module cache after a runner host was rebuilt from
+# nothing; the bug had been latent all along, hidden by warm caches. A
+# caller runs this weekly (a schedule in its own thin workflow), so a bug of
+# that kind goes red on a Monday morning instead of on the day a host is
+# rebuilt. The per-host caches stay budgeted and warm (spec I7); per-job cold
+# caches everywhere are the rejected alternative.
+#
+# The caller's build-command runs with GOCACHE, GOMODCACHE and GOTMPDIR
+# pointing at this job's own empty scratch, and the job proves they are
+# empty before it starts. A red run is the loud surface.
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        type: string
+        required: true
+        description: 'Go toolchain version for actions/setup-go (the caller pins it, as its CI does).'
+      build-command:
+        type: string
+        required: true
+        description: 'Shell commands that build, compile tests and package from the cold caches.'
+      go-flags:
+        type: string
+        default: ''
+        description: 'Optional GOFLAGS (for example -mod=vendor).'
+      working-directory:
+        type: string
+        default: '.'
+        description: 'Directory the build-command runs in.'
+      timeout-minutes:
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-cold-cache-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  cold-build:
+    name: cold-cache / build
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: ${{ inputs.go-flags }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: false
+
+      - name: Point every Go cache at this job's empty scratch
+        run: |
+          set -euo pipefail
+          cold="$RUNNER_TEMP/go-cold-cache"
+          rm -rf "$cold"
+          mkdir -p "$cold/go-build" "$cold/go-mod" "$cold/tmp"
+          {
+            echo "GOCACHE=$cold/go-build"
+            echo "GOMODCACHE=$cold/go-mod"
+            echo "GOTMPDIR=$cold/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Prove the caches are cold
+        # A leg that silently inherited a warm cache would pass for the
+        # wrong reason.
+        run: |
+          set -euo pipefail
+          for var in GOCACHE GOMODCACHE; do
+            path="$(go env "$var")"
+            case "$path" in
+              "$RUNNER_TEMP"/go-cold-cache/*) ;;
+              *) echo "::error::$var resolves to $path, not this job's cold scratch"; exit 1 ;;
+            esac
+            if [ -n "$(ls -A "$path")" ]; then
+              echo "::error::$var ($path) is not empty at the start of the cold leg"
+              exit 1
+            fi
+            echo "$var=$path (empty)"
+          done
+
+      - name: Build from cold caches
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          ${{ inputs.build-command }}
+
+      - name: Cold-cache footprint
+        # This is the size a cold build needs, recorded so the per-host cache
+        # budgets (spec section 4) are sized from measurement.
+        run: du -sh "$RUNNER_TEMP/go-cold-cache/go-build" "$RUNNER_TEMP/go-cold-cache/go-mod" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the cold scratch
+        if: ${{ !cancelled() }}
+        run: rm -rf "$RUNNER_TEMP/go-cold-cache"
