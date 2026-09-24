@@ -247,3 +247,87 @@ test('the D1 LIKE/GLOB pattern length step rejects literals over 50 bytes in mig
   const exactly50 = run({ 'migrations/0003.sql': `x LIKE '${'a'.repeat(50)}'` });
   assert.equal(exactly50.status, 0, exactly50.stdout + exactly50.stderr);
 });
+
+test('vitest workers are capped to the node class envelope in the gate step', () => {
+  assert.match(workflow, /vitest-max-workers:\n        type: string\n        default: '2'/);
+  const capStart = workflow.indexOf('      - name: Cap Vitest workers to the job class envelope');
+  const gateStart = workflow.indexOf('      - name: CI gate (typecheck + lint + test + build)');
+  const nextStep = workflow.indexOf('      - name: Lockfile integrity');
+  assert.ok(capStart >= 0 && gateStart > capStart && nextStep > gateStart, 'the cap step must precede the gate step');
+  const cap = workflow.slice(capStart, gateStart);
+  assert.match(cap, /\*\[!0-9\]\*\|0\) echo "::error::vitest-max-workers must be a positive integer/);
+  assert.match(cap, /vitest workers capped at \$VITEST_CAP/);
+  const gate = workflow.slice(gateStart, nextStep);
+  for (const variable of ['VITEST_MAX_WORKERS', 'VITEST_MAX_THREADS', 'VITEST_MAX_FORKS']) {
+    assert.match(gate, new RegExp(`${variable}: \\$\\{\\{ steps\\.vitest-cap\\.outputs\\.workers \\}\\}`));
+  }
+});
+
+test('the Go cold-cache leg proves its caches are empty scratch before building', () => {
+  const cold = readFileSync(new URL('../workflows/go-cold-cache.yml', import.meta.url), 'utf8');
+  assert.match(cold, /^  workflow_call:$/m);
+  assert.match(cold, /cache: false/);
+  for (const variable of ['GOCACHE', 'GOMODCACHE', 'GOTMPDIR', 'TMPDIR']) {
+    assert.match(cold, new RegExp(`echo "${variable}=\\$cold/`));
+  }
+  const prove = cold.indexOf('      - name: Prove the caches are cold');
+  const build = cold.indexOf('      - name: Build from cold caches');
+  assert.ok(prove >= 0 && build > prove, 'the coldness proof must precede the build');
+  assert.match(cold.slice(prove, build), /is not empty at the start of the cold leg/);
+  assert.doesNotMatch(cold, /always\(\)/);
+  // The job's budget is a literal; no caller can raise it.
+  assert.match(cold, /^    timeout-minutes: 30$/m);
+  assert.doesNotMatch(cold, /inputs\.timeout-minutes/);
+  // Every action is SHA-pinned: this leg builds release packages.
+  for (const use of cold.matchAll(/uses: ([^\s]+)/g)) {
+    assert.match(use[1], /@[0-9a-f]{40}$/, `${use[1]} is not pinned to a commit`);
+  }
+  // The module cache is read-only on disk: every removal makes it writable
+  // first (fulcrum-projects#424's first run failed its cleanup on exactly this).
+  const removals = cold.match(/rm -rf "\$(cold|RUNNER_TEMP\/go-cold-cache)"/g) ?? [];
+  const chmods = cold.match(/chmod -R u\+w "\$(cold|RUNNER_TEMP\/go-cold-cache)"/g) ?? [];
+  assert.equal(removals.length, 2);
+  assert.equal(chmods.length, removals.length);
+});
+
+test('a strict Turbo repo that runs vitest must pass the cap through, or the gate says so', async () => {
+  const { execFileSync } = await import('node:child_process')
+  const { mkdtempSync, writeFileSync, mkdirSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const path = await import('node:path')
+  const start = workflow.indexOf("          node - <<'VITEST_PASSTHROUGH'")
+  const end = workflow.indexOf('          VITEST_PASSTHROUGH', start + 10)
+  assert.ok(start > 0 && end > start, 'the pass-through check must be present')
+  const script = workflow.slice(start, end).split('\n').slice(1).map(line => line.replace(/^ {10}/, '')).join('\n')
+  const run = files => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'vitest-passthrough-'))
+    for (const [name, body] of Object.entries(files)) {
+      mkdirSync(path.dirname(path.join(dir, name)), { recursive: true })
+      writeFileSync(path.join(dir, name), body)
+    }
+    try {
+      execFileSync('node', ['-e', script], { cwd: dir, stdio: 'pipe' })
+      return 'ok'
+    } catch (error) {
+      return String(error.stdout)
+    }
+  }
+  const pkg = JSON.stringify({ devDependencies: { vitest: '4.0.0' } })
+  const turbo = pass => `{\n  // growth-labs style\n  "envMode": "strict",\n  "globalPassThroughEnv": ${JSON.stringify(pass)},\n}`
+  assert.match(run({ 'turbo.json': turbo(['CI']), 'packages/a/package.json': pkg }), /does not pass VITEST_MAX_WORKERS, VITEST_MAX_THREADS, VITEST_MAX_FORKS through/)
+  assert.equal(run({ 'turbo.json': turbo(['CI', 'VITEST_MAX_WORKERS', 'VITEST_MAX_THREADS', 'VITEST_MAX_FORKS']), 'packages/a/package.json': pkg }), 'ok')
+  assert.equal(run({ 'turbo.json': turbo(['CI']), 'package.json': JSON.stringify({}) }), 'ok', 'no vitest, nothing to strip')
+  assert.equal(run({ 'package.json': pkg }), 'ok', 'no turbo, nothing strips the env')
+})
+
+test('the gate reports the vitest worker count it observed, not only the cap it set', () => {
+  const gateStart = workflow.indexOf('      - name: CI gate (typecheck + lint + test + build)')
+  const gate = workflow.slice(gateStart, workflow.indexOf('      - name: Lockfile integrity'))
+  // Counted: node processes with vitest's fork-worker script anywhere in
+  // argv, and only inside this step's own process tree (root=$$).
+  assert.match(gate, /root=\$\$/)
+  assert.match(gate, /for \(i = 4; i <= NF; i\+\+\) if \(\$i ~ \/vitest/)
+  assert.match(gate, /\(ppid\[p\] in desc\)/)
+  assert.match(gate, /vitest workers observed \(this step only\): at most \$per fork workers/)
+  assert.match(gate, /exit "\$status"/)
+})
