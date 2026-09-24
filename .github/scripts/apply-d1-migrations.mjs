@@ -23,7 +23,7 @@
 // with their D1_DATABASE_NAME and CLOUDFLARE_ACCOUNT_ID.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -115,6 +115,14 @@ const WRANGLER_CONFIG_ARGS = DATABASE_ID
 			const configDir = mkdtempSync(
 				join(process.env.RUNNER_TEMP || tmpdir(), "d1-migrations-config-"),
 			);
+			// Self-hosted runners are persistent, not ephemeral containers --
+			// nothing else removes a leftover mkdtempSync directory between
+			// runs. Cleaned up unconditionally on exit (covers a thrown error
+			// or an early process.exit(), not just the success path a bare
+			// `finally` around the rest of the script would miss).
+			process.on("exit", () => {
+				rmSync(configDir, { recursive: true, force: true });
+			});
 			const configPath = join(configDir, "wrangler.json");
 			writeFileSync(
 				configPath,

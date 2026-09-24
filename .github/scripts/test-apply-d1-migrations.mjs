@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -84,6 +84,12 @@ function runApply({ migrationFiles, appliedLedgerNames, dryRun, databaseId, cfAp
   writeFileSync(logPath, '');
   const targetedIdsLogPath = join(dir, 'wrangler-targeted-ids.log');
   writeFileSync(targetedIdsLogPath, '');
+  // A dedicated, test-owned RUNNER_TEMP -- separate from `dir` -- so a test
+  // can inspect it AFTER the child exits to confirm the script's own
+  // cleanup (not this harness's own teardown) removed the generated
+  // wrangler-config directory. Left in place here; the caller is
+  // responsible for removing it once done inspecting.
+  const runnerTemp = mkdtempSync(join(tmpdir(), 'd1-runner-temp-'));
 
   return new Promise((resolvePromise) => {
     const child = spawn(
@@ -98,6 +104,7 @@ function runApply({ migrationFiles, appliedLedgerNames, dryRun, databaseId, cfAp
           CLOUDFLARE_ACCOUNT_ID: 'test-account',
           CLOUDFLARE_API_TOKEN: 'test-token',
           WRANGLER_BIN: wranglerPath,
+          RUNNER_TEMP: runnerTemp,
           FAKE_WRANGLER_LOG: logPath,
           FAKE_WRANGLER_TARGETED_LOG: targetedIdsLogPath,
           FAKE_WRANGLER_APPLIED: JSON.stringify(appliedLedgerNames),
@@ -122,7 +129,7 @@ function runApply({ migrationFiles, appliedLedgerNames, dryRun, databaseId, cfAp
         .split('\n')
         .filter(Boolean);
       rmSync(dir, { recursive: true, force: true });
-      resolvePromise({ result: { status, stdout, stderr }, invocations, targetedIds });
+      resolvePromise({ result: { status, stdout, stderr }, invocations, targetedIds, runnerTemp });
     });
   });
 }
@@ -344,4 +351,34 @@ test('without database-id, wrangler resolves through the consumer\'s own wrangle
   assert.equal(invocations.length, 1);
   assert.ok(!invocations[0].includes('--config'), 'no database-id means no generated config, exactly as before this existed');
   assert.deepEqual(targetedIds, ['cccccccc-0000-0000-0000-000000000003']);
+});
+
+// reviewer-foundry NIT on #58's approval: the generated wrangler-config
+// directory was never removed. Self-hosted runners are persistent, not
+// ephemeral containers, so a leftover mkdtempSync directory per run would
+// accumulate forever with nothing else to clean it up.
+test('the generated wrangler-config directory is removed after the process exits', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaa-1111-verified-uuid' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, runnerTemp } = await runApply({
+      migrationFiles: ['0001_a.sql'],
+      appliedLedgerNames: ['0001_a.sql'],
+      dryRun: true,
+      databaseName: 'fronts-data-staging',
+      databaseId: 'aaaa-1111-verified-uuid',
+      cfApiBase: `http://127.0.0.1:${port}`,
+    });
+
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    // RUNNER_TEMP itself must survive (the script never owns that
+    // directory, only the one subdirectory it created inside it) --
+    // empty of the generated config subdirectory, not deleted itself.
+    assert.deepEqual(readdirSync(runnerTemp), []);
+    rmSync(runnerTemp, { recursive: true, force: true });
+  } finally {
+    server.close();
+  }
 });
