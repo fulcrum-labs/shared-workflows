@@ -275,4 +275,10 @@ test('the Go cold-cache leg proves its caches are empty scratch before building'
   assert.ok(prove >= 0 && build > prove, 'the coldness proof must precede the build');
   assert.match(cold.slice(prove, build), /is not empty at the start of the cold leg/);
   assert.doesNotMatch(cold, /always\(\)/);
+  // The module cache is read-only on disk: every removal makes it writable
+  // first (fulcrum-projects#424's first run failed its cleanup on exactly this).
+  const removals = cold.match(/rm -rf "\$(cold|RUNNER_TEMP\/go-cold-cache)"/g) ?? [];
+  const chmods = cold.match(/chmod -R u\+w "\$(cold|RUNNER_TEMP\/go-cold-cache)"/g) ?? [];
+  assert.equal(removals.length, 2);
+  assert.equal(chmods.length, removals.length);
 });

@@ -67,6 +67,9 @@ jobs:
         run: |
           set -euo pipefail
           cold="$RUNNER_TEMP/go-cold-cache"
+          # Go writes the module cache read-only; make a leftover writable
+          # before removing it.
+          if [ -e "$cold" ]; then chmod -R u+w "$cold"; fi
           rm -rf "$cold"
           mkdir -p "$cold/go-build" "$cold/go-mod" "$cold/tmp"
           {
@@ -106,4 +109,9 @@ jobs:
 
       - name: Remove the cold scratch
         if: ${{ !cancelled() }}
-        run: rm -rf "$RUNNER_TEMP/go-cold-cache"
+        # The module cache is written read-only (0444 files in 0555
+        # directories), so a bare rm -rf is refused.
+        run: |
+          set -euo pipefail
+          if [ -e "$RUNNER_TEMP/go-cold-cache" ]; then chmod -R u+w "$RUNNER_TEMP/go-cold-cache"; fi
+          rm -rf "$RUNNER_TEMP/go-cold-cache"
