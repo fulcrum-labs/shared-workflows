@@ -58,6 +58,10 @@ on:
         type: boolean
         default: false
         description: "List pending migrations and exit without applying anything or writing to d1_migrations. Default false keeps every existing caller applying exactly as before this input existed."
+      database-id:
+        type: string
+        default: ""
+        description: "Cloudflare D1 database uuid. When set, verified (via the account's D1 list endpoint, read-only) against what database-name actually resolves to, before any D1 interaction and regardless of dry-run -- refuses on a mismatch. Name alone is otherwise the only selector against the same account and token as prod, so a staging config carrying prod's uuid would otherwise silently write prod. Optional and unverified when empty, keeping every existing caller unchanged."
     secrets:
       CF_API_TOKEN:
         required: true
@@ -67,7 +71,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: d1-migrations-${{ github.repository }}-${{ github.ref }}
+  # Keyed on the DATABASE, not the ref: a staging catch-up dispatch and a
+  # prod push-apply are different refs but can hit the SAME database when a
+  # caller's database-name input is misconfigured, and even when they don't,
+  # keying on ref meant a staging dispatch (a different ref) could CANCEL a
+  # pending prod push-apply in the same repo (one pending run per group;
+  # cancel-in-progress stays false, so a same-database queue still waits
+  # rather than clobbers).
+  group: d1-migrations-${{ github.repository }}-${{ inputs.database-name }}
   cancel-in-progress: false
 
 jobs:

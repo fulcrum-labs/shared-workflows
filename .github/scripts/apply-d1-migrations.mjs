@@ -30,6 +30,14 @@ const DB_NAME = process.env.D1_DATABASE_NAME;
 const MIGRATIONS_DIR = process.env.D1_MIGRATIONS_DIR || "migrations";
 const ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 const API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+// Optional: verified below, before any D1 interaction at all, whenever set.
+// Existing callers that predate this input simply don't set it and get no
+// verification, exactly as before this existed. A staging wrapper should
+// always set it (platform-foundations' generator does), since name is
+// otherwise the ONLY selector against the same account and the same token
+// as prod -- a staging config block that accidentally carried prod's uuid
+// would otherwise silently write prod.
+const DATABASE_ID = process.env.D1_DATABASE_ID || "";
 // List pending migrations and exit 0 without applying anything or writing
 // to d1_migrations. Read-only end to end (the ledger SELECT above already
 // runs either way) -- for a staging catch-up dispatch previewing what
@@ -39,6 +47,56 @@ const DRY_RUN = process.env.D1_MIGRATIONS_DRY_RUN === "1";
 if (!DB_NAME) throw new Error("D1_DATABASE_NAME is required");
 if (!ACCOUNT_ID) throw new Error("CLOUDFLARE_ACCOUNT_ID is required");
 if (!API_TOKEN) throw new Error("CLOUDFLARE_API_TOKEN is required");
+
+const log = (...parts) => console.log("[d1-migrations]", ...parts);
+
+// wrangler resolves `database-name` to a database through the consumer's
+// wrangler config; the name is the only selector it ever checks. Verify the
+// name actually resolves to the uuid the caller declared, via the plain
+// Cloudflare REST list endpoint (read-only, no wrangler needed) -- BEFORE
+// any D1 interaction, including the ledger SELECT below, and regardless of
+// DRY_RUN (the whole point of a preview is confirming the target is right
+// before committing to anything).
+// Overridable only so tests can point this at a local fixture server instead
+// of the real Cloudflare API; every real caller gets the real base URL.
+const CF_API_BASE =
+	process.env.D1_MIGRATIONS_CF_API_BASE_FOR_TESTS_ONLY ||
+	"https://api.cloudflare.com/client/v4";
+
+async function verifyDatabaseId() {
+	if (!DATABASE_ID) return;
+	const url = `${CF_API_BASE}/accounts/${ACCOUNT_ID}/d1/database?name=${encodeURIComponent(DB_NAME)}`;
+	const response = await fetch(url, {
+		headers: { Authorization: `Bearer ${API_TOKEN}` },
+	});
+	if (!response.ok) {
+		throw new Error(
+			`D1 database lookup failed for "${DB_NAME}" on account ${ACCOUNT_ID}: HTTP ${response.status} ${await response.text()}`,
+		);
+	}
+	const body = await response.json();
+	// The list endpoint's `name` filter is a substring match, not exact --
+	// confirmed live (querying "fronts-data" also returned
+	// "fronts-data-staging" and "homefronts-data-staging"). Filter to the
+	// exact name client-side; never trust the query param to have done it.
+	const results = Array.isArray(body?.result) ? body.result : [];
+	const match = results.find((db) => db.name === DB_NAME);
+	if (!match) {
+		throw new Error(
+			`D1 database "${DB_NAME}" was not found (exact name) on account ${ACCOUNT_ID} -- refusing to apply against an unverified target`,
+		);
+	}
+	if (match.uuid !== DATABASE_ID) {
+		throw new Error(
+			`D1 database "${DB_NAME}" resolves to uuid ${match.uuid}, but the caller declared database-id ${DATABASE_ID} -- ` +
+				"refusing to apply against a mismatched target (this is exactly what a staging config block accidentally " +
+				"carrying prod's uuid would otherwise let through silently)",
+		);
+	}
+	log(`verified "${DB_NAME}" resolves to the declared uuid ${DATABASE_ID}`);
+}
+
+await verifyDatabaseId();
 
 // Self-hosted runners do not expose the global npm bin dir on PATH, so a bare
 // "wrangler" spawn ENOENTs there. The workflow resolves the absolute binary
@@ -72,8 +130,6 @@ const wrangler = (args) =>
 	});
 
 const sqlEscape = (value) => value.replace(/'/g, "''");
-
-const log = (...parts) => console.log("[d1-migrations]", ...parts);
 
 const migrationsDir = resolve(MIGRATIONS_DIR);
 const migrationFiles = readdirSync(migrationsDir)
