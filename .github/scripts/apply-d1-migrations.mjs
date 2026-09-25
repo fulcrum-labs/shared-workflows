@@ -218,6 +218,54 @@ const wrangler = (args) =>
 	});
 
 const sqlEscape = (value) => value.replace(/'/g, "''");
+const quoteIdentifier = (name) => `"${name.replace(/"/g, '""')}"`;
+
+// A wrangler.d1.execute() read helper for the FK-graph queries below --
+// same shape as wranglerJson, kept separate so those call sites read as
+// "one FK-list read per table", not folded into the bigger enumeration call.
+const fkListForTable = (table) =>
+	wranglerJson([
+		"d1",
+		"execute",
+		DB_NAME,
+		"--remote",
+		"--json",
+		"--command",
+		`PRAGMA foreign_key_list(${quoteIdentifier(table)})`,
+	])?.[0]?.results || [];
+
+// Kahn's algorithm: an order where, for every edge child->parent (the child
+// holds a FK referencing the parent, so it must be dropped first), the
+// child appears before the parent. Throws -- refusing the reset outright,
+// never guessing -- on any cycle, since a cyclic FK graph among tables has
+// no drop order that avoids violating one of them.
+function topoSortDropOrder(tableNames, edges) {
+	const inDegree = new Map(tableNames.map((t) => [t, 0]));
+	const dependents = new Map(tableNames.map((t) => [t, []]));
+	for (const { child, parent } of edges) {
+		if (child === parent) continue; // self-reference: no cross-table ordering constraint
+		if (!dependents.has(child) || !inDegree.has(parent)) continue; // references a table outside this drop set (already excluded/handled)
+		dependents.get(child).push(parent);
+		inDegree.set(parent, inDegree.get(parent) + 1);
+	}
+	const queue = tableNames.filter((t) => inDegree.get(t) === 0);
+	const order = [];
+	while (queue.length > 0) {
+		const node = queue.shift();
+		order.push(node);
+		for (const next of dependents.get(node)) {
+			inDegree.set(next, inDegree.get(next) - 1);
+			if (inDegree.get(next) === 0) queue.push(next);
+		}
+	}
+	if (order.length !== tableNames.length) {
+		const unresolved = tableNames.filter((t) => !order.includes(t));
+		throw new Error(
+			`reset-and-replay refuses: a foreign-key cycle among tables prevents a safe drop order (unresolved: ${unresolved.join(", ")})`,
+		);
+	}
+	return order;
+}
 
 // Reset-and-replay's actual destructive step: enumerate every object in
 // sqlite_master and drop them, INCLUDING d1_migrations -- emptying the
@@ -227,17 +275,29 @@ const sqlEscape = (value) => value.replace(/'/g, "''");
 // changes. Recreating the database instead of emptying it would mint a new
 // uuid and break that pin.
 //
-// Excludes sqlite_%  (SQLite's own bookkeeping, e.g. sqlite_sequence) and
-// _cf_% (D1's own internal tables -- D1 refuses a DROP on these, which
-// would abort the reset partway through if they were included).
+// Excludes (escaped -- bare `_` is itself a LIKE wildcard, so an unescaped
+// pattern is not the literal match it looks like): sqlite_% (SQLite's own
+// bookkeeping, e.g. sqlite_sequence) and _cf_% (D1's own internal tables --
+// D1 refuses a DROP on these with SQLITE_AUTH, which would abort the reset
+// partway through if they were included).
 //
-// Drop order: triggers and views first (neither blocks any other drop, and
+// A DROP TABLE on an FTS5 virtual table cascades to its own shadow tables
+// (e.g. `_fts_data`, `_fts_idx`) automatically; this enumeration lists those
+// shadow tables too (they're ordinary rows in sqlite_master), but dropping
+// them explicitly afterward is a harmless IF EXISTS no-op either way this
+// enumeration or the cascade gets to them first -- no separate exclusion
+// needed.
+//
+// Drop order: d1_migrations FIRST, on its own -- so that a failure ANYWHERE
+// later in this same run still leaves a database with no ledger, and a
+// later plain apply-missing dispatch fails loudly ("no such table:
+// d1_migrations") instead of reading a stale-but-present ledger and
+// silently declaring "nothing to apply" against a partially-dropped
+// schema. Then triggers and views (neither blocks any other drop, and
 // SQLite doesn't validate a view's referenced table until the view is
-// queried), then indexes, then tables last (DROP TABLE auto-drops any
-// index/trigger still attached to it, so dropping tables first could race
-// an explicit index/trigger drop that runs after -- ordering removes the
-// need to reason about it). d1_migrations is just another table name this
-// same query returns; no special-casing needed to include it.
+// queried), then indexes, then the remaining tables last, in FK-topological
+// order (children before parents) -- refusing outright on a cycle rather
+// than guessing.
 async function resetDatabase() {
 	const objects =
 		wranglerJson([
@@ -247,19 +307,46 @@ async function resetDatabase() {
 			"--remote",
 			"--json",
 			"--command",
-			"SELECT type, name FROM sqlite_master WHERE type IN ('table','view','index','trigger') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
+			"SELECT type, name FROM sqlite_master WHERE type IN ('table','view','index','trigger')" +
+				" AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'" +
+				" AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'",
 		])?.[0]?.results || [];
 
-	const dropOrder = { trigger: 0, view: 1, index: 2, table: 3 };
-	const drops = [...objects].sort((a, b) => dropOrder[a.type] - dropOrder[b.type]);
+	const withoutLedger = objects.filter((o) => !(o.type === "table" && o.name === "d1_migrations"));
+	const ledgerPresent = withoutLedger.length !== objects.length;
 
-	if (drops.length === 0) {
+	const triggers = withoutLedger.filter((o) => o.type === "trigger");
+	const views = withoutLedger.filter((o) => o.type === "view");
+	const indexes = withoutLedger.filter((o) => o.type === "index");
+	const tableNames = withoutLedger.filter((o) => o.type === "table").map((o) => o.name);
+
+	const fkEdges = [];
+	for (const table of tableNames) {
+		for (const row of fkListForTable(table)) {
+			if (row.table) fkEdges.push({ child: table, parent: row.table });
+		}
+	}
+	const orderedTableNames = topoSortDropOrder(tableNames, fkEdges);
+
+	const dropStatements = [
+		...(ledgerPresent ? [`DROP TABLE IF EXISTS ${quoteIdentifier("d1_migrations")}`] : []),
+		...triggers.map((o) => `DROP TRIGGER IF EXISTS ${quoteIdentifier(o.name)}`),
+		...views.map((o) => `DROP VIEW IF EXISTS ${quoteIdentifier(o.name)}`),
+		...indexes.map((o) => `DROP INDEX IF EXISTS ${quoteIdentifier(o.name)}`),
+		...orderedTableNames.map((name) => `DROP TABLE IF EXISTS ${quoteIdentifier(name)}`),
+	];
+
+	if (dropStatements.length === 0) {
 		log("reset-and-replay: database already empty, nothing to drop");
 	} else {
 		log(
-			`reset-and-replay: would drop ${drops.length} object(s): ${drops
-				.map((o) => `${o.type} ${o.name}`)
-				.join(", ")}`,
+			`reset-and-replay: would drop ${dropStatements.length} object(s): ${[
+				...(ledgerPresent ? ["table d1_migrations"] : []),
+				...triggers.map((o) => `trigger ${o.name}`),
+				...views.map((o) => `view ${o.name}`),
+				...indexes.map((o) => `index ${o.name}`),
+				...orderedTableNames.map((name) => `table ${name}`),
+			].join(", ")}`,
 		);
 	}
 
@@ -268,42 +355,42 @@ async function resetDatabase() {
 		process.exit(0);
 	}
 
-	// Every drop, the FK-defer PRAGMA, and the ledger re-create run as ONE
-	// wrangler d1 execute call -- a single multi-statement string, not one
-	// call per statement -- so D1's own multi-statement/batch execution
-	// (Cloudflare docs: batched statements are SQL transactions; a failing
-	// statement aborts and rolls back the whole sequence) covers the entire
-	// reset, not just each individual drop. PRAGMA defer_foreign_keys=true
-	// (D1's own documented mechanism for a change that would otherwise
-	// violate a foreign key mid-migration) is scoped to the transaction it
-	// runs in, so it must be the first statement in this SAME call, not a
-	// separate, earlier one -- a separate call would not carry it forward.
+	// Every drop, the FK-defer PRAGMA, and the ledger re-create run from ONE
+	// file via a single `wrangler d1 execute --file` call, under RUNNER_TEMP
+	// (self-hosted runners are persistent, so this is removed explicitly on
+	// exit, same as the generated wrangler-config pin elsewhere in this
+	// script) -- not one call per statement, and not an inline --command
+	// string. defer_foreign_keys is scoped to the transaction it runs in, so
+	// it has to be the first statement in this SAME file, not an earlier,
+	// separate call -- kept as defence in depth alongside the FK-topological
+	// drop order above, in case any single statement in this file still runs
+	// as its own auto-commit outside of an enclosing transaction.
+	const batchDir = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "d1-reset-batch-"));
+	process.on("exit", () => {
+		rmSync(batchDir, { recursive: true, force: true });
+	});
+	const batchPath = join(batchDir, "reset.sql");
 	const statements = [
 		"PRAGMA defer_foreign_keys = true",
-		...drops.map(
-			({ type, name }) => `DROP ${type.toUpperCase()} IF EXISTS "${name.replace(/"/g, '""')}"`,
-		),
+		...dropStatements,
 		// Same shape wrangler's own `d1 migrations apply` creates it with, so
 		// a migration file that itself queries d1_migrations (none do today,
-		// but nothing stops one) sees the same schema either way. In the same
-		// batch as the drops: the ledger-read loop right after this needs the
-		// table to exist even if the batch's atomicity guarantee turns out
-		// to matter here (see the catch below).
+		// but nothing stops one) sees the same schema either way.
 		"CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
 	];
+	writeFileSync(batchPath, `${statements.join(";\n")};\n`);
 
 	try {
-		wrangler(["d1", "execute", DB_NAME, "--remote", "--command", statements.join(";\n")]);
+		wrangler(["d1", "execute", DB_NAME, "--remote", "--file", batchPath]);
 	} catch (error) {
 		log(`RESET FAILED: ${error?.message || error}`);
 		log(
-			"reset-and-replay: the drop-and-recreate batch failed partway. D1 documents batched/multi-" +
-				"statement execution as a single SQL transaction that rolls back the whole sequence on any " +
-				"one statement's failure, so this database is EXPECTED to be unchanged from before this run " +
-				"-- but an operator must confirm that (enumerate sqlite_master by hand) before trusting it. " +
-				"Do NOT dispatch a plain apply-missing run against this database until that's confirmed: an " +
-				"apply-missing run assumes whatever d1_migrations currently says is accurate, and would " +
-				"silently complete against a partially-dropped schema if this rollback did not fully apply.",
+			"reset-and-replay: the drop-and-recreate batch failed partway. d1_migrations was dropped FIRST " +
+				"in this same file specifically so that, whatever this database's actual state is now, a " +
+				"later plain apply-missing dispatch will fail loudly (no such table: d1_migrations) rather " +
+				"than silently trusting a stale ledger against a partially-dropped schema -- but do NOT " +
+				"dispatch one anyway. An operator must confirm this database's actual state by hand " +
+				"(enumerate sqlite_master) before anything else runs against it.",
 		);
 		process.exit(1);
 	}
