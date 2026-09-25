@@ -95,6 +95,13 @@ jobs:
       D1_DATABASE_NAME: ${{ inputs.database-name }}
       D1_MIGRATIONS_DIR: ${{ inputs.migrations-dir }}
       D1_MIGRATIONS_DRY_RUN: ${{ inputs.dry-run && '1' || '' }}
+      # Fixes #58: this was never wired, so verifyDatabaseId() and the
+      # generated-config pin (apply-d1-migrations.mjs) always no-op'd on an
+      # empty DATABASE_ID regardless of what a caller passed as database-id
+      # -- #58's entire server-side verification has been dead code since it
+      # merged. Every existing caller that never sets database-id is
+      # unaffected (still empty, still skipped).
+      D1_DATABASE_ID: ${{ inputs.database-id }}
     steps:
       - name: Checkout consumer repo
         uses: actions/checkout@v5
