@@ -19,6 +19,14 @@ test('mints a per-job App token scoped to contents:read on packages-go only', ()
   assert.doesNotMatch(source, /permission-(?!contents)[a-z-]+:/);
 });
 
+test('documents only the read-only fulcrum-ci-read App, never the platform-automation key (ES-11)', () => {
+  // A co-tenant job on a shared self-hosted runner can read a concurrent job's
+  // environment, so this read-only step must be fed a key that can only read.
+  assert.match(source, /secrets\.FULCRUM_CI_READ_APP_ID/);
+  assert.match(source, /secrets\.FULCRUM_CI_READ_APP_PRIVATE_KEY/);
+  assert.doesNotMatch(source, /secrets\.FULCRUM_APP_(ID|PRIVATE_KEY)\b/);
+});
+
 test('never writes a global git config and never echoes the token', () => {
   assert.doesNotMatch(source, /git config --global|git config --system/);
   const script = source.slice(source.indexOf('run: |'));
