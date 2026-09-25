@@ -240,13 +240,24 @@ const fkListForTable = (table) =>
 // never guessing -- on any cycle, since a cyclic FK graph among tables has
 // no drop order that avoids violating one of them.
 function topoSortDropOrder(tableNames, edges) {
+	// SQLite table names are case-insensitive, but PRAGMA foreign_key_list's
+	// `table` column is spelled exactly as written in the REFERENCES clause
+	// -- `REFERENCES Users(id)` against an actual table `users` would
+	// otherwise silently fail an exact-string Map lookup below and lose the
+	// ordering constraint entirely (the reset would then abort partway,
+	// loudly, but still abort). Resolve both sides of an edge through this
+	// case-insensitive lookup; the DROP statements themselves still use
+	// tableNames' own (real, as-enumerated) casing, untouched by this.
+	const byLowerName = new Map(tableNames.map((t) => [t.toLowerCase(), t]));
 	const inDegree = new Map(tableNames.map((t) => [t, 0]));
 	const dependents = new Map(tableNames.map((t) => [t, []]));
 	for (const { child, parent } of edges) {
-		if (child === parent) continue; // self-reference: no cross-table ordering constraint
-		if (!dependents.has(child) || !inDegree.has(parent)) continue; // references a table outside this drop set (already excluded/handled)
-		dependents.get(child).push(parent);
-		inDegree.set(parent, inDegree.get(parent) + 1);
+		const childName = byLowerName.get(child.toLowerCase());
+		const parentName = byLowerName.get(parent.toLowerCase());
+		if (!childName || !parentName) continue; // references a table outside this drop set (already excluded/handled)
+		if (childName === parentName) continue; // self-reference: no cross-table ordering constraint
+		dependents.get(childName).push(parentName);
+		inDegree.set(parentName, inDegree.get(parentName) + 1);
 	}
 	const queue = tableNames.filter((t) => inDegree.get(t) === 0);
 	const order = [];
@@ -369,11 +380,15 @@ async function resetDatabase() {
 	// (self-hosted runners are persistent, so this is removed explicitly on
 	// exit, same as the generated wrangler-config pin elsewhere in this
 	// script) -- not one call per statement, and not an inline --command
-	// string. defer_foreign_keys is scoped to the transaction it runs in, so
-	// it has to be the first statement in this SAME file, not an earlier,
-	// separate call -- kept as defence in depth alongside the FK-topological
-	// drop order above, in case any single statement in this file still runs
-	// as its own auto-commit outside of an enclosing transaction.
+	// string. defer_foreign_keys is scoped to the transaction it runs in and
+	// resets at that transaction's end, so it has to be the first statement
+	// in this SAME file to matter at all -- and it only CAN matter if D1
+	// runs this whole file as one transaction. If D1 instead auto-commits
+	// each statement individually, defer_foreign_keys is a harmless no-op
+	// here (there is no multi-statement transaction for it to defer within),
+	// and the FK-topological drop order above is what actually makes the
+	// drops safe either way -- kept regardless, since it costs nothing and
+	// helps if the whole-file-as-one-transaction case does hold.
 	const batchDir = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "d1-reset-batch-"));
 	process.on("exit", () => {
 		rmSync(batchDir, { recursive: true, force: true });

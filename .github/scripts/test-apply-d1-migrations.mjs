@@ -798,6 +798,45 @@ test('reset-and-replay drops triggers, then views, then indexes, then tables (in
   }
 });
 
+test('reset-and-replay resolves a mixed-case REFERENCES against sqlite_master\'s own casing (PRAGMA foreign_key_list reports the table exactly as written in REFERENCES, not as it exists)', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, fileContents } = await runApply({
+      migrationFiles: ['0001_a.sql'],
+      appliedLedgerNames: [],
+      dryRun: false,
+      databaseName: 'fronts-data-staging',
+      resetAndReplay: true,
+      confirm: 'fronts-data-staging',
+      prodDatabaseName: 'fronts-data',
+      databaseId: 'aaaaaaaa-0000-0000-0000-000000000001',
+      cfApiBase: `http://127.0.0.1:${port}`,
+      sqliteMasterObjects: [
+        { type: 'table', name: 'users' },
+        { type: 'table', name: 'posts' },
+      ],
+      // `posts` was created with `REFERENCES Users(id)` -- PRAGMA
+      // foreign_key_list reports "Users" (as written), not "users" (as
+      // sqlite_master itself spells the table). An exact-string lookup
+      // would silently lose this edge and drop users before posts.
+      fkLists: { posts: [{ table: 'Users' }] },
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const batchContents = fileContents.find((text) => text.includes('PRAGMA defer_foreign_keys'));
+    assert.ok(batchContents, 'the reset batch file must exist');
+    const statements = batchContents.trim().replace(/;\s*$/, '').split(';\n');
+    const postsIndex = statements.indexOf('DROP TABLE IF EXISTS "posts"');
+    const usersIndex = statements.indexOf('DROP TABLE IF EXISTS "users"');
+    assert.ok(postsIndex !== -1 && usersIndex !== -1, 'both tables must be in the drop list');
+    assert.ok(postsIndex < usersIndex, 'posts (child, via a case-mismatched REFERENCES Users) must still drop before users (parent)');
+  } finally {
+    server.close();
+  }
+});
+
 test('reset-and-replay\'s sqlite_master enumeration query excludes D1-internal _cf_* and sqlite_* tables, properly escaped (bare _ is itself a LIKE wildcard)', async () => {
   // The fixture wrangler can't simulate a real WHERE clause filtering rows
   // server-side -- it just echoes back whatever sqliteMasterObjects the
