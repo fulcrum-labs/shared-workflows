@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -118,6 +118,13 @@ function runApply({
   // `migrations/`, so a test can prove the manifest spans more than one
   // directory -- exactly the fronts + analytics shape this exists for.
   extraDirs,
+  // M2-19 R17, reviewer-foundry re-review: symlinks to create inside `dir`
+  // BEFORE spawning, each {at: 'migrations/evil.sql', target: '/outside'} --
+  // `at` is relative to `dir` (matching migrationFiles/extraDirs), `target`
+  // is an absolute path OUTSIDE `dir` entirely (a real, pre-existing file --
+  // symlinkSync doesn't require the target to exist, but statSync/lstatSync
+  // downstream do care once the real script inspects it).
+  symlinks,
 }) {
   const dir = mkdtempSync(join(tmpdir(), 'd1-apply-test-'));
   const migrationsDir = join(dir, 'migrations');
@@ -131,6 +138,9 @@ function runApply({
     for (const [name, content] of Object.entries(files)) {
       writeFileSync(join(extraDir, name), content ?? `-- ${name}\nSELECT 1;\n`);
     }
+  }
+  for (const { at, target } of symlinks || []) {
+    symlinkSync(target, join(dir, at));
   }
   if (wranglerTomlContent) {
     writeFileSync(join(dir, 'wrangler.toml'), wranglerTomlContent);
@@ -1284,6 +1294,36 @@ refusalTest(
   [{ path: 'migrations/0001_a.sql', apply: true, supercededBy: 'a typo, not supersededBy' }],
   /unrecognized field\(s\): supercededBy/,
 );
+
+// reviewer-foundry, SW#63 re-review: resolve() is lexical, so a committed
+// symlink inside the checkout pointing OUTSIDE it (migrations/evil.sql ->
+// /somewhere/else.sql) passes the lexical containment check, and the old
+// statSync-based guard FOLLOWED the link (isFile() on the link's target).
+// lstatSync never follows a link -- this proves the refusal fires on the
+// link itself, before wrangler ever gets near whatever it points at.
+test('replay-manifest-path refuses a symlink inside the checkout that points outside it, before the destructive reset runs', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, invocations } = await runApply(
+      validResetAndReplayOptions({
+        cfApiBase: `http://127.0.0.1:${port}`,
+        migrationFiles: [],
+        appliedLedgerNames: [],
+        dryRun: false,
+        symlinks: [{ at: 'migrations/evil.sql', target: '/tmp/outside-the-checkout-does-not-need-to-exist.sql' }],
+        replayManifest: { entries: [{ path: 'migrations/evil.sql', apply: true }] },
+      }),
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout + result.stderr, /entry 0's path is a symlink, refused outright/);
+    assert.equal(invocations.length, 0, 'zero wrangler invocations -- refused before the destructive reset');
+  } finally {
+    server.close();
+  }
+});
 
 test('reset-and-replay dry run with a replay manifest prints the validated plan (order, apply vs ledger-only, supersededBy) before the dry-run exit, and still performs zero D1 writes', async () => {
   const server = await startFixtureD1ListServer([

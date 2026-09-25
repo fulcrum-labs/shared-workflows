@@ -23,7 +23,7 @@
 // with their D1_DATABASE_NAME and CLOUDFLARE_ACCOUNT_ID.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 
@@ -482,8 +482,12 @@ function loadReplayManifest(manifestPath) {
 	// The checkout root every entry's path must resolve inside. Computed once,
 	// as an absolute, trailing-separator-qualified prefix, so a startsWith
 	// check below can't be fooled by a sibling directory that merely shares a
-	// string prefix (e.g. "/repo" vs "/repo-evil").
+	// string prefix (e.g. "/repo" vs "/repo-evil"). Two forms: the lexical
+	// one (cheap, catches a bare absolute path or a literal ".." before any
+	// filesystem call) and the REAL one (resolves any symlinked ancestor
+	// directory too) -- an entry must pass both.
 	const checkoutRoot = resolve(".") + sep;
+	const realCheckoutRoot = realpathSync(".") + sep;
 
 	const entries = rawEntries.map((entry, index) => {
 		if (!entry || typeof entry !== "object") {
@@ -505,11 +509,18 @@ function loadReplayManifest(manifestPath) {
 		}
 
 		// Guard 1: the path must resolve to a real .sql file INSIDE the
-		// checkout -- no absolute path, no `..` escaping it. Checked via the
-		// RESOLVED path, not the string itself: a purely lexical check (e.g.
-		// "does the string contain '..'") is trivially defeated by a path that
-		// resolves outside without ever spelling `..` (a symlink, or simply an
-		// absolute path to another directory).
+		// checkout -- no absolute path, no `..` escaping it, and no symlink
+		// escaping it either. `resolve()` is purely LEXICAL -- it defeats a
+		// bare absolute path or a literal `..`, but a committed symlink
+		// (`migrations/x.sql -> /outside/evil.sql`) resolves lexically to a
+		// path that still starts with the checkout root, then `statSync`
+		// FOLLOWS the link to whatever it points at (reviewer-foundry, SW#63
+		// re-review). Two checks close this: `lstatSync` (never follows
+		// links) to refuse a symlink outright, and `realpathSync` (resolves
+		// every remaining path component, including any symlinked ANCESTOR
+		// directory) compared against the checkout root's own realpath --
+		// not `resolve('.')`, which is exactly as lexical as `resolve(entry.path)`
+		// and would miss a symlinked directory two levels up just as easily.
 		if (!entry.path.endsWith(".sql")) {
 			throw new Error(
 				`replay-manifest-path "${manifestPath}" entry ${index}'s path does not end in .sql: ${entry.path}`,
@@ -521,17 +532,29 @@ function loadReplayManifest(manifestPath) {
 				`replay-manifest-path "${manifestPath}" entry ${index}'s path resolves outside the checkout: ${entry.path}`,
 			);
 		}
-		let stat;
+		let lstat;
 		try {
-			stat = statSync(resolvedEntryPath);
+			lstat = lstatSync(resolvedEntryPath);
 		} catch {
 			throw new Error(
 				`replay-manifest-path "${manifestPath}" entry ${index}'s path does not exist: ${entry.path}`,
 			);
 		}
-		if (!stat.isFile()) {
+		if (lstat.isSymbolicLink()) {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index}'s path is a symlink, refused outright: ${entry.path}`,
+			);
+		}
+		if (!lstat.isFile()) {
 			throw new Error(
 				`replay-manifest-path "${manifestPath}" entry ${index}'s path is not a regular file: ${entry.path}`,
+			);
+		}
+		const realEntryPath = realpathSync(resolvedEntryPath);
+		if (realEntryPath !== realCheckoutRoot.slice(0, -1) && !realEntryPath.startsWith(realCheckoutRoot)) {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index}'s path resolves outside the checkout `
+					+ `via a symlinked ancestor directory: ${entry.path}`,
 			);
 		}
 
@@ -551,7 +574,9 @@ function loadReplayManifest(manifestPath) {
 		// EARLIER entry in this same manifest (checked in a second pass below,
 		// once every entry's name is known) -- a forward or dangling reference
 		// would silently record a superseded name with no real entry to back
-		// the claim "this schema effect already ran".
+		// the claim "this schema effect already ran". supersededBy is matched
+		// against that earlier entry's PATH, exact string, byte for byte --
+		// never just a basename (two different directories can share one).
 		if (!apply && (typeof entry.supersededBy !== "string" || entry.supersededBy === "")) {
 			throw new Error(
 				`replay-manifest-path "${manifestPath}" entry ${index} is apply:false but has no supersededBy: ${entry.path}`,
