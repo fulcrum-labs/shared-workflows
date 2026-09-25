@@ -508,6 +508,19 @@ function loadReplayManifest(manifestPath) {
 			);
 		}
 
+		// Guard 4b: `apply` must be a real boolean when present -- "false", 0,
+		// and a missing field are three different things a loose truthiness
+		// check would otherwise conflate into "apply" (this script's own
+		// `entry.apply !== false` used to do exactly that for the string
+		// "false" and the number 0, both of which are !== the boolean false).
+		// Computed BEFORE guard 1 below, which branches on it.
+		if ("apply" in entry && typeof entry.apply !== "boolean") {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index}'s apply must be a real boolean, got ${JSON.stringify(entry.apply)}`,
+			);
+		}
+		const apply = "apply" in entry ? entry.apply : true;
+
 		// Guard 1: the path must resolve to a real .sql file INSIDE the
 		// checkout -- no absolute path, no `..` escaping it, and no symlink
 		// escaping it either. `resolve()` is purely LEXICAL -- it defeats a
@@ -521,6 +534,22 @@ function loadReplayManifest(manifestPath) {
 		// directory) compared against the checkout root's own realpath --
 		// not `resolve('.')`, which is exactly as lexical as `resolve(entry.path)`
 		// and would miss a symlinked directory two levels up just as easily.
+		//
+		// apply:false is exempt from the FILESYSTEM half of this guard
+		// (existence, lstat, realpath) -- reviewer-foundry/team-lead, SW#63
+		// re-review: this workflow never runs `pnpm install`, so a
+		// dependency's own migrations_dir (e.g. node_modules/@growth-labs/
+		// analytics/migrations, exactly where every ledger-only entry in a
+		// project like Fronts' 116-name historical set lives) does not exist
+		// on disk in this job at all. An apply:false entry never executes
+		// its file -- only its basename is ever read (for the ledger INSERT)
+		// -- so there is nothing to protect by requiring the file to exist,
+		// while a real prod dependency version bump would otherwise refuse a
+		// perfectly safe manifest outright. The lexical half (.sql suffix,
+		// no absolute path, no `..`) still applies to EVERY entry regardless
+		// of apply -- a nonsense or escaping path is refused either way,
+		// it's only the "does this actually exist" filesystem check that's
+		// apply:true-only.
 		if (!entry.path.endsWith(".sql")) {
 			throw new Error(
 				`replay-manifest-path "${manifestPath}" entry ${index}'s path does not end in .sql: ${entry.path}`,
@@ -532,43 +561,33 @@ function loadReplayManifest(manifestPath) {
 				`replay-manifest-path "${manifestPath}" entry ${index}'s path resolves outside the checkout: ${entry.path}`,
 			);
 		}
-		let lstat;
-		try {
-			lstat = lstatSync(resolvedEntryPath);
-		} catch {
-			throw new Error(
-				`replay-manifest-path "${manifestPath}" entry ${index}'s path does not exist: ${entry.path}`,
-			);
+		if (apply) {
+			let lstat;
+			try {
+				lstat = lstatSync(resolvedEntryPath);
+			} catch {
+				throw new Error(
+					`replay-manifest-path "${manifestPath}" entry ${index}'s path does not exist: ${entry.path}`,
+				);
+			}
+			if (lstat.isSymbolicLink()) {
+				throw new Error(
+					`replay-manifest-path "${manifestPath}" entry ${index}'s path is a symlink, refused outright: ${entry.path}`,
+				);
+			}
+			if (!lstat.isFile()) {
+				throw new Error(
+					`replay-manifest-path "${manifestPath}" entry ${index}'s path is not a regular file: ${entry.path}`,
+				);
+			}
+			const realEntryPath = realpathSync(resolvedEntryPath);
+			if (realEntryPath !== realCheckoutRoot.slice(0, -1) && !realEntryPath.startsWith(realCheckoutRoot)) {
+				throw new Error(
+					`replay-manifest-path "${manifestPath}" entry ${index}'s path resolves outside the checkout `
+						+ `via a symlinked ancestor directory: ${entry.path}`,
+				);
+			}
 		}
-		if (lstat.isSymbolicLink()) {
-			throw new Error(
-				`replay-manifest-path "${manifestPath}" entry ${index}'s path is a symlink, refused outright: ${entry.path}`,
-			);
-		}
-		if (!lstat.isFile()) {
-			throw new Error(
-				`replay-manifest-path "${manifestPath}" entry ${index}'s path is not a regular file: ${entry.path}`,
-			);
-		}
-		const realEntryPath = realpathSync(resolvedEntryPath);
-		if (realEntryPath !== realCheckoutRoot.slice(0, -1) && !realEntryPath.startsWith(realCheckoutRoot)) {
-			throw new Error(
-				`replay-manifest-path "${manifestPath}" entry ${index}'s path resolves outside the checkout `
-					+ `via a symlinked ancestor directory: ${entry.path}`,
-			);
-		}
-
-		// Guard 4b: `apply` must be a real boolean when present -- "false", 0,
-		// and a missing field are three different things a loose truthiness
-		// check would otherwise conflate into "apply" (this script's own
-		// `entry.apply !== false` used to do exactly that for the string
-		// "false" and the number 0, both of which are !== the boolean false).
-		if ("apply" in entry && typeof entry.apply !== "boolean") {
-			throw new Error(
-				`replay-manifest-path "${manifestPath}" entry ${index}'s apply must be a real boolean, got ${JSON.stringify(entry.apply)}`,
-			);
-		}
-		const apply = "apply" in entry ? entry.apply : true;
 
 		// Guard 3: apply:false requires supersededBy, and it must name an
 		// EARLIER entry in this same manifest (checked in a second pass below,

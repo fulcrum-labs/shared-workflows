@@ -1325,6 +1325,53 @@ test('replay-manifest-path refuses a symlink inside the checkout that points out
   }
 });
 
+// reviewer-foundry / team-lead, SW#63 re-review, option (c): this workflow
+// never runs a package install, so a dependency's own migrations_dir (e.g.
+// node_modules/@growth-labs/analytics/migrations -- exactly where every
+// ledger-only entry in a project like Fronts' historical set lives) does
+// not exist on disk in this job. apply:false is exempt from the existence
+// check (it never executes the file, only its basename is read) -- proves
+// a real, non-toy path shape succeeds and writes exactly the ledger row,
+// no --file call.
+test('replay-manifest-path accepts an apply:false entry under a path that does not exist on disk (a dependency\'s migrations_dir this job never installed), writing only the ledger row', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, invocations } = await runApply(
+      validResetAndReplayOptions({
+        cfApiBase: `http://127.0.0.1:${port}`,
+        migrationFiles: ['0029_fronts_copy.sql'],
+        appliedLedgerNames: [],
+        dryRun: false,
+        replayManifest: {
+          entries: [
+            { path: 'migrations/0029_fronts_copy.sql', apply: true },
+            {
+              path: 'node_modules/@growth-labs/analytics/migrations/0002_extend_conversion_attribution.sql',
+              apply: false,
+              supersededBy: 'migrations/0029_fronts_copy.sql',
+            },
+          ],
+        },
+      }),
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const fileCalls = invocations.filter((call) => call.includes('--file'));
+    assert.ok(
+      !fileCalls.some((call) => call.some((arg) => typeof arg === 'string' && arg.includes('node_modules'))),
+      'the apply:false entry under a non-existent path must never be --file-applied',
+    );
+    const insertedNames = invocations
+      .flat()
+      .filter((arg) => typeof arg === 'string' && arg.includes('INSERT INTO d1_migrations'));
+    assert.ok(insertedNames.some((sql) => sql.includes("'0002_extend_conversion_attribution.sql'")));
+  } finally {
+    server.close();
+  }
+});
+
 test('reset-and-replay dry run with a replay manifest prints the validated plan (order, apply vs ledger-only, supersededBy) before the dry-run exit, and still performs zero D1 writes', async () => {
   const server = await startFixtureD1ListServer([
     { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
