@@ -108,6 +108,16 @@ function runApply({
   sqliteMasterObjects,
   failOnSubstring,
   fkLists,
+  // M2-19 R17: either a raw string (a test exercising a malformed/missing
+  // manifest file writes its own file and passes the path string here), or
+  // an object/array that gets JSON-written to `replay-manifest.json` in the
+  // test's own dir and passed by that relative path -- the same shape a real
+  // checked-in manifest resolves relative to the checkout root.
+  replayManifest,
+  // Extra directories (name -> {filename: content}) beyond the default
+  // `migrations/`, so a test can prove the manifest spans more than one
+  // directory -- exactly the fronts + analytics shape this exists for.
+  extraDirs,
 }) {
   const dir = mkdtempSync(join(tmpdir(), 'd1-apply-test-'));
   const migrationsDir = join(dir, 'migrations');
@@ -115,8 +125,22 @@ function runApply({
   for (const name of migrationFiles) {
     writeFileSync(join(migrationsDir, name), `-- ${name}\nSELECT 1;\n`);
   }
+  for (const [dirName, files] of Object.entries(extraDirs || {})) {
+    const extraDir = join(dir, dirName);
+    mkdirSync(extraDir, { recursive: true });
+    for (const [name, content] of Object.entries(files)) {
+      writeFileSync(join(extraDir, name), content ?? `-- ${name}\nSELECT 1;\n`);
+    }
+  }
   if (wranglerTomlContent) {
     writeFileSync(join(dir, 'wrangler.toml'), wranglerTomlContent);
+  }
+  let replayManifestPath;
+  if (typeof replayManifest === 'string') {
+    replayManifestPath = replayManifest;
+  } else if (replayManifest !== undefined) {
+    replayManifestPath = 'replay-manifest.json';
+    writeFileSync(join(dir, replayManifestPath), JSON.stringify(replayManifest));
   }
   const wranglerPath = join(dir, 'fake-wrangler.mjs');
   writeFileSync(wranglerPath, FAKE_WRANGLER);
@@ -161,6 +185,7 @@ function runApply({
           ...(confirm !== undefined ? { D1_MIGRATIONS_CONFIRM: confirm } : {}),
           ...(prodDatabaseName ? { D1_MIGRATIONS_PROD_DATABASE_NAME: prodDatabaseName } : {}),
           ...(failOnSubstring ? { FAKE_WRANGLER_FAIL_ON_SUBSTRING: failOnSubstring } : {}),
+          ...(replayManifestPath ? { D1_MIGRATIONS_REPLAY_MANIFEST_PATH: replayManifestPath } : {}),
         },
       },
     );
@@ -504,6 +529,7 @@ test('every process.env.D1_* / CLOUDFLARE_* the script reads is mapped in the wo
     D1_MIGRATIONS_RESET_AND_REPLAY: 'inputs.reset-and-replay',
     D1_MIGRATIONS_CONFIRM: 'inputs.confirm',
     D1_MIGRATIONS_PROD_DATABASE_NAME: 'inputs.prod-database-name',
+    D1_MIGRATIONS_REPLAY_MANIFEST_PATH: 'inputs.replay-manifest-path',
   };
   for (const [key, value] of mappedLines.map((m) => [m[1], m[2]])) {
     const expected = EXPECTED_REFERENCE[key];
@@ -977,6 +1003,176 @@ test('reset-and-replay stops loudly if the drop-and-recreate batch fails, and ne
       call.some((arg) => typeof arg === 'string' && arg.includes('SELECT name FROM d1_migrations')),
     );
     assert.equal(afterBatch.length, 0, 'must not read the ledger after a failed reset batch');
+  } finally {
+    server.close();
+  }
+});
+
+// M2-19 R17: replay-manifest-path replaces the default "read migrations-dir
+// alphabetically" behaviour with an explicit, checked-in {path,apply} order
+// that can span more than one directory (the fronts + analytics shape this
+// exists for). Only meaningful alongside reset-and-replay -- see guard 0.
+test('replay-manifest-path without reset-and-replay refuses, before any D1 interaction', async () => {
+  const { result, invocations } = await runApply({
+    migrationFiles: ['0001_a.sql'],
+    appliedLedgerNames: [],
+    dryRun: false,
+    replayManifest: { entries: [{ path: 'migrations/0001_a.sql' }] },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout + result.stderr, /replay-manifest-path was supplied without reset-and-replay/);
+  assert.equal(invocations.length, 0, 'zero wrangler invocations on refusal');
+});
+
+function validResetAndReplayOptions(extra) {
+  return {
+    databaseName: 'fronts-data-staging',
+    resetAndReplay: true,
+    confirm: 'fronts-data-staging',
+    prodDatabaseName: 'fronts-data',
+    databaseId: 'aaaaaaaa-0000-0000-0000-000000000001',
+    sqliteMasterObjects: [],
+    ...extra,
+  };
+}
+
+test('replay-manifest-path follows the manifest\'s explicit order, spanning two directories, NOT alphabetical order and NOT the default single migrations-dir', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, fileContents } = await runApply(
+      validResetAndReplayOptions({
+        cfApiBase: `http://127.0.0.1:${port}`,
+        migrationFiles: ['0001_a.sql'],
+        extraDirs: { 'other-migrations': { '0005_z.sql': '-- 0005_z.sql\nCREATE TABLE z (id TEXT);\n' } },
+        appliedLedgerNames: [],
+        dryRun: false,
+        // Deliberately reversed from alphabetical-across-both-dirs (0001
+        // would sort before 0005): proves the script follows the manifest's
+        // own order, not a directory scan or a merge-sort of the two.
+        replayManifest: {
+          entries: [
+            { path: 'other-migrations/0005_z.sql', apply: true },
+            { path: 'migrations/0001_a.sql', apply: true },
+          ],
+        },
+      }),
+    );
+    assert.equal(result.status, 0, result.stderr);
+    // fileContents logs every --file read in call order, including the
+    // reset batch itself (statements.join, not a migration file) -- filter
+    // to the two real migration file reads by their own SQL content.
+    const migrationReads = fileContents.filter(
+      (content) => content.includes('CREATE TABLE z') || content.includes('SELECT 1'),
+    );
+    assert.equal(migrationReads.length, 2);
+    assert.match(migrationReads[0], /CREATE TABLE z/, '0005_z.sql (other-migrations/) must apply FIRST, per the manifest');
+    assert.match(migrationReads[1], /SELECT 1/, '0001_a.sql (migrations/) must apply SECOND, per the manifest');
+    assert.match(result.stdout, /applied 0005_z\.sql/);
+    assert.match(result.stdout, /applied 0001_a\.sql/);
+  } finally {
+    server.close();
+  }
+});
+
+test('replay-manifest-path apply:false records a ledger row without ever calling --file for that entry', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, invocations } = await runApply(
+      validResetAndReplayOptions({
+        cfApiBase: `http://127.0.0.1:${port}`,
+        migrationFiles: ['0029_fronts_copy.sql'],
+        extraDirs: { 'other-migrations': { '0002_superseded.sql': '-- 0002_superseded.sql\nALTER TABLE x ADD COLUMN y TEXT;\n' } },
+        appliedLedgerNames: [],
+        dryRun: false,
+        replayManifest: {
+          entries: [
+            { path: 'migrations/0029_fronts_copy.sql', apply: true },
+            {
+              path: 'other-migrations/0002_superseded.sql',
+              apply: false,
+              supersededBy: 'migrations/0029_fronts_copy.sql',
+            },
+          ],
+        },
+      }),
+    );
+    assert.equal(result.status, 0, result.stderr);
+    // Exactly one --file call for the apply:true entry; none for apply:false.
+    const fileCalls = invocations.filter((call) => call.includes('--file'));
+    // One of those --file calls is the reset batch itself (sqliteMasterObjects
+    // is empty, so it's a trivial recreate-the-ledger batch) -- the OTHER is
+    // the one real migration apply.
+    const migrationFileCalls = fileCalls.filter((call) =>
+      call.some((arg) => typeof arg === 'string' && arg.includes('0029_fronts_copy.sql')),
+    );
+    assert.equal(migrationFileCalls.length, 1, 'the apply:true entry must be --file-applied exactly once');
+    assert.ok(
+      !fileCalls.some((call) => call.some((arg) => typeof arg === 'string' && arg.includes('0002_superseded.sql'))),
+      'the apply:false entry must NEVER be --file-applied',
+    );
+    // Both names still get an INSERT INTO d1_migrations -- the ledger-only
+    // entry's name is preserved so the deploy-gate file-union tripwire keeps
+    // passing without ever re-executing its SQL.
+    const insertedNames = invocations
+      .flat()
+      .filter((arg) => typeof arg === 'string' && arg.includes('INSERT INTO d1_migrations'));
+    assert.ok(insertedNames.some((sql) => sql.includes("'0029_fronts_copy.sql'")), 'the apply:true entry\'s name must be inserted');
+    assert.ok(insertedNames.some((sql) => sql.includes("'0002_superseded.sql'")), 'the apply:false entry\'s name must ALSO be inserted (ledger-only)');
+    assert.match(result.stdout, /recording 0002_superseded\.sql as ledger-only -- already applied for real as migrations\/0029_fronts_copy\.sql/);
+  } finally {
+    server.close();
+  }
+});
+
+test('replay-manifest-path refuses a manifest with an empty entries array, before the destructive reset runs', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, invocations } = await runApply(
+      validResetAndReplayOptions({
+        cfApiBase: `http://127.0.0.1:${port}`,
+        migrationFiles: [],
+        appliedLedgerNames: [],
+        dryRun: false,
+        replayManifest: { entries: [] },
+      }),
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout + result.stderr, /contains no entries/);
+    // Refused before resetDatabase()'s own sqlite_master enumeration --
+    // only the identity-verification lookup happened (no wrangler call).
+    assert.equal(invocations.length, 0, 'zero wrangler invocations -- refused before the destructive reset');
+  } finally {
+    server.close();
+  }
+});
+
+test('replay-manifest-path refuses an entry with no path, before the destructive reset runs', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, invocations } = await runApply(
+      validResetAndReplayOptions({
+        cfApiBase: `http://127.0.0.1:${port}`,
+        migrationFiles: [],
+        appliedLedgerNames: [],
+        dryRun: false,
+        replayManifest: { entries: [{ apply: true }] },
+      }),
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout + result.stderr, /entry 0 has no path/);
+    assert.equal(invocations.length, 0, 'zero wrangler invocations -- refused before the destructive reset');
   } finally {
     server.close();
   }
