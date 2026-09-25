@@ -227,6 +227,10 @@ const sqlEscape = (value) => value.replace(/'/g, "''");
 // changes. Recreating the database instead of emptying it would mint a new
 // uuid and break that pin.
 //
+// Excludes sqlite_%  (SQLite's own bookkeeping, e.g. sqlite_sequence) and
+// _cf_% (D1's own internal tables -- D1 refuses a DROP on these, which
+// would abort the reset partway through if they were included).
+//
 // Drop order: triggers and views first (neither blocks any other drop, and
 // SQLite doesn't validate a view's referenced table until the view is
 // queried), then indexes, then tables last (DROP TABLE auto-drops any
@@ -243,7 +247,7 @@ async function resetDatabase() {
 			"--remote",
 			"--json",
 			"--command",
-			"SELECT type, name FROM sqlite_master WHERE type IN ('table','view','index','trigger') AND name NOT LIKE 'sqlite_%'",
+			"SELECT type, name FROM sqlite_master WHERE type IN ('table','view','index','trigger') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
 		])?.[0]?.results || [];
 
 	const dropOrder = { trigger: 0, view: 1, index: 2, table: 3 };
@@ -264,29 +268,45 @@ async function resetDatabase() {
 		process.exit(0);
 	}
 
-	for (const { type, name } of drops) {
-		wrangler([
-			"d1",
-			"execute",
-			DB_NAME,
-			"--remote",
-			"--command",
-			`DROP ${type.toUpperCase()} IF EXISTS "${name.replace(/"/g, '""')}"`,
-		]);
-	}
-
-	// The ledger-read loop right below this needs the table to exist -- same
-	// shape wrangler's own `d1 migrations apply` creates it with, so a
-	// migration file that itself queries d1_migrations (none do today, but
-	// nothing stops one) sees the same schema either way.
-	wrangler([
-		"d1",
-		"execute",
-		DB_NAME,
-		"--remote",
-		"--command",
+	// Every drop, the FK-defer PRAGMA, and the ledger re-create run as ONE
+	// wrangler d1 execute call -- a single multi-statement string, not one
+	// call per statement -- so D1's own multi-statement/batch execution
+	// (Cloudflare docs: batched statements are SQL transactions; a failing
+	// statement aborts and rolls back the whole sequence) covers the entire
+	// reset, not just each individual drop. PRAGMA defer_foreign_keys=true
+	// (D1's own documented mechanism for a change that would otherwise
+	// violate a foreign key mid-migration) is scoped to the transaction it
+	// runs in, so it must be the first statement in this SAME call, not a
+	// separate, earlier one -- a separate call would not carry it forward.
+	const statements = [
+		"PRAGMA defer_foreign_keys = true",
+		...drops.map(
+			({ type, name }) => `DROP ${type.toUpperCase()} IF EXISTS "${name.replace(/"/g, '""')}"`,
+		),
+		// Same shape wrangler's own `d1 migrations apply` creates it with, so
+		// a migration file that itself queries d1_migrations (none do today,
+		// but nothing stops one) sees the same schema either way. In the same
+		// batch as the drops: the ledger-read loop right after this needs the
+		// table to exist even if the batch's atomicity guarantee turns out
+		// to matter here (see the catch below).
 		"CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-	]);
+	];
+
+	try {
+		wrangler(["d1", "execute", DB_NAME, "--remote", "--command", statements.join(";\n")]);
+	} catch (error) {
+		log(`RESET FAILED: ${error?.message || error}`);
+		log(
+			"reset-and-replay: the drop-and-recreate batch failed partway. D1 documents batched/multi-" +
+				"statement execution as a single SQL transaction that rolls back the whole sequence on any " +
+				"one statement's failure, so this database is EXPECTED to be unchanged from before this run " +
+				"-- but an operator must confirm that (enumerate sqlite_master by hand) before trusting it. " +
+				"Do NOT dispatch a plain apply-missing run against this database until that's confirmed: an " +
+				"apply-missing run assumes whatever d1_migrations currently says is accurate, and would " +
+				"silently complete against a partially-dropped schema if this rollback did not fully apply.",
+		);
+		process.exit(1);
+	}
 	log("reset-and-replay: dropped and re-created an empty d1_migrations; replaying every migration from scratch");
 }
 

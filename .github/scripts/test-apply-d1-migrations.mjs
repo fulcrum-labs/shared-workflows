@@ -53,16 +53,22 @@ if (configIndex !== -1) {
 if (process.env.FAKE_WRANGLER_TARGETED_LOG) {
   appendFileSync(process.env.FAKE_WRANGLER_TARGETED_LOG, (targetedId ?? '') + '\\n');
 }
-if (args.includes('--json')) {
+{
   const commandIndex = args.indexOf('--command');
   const command = commandIndex !== -1 ? args[commandIndex + 1] : '';
-  process.stdout.write('some wrangler banner line\\n');
-  if (command.includes('sqlite_master')) {
-    const objects = JSON.parse(process.env.FAKE_WRANGLER_SQLITE_MASTER || '[]');
-    process.stdout.write(JSON.stringify([{ results: objects }]));
-  } else {
-    const applied = JSON.parse(process.env.FAKE_WRANGLER_APPLIED || '[]');
-    process.stdout.write(JSON.stringify([{ results: applied.map((name) => ({ name })) }]));
+  if (process.env.FAKE_WRANGLER_FAIL_ON_SUBSTRING && command.includes(process.env.FAKE_WRANGLER_FAIL_ON_SUBSTRING)) {
+    process.stderr.write('fake wrangler: simulated failure\\n');
+    process.exit(1);
+  }
+  if (args.includes('--json')) {
+    process.stdout.write('some wrangler banner line\\n');
+    if (command.includes('sqlite_master')) {
+      const objects = JSON.parse(process.env.FAKE_WRANGLER_SQLITE_MASTER || '[]');
+      process.stdout.write(JSON.stringify([{ results: objects }]));
+    } else {
+      const applied = JSON.parse(process.env.FAKE_WRANGLER_APPLIED || '[]');
+      process.stdout.write(JSON.stringify([{ results: applied.map((name) => ({ name })) }]));
+    }
   }
 }
 process.exit(0);
@@ -86,6 +92,7 @@ function runApply({
   confirm,
   prodDatabaseName,
   sqliteMasterObjects,
+  failOnSubstring,
 }) {
   const dir = mkdtempSync(join(tmpdir(), 'd1-apply-test-'));
   const migrationsDir = join(dir, 'migrations');
@@ -134,6 +141,7 @@ function runApply({
           ...(resetAndReplay ? { D1_MIGRATIONS_RESET_AND_REPLAY: '1' } : {}),
           ...(confirm !== undefined ? { D1_MIGRATIONS_CONFIRM: confirm } : {}),
           ...(prodDatabaseName ? { D1_MIGRATIONS_PROD_DATABASE_NAME: prodDatabaseName } : {}),
+          ...(failOnSubstring ? { FAKE_WRANGLER_FAIL_ON_SUBSTRING: failOnSubstring } : {}),
         },
       },
     );
@@ -650,28 +658,39 @@ test('reset-and-replay drops triggers, then views, then indexes, then tables (in
     });
     assert.equal(result.status, 0, result.stdout + result.stderr);
 
-    const dropCalls = invocations.filter((call) =>
-      call.some((arg) => typeof arg === 'string' && arg.startsWith('DROP ')),
+    // Every drop, the FK-defer PRAGMA, and the ledger re-create are ONE
+    // wrangler d1 execute call -- a single multi-statement --command
+    // string -- not one call per statement, so D1's own batch/transaction
+    // semantics cover the whole reset atomically.
+    const batchCall = invocations.find((call) =>
+      call.some((arg) => typeof arg === 'string' && arg.includes('PRAGMA defer_foreign_keys')),
     );
-    const dropCommand = (call) => call[call.indexOf('--command') + 1];
-    assert.equal(dropCalls.length, 5, 'one DROP per sqlite_master object');
-    assert.match(dropCommand(dropCalls[0]), /^DROP TRIGGER IF EXISTS "users_updated_at"$/);
-    assert.match(dropCommand(dropCalls[1]), /^DROP VIEW IF EXISTS "active_users"$/);
-    assert.match(dropCommand(dropCalls[2]), /^DROP INDEX IF EXISTS "idx_users_email"$/);
+    assert.ok(batchCall, 'the reset batch call must exist');
+    const statements = batchCall[batchCall.indexOf('--command') + 1].split(';\n');
+
+    assert.equal(statements[0], 'PRAGMA defer_foreign_keys = true', 'FK deferral must be the first statement in the SAME call the drops run in');
+    assert.equal(statements.length, 1 + 5 + 1, 'PRAGMA + one DROP per sqlite_master object + the re-create');
+    assert.equal(statements[1], 'DROP TRIGGER IF EXISTS "users_updated_at"');
+    assert.equal(statements[2], 'DROP VIEW IF EXISTS "active_users"');
+    assert.equal(statements[3], 'DROP INDEX IF EXISTS "idx_users_email"');
     // The two remaining tables (d1_migrations and users) drop last, in
     // whatever order they appeared in the sqlite_master fixture --
     // dropOrder only guarantees they come after triggers/views/indexes.
-    const tableDrops = dropCalls.slice(3).map(dropCommand);
-    assert.ok(tableDrops.some((c) => c === 'DROP TABLE IF EXISTS "d1_migrations"'));
-    assert.ok(tableDrops.some((c) => c === 'DROP TABLE IF EXISTS "users"'));
-
-    const recreateCall = invocations.find((call) =>
-      call.some((arg) => typeof arg === 'string' && arg.startsWith('CREATE TABLE d1_migrations')),
+    const tableDrops = statements.slice(4, 6);
+    assert.ok(tableDrops.includes('DROP TABLE IF EXISTS "d1_migrations"'));
+    assert.ok(tableDrops.includes('DROP TABLE IF EXISTS "users"'));
+    assert.equal(
+      statements[statements.length - 1],
+      'CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)',
+      'the re-create must be the last statement, after every drop',
     );
-    assert.ok(recreateCall, 'd1_migrations must be re-created after the drops');
-    assert.ok(
-      invocations.indexOf(recreateCall) > invocations.indexOf(dropCalls[dropCalls.length - 1]),
-      'the re-create must come after every drop',
+    // No separate per-object DROP/CREATE calls -- only the one batch call
+    // (plus the sqlite_master SELECT before it and the apply-missing calls
+    // after it, asserted below via stdout).
+    assert.equal(
+      invocations.filter((call) => call.some((arg) => typeof arg === 'string' && arg.startsWith('DROP '))).length,
+      0,
+      'no DROP should appear as its own separate wrangler invocation',
     );
 
     // Replay: both migration files apply, from an empty ledger, exactly
@@ -679,6 +698,79 @@ test('reset-and-replay drops triggers, then views, then indexes, then tables (in
     assert.match(result.stdout, /applied 0001_a\.sql/);
     assert.match(result.stdout, /applied 0002_b\.sql/);
     assert.match(result.stdout, /done; applied 2 migration\(s\)/);
+  } finally {
+    server.close();
+  }
+});
+
+test('reset-and-replay\'s sqlite_master enumeration query excludes D1-internal _cf_* and sqlite_* tables (D1 refuses a DROP on these; a real enumeration must never even ask for one)', async () => {
+  // The fixture wrangler can't simulate a real WHERE clause filtering rows
+  // server-side -- it just echoes back whatever sqliteMasterObjects the
+  // test supplies -- so this asserts the SELECT this script actually sends
+  // excludes both prefixes, trusting D1 to honour that WHERE clause the
+  // same as any other SQLite database (which is the real enforcement:
+  // this script never client-side filters sqlite_master's own results).
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    await runApply({
+      migrationFiles: ['0001_a.sql'],
+      appliedLedgerNames: [],
+      dryRun: true,
+      databaseName: 'fronts-data-staging',
+      resetAndReplay: true,
+      confirm: 'fronts-data-staging',
+      prodDatabaseName: 'fronts-data',
+      databaseId: 'aaaaaaaa-0000-0000-0000-000000000001',
+      cfApiBase: `http://127.0.0.1:${port}`,
+      sqliteMasterObjects: [{ type: 'table', name: 'users' }],
+    });
+  } finally {
+    server.close();
+  }
+
+  // Read the enumeration query straight from the script source rather than
+  // re-deriving invocations here (dry run already exits right after it,
+  // asserted elsewhere) -- this test is specifically about the query TEXT.
+  const script = readFileSync(new URL('apply-d1-migrations.mjs', import.meta.url).pathname, 'utf8');
+  const queryMatch = script.match(/SELECT type, name FROM sqlite_master WHERE[^"]+/);
+  assert.ok(queryMatch, 'could not find the sqlite_master enumeration query in the script source');
+  assert.match(queryMatch[0], /NOT LIKE '_cf_%'/, 'must exclude D1-internal _cf_* tables -- D1 refuses a DROP on these');
+  assert.match(queryMatch[0], /NOT LIKE 'sqlite_%'/, 'must exclude SQLite-internal sqlite_* tables (e.g. sqlite_sequence)');
+});
+
+test('reset-and-replay stops loudly if the drop-and-recreate batch fails, and never proceeds to apply-missing against a possibly half-dropped database', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, invocations } = await runApply({
+      migrationFiles: ['0001_a.sql'],
+      appliedLedgerNames: [],
+      dryRun: false,
+      databaseName: 'fronts-data-staging',
+      resetAndReplay: true,
+      confirm: 'fronts-data-staging',
+      prodDatabaseName: 'fronts-data',
+      databaseId: 'aaaaaaaa-0000-0000-0000-000000000001',
+      cfApiBase: `http://127.0.0.1:${port}`,
+      sqliteMasterObjects: [{ type: 'table', name: 'users' }],
+      // Simulates the batch itself failing (e.g. a real D1 error mid-drop).
+      failOnSubstring: 'PRAGMA defer_foreign_keys',
+    });
+    assert.notEqual(result.status, 0, 'a failed reset batch must be a red job, not swallowed');
+    assert.match(result.stdout, /RESET FAILED/);
+    assert.match(result.stdout, /do NOT dispatch a plain apply-missing run/i);
+    // No apply-missing call (ledger SELECT or migration --file apply) may
+    // follow a failed reset -- the whole point is refusing to let a later
+    // step silently trust a database this run couldn't finish resetting.
+    const afterBatch = invocations.filter((call) =>
+      call.some((arg) => typeof arg === 'string' && arg.includes('SELECT name FROM d1_migrations')),
+    );
+    assert.equal(afterBatch.length, 0, 'must not read the ledger after a failed reset batch');
   } finally {
     server.close();
   }
