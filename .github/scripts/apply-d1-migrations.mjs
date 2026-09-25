@@ -44,10 +44,57 @@ const DATABASE_ID = process.env.D1_DATABASE_ID || "";
 // runs either way) -- for a staging catch-up dispatch previewing what
 // apply-missing would do before committing to it.
 const DRY_RUN = process.env.D1_MIGRATIONS_DRY_RUN === "1";
+// Reset-then-replay (M2-19 R17): drop every object in the target D1, then
+// fall through to the normal apply-missing loop below against the now-empty
+// ledger, so it applies every migration file from scratch. Never wired to
+// anything but the platform-foundations staging wrapper -- the four guards
+// immediately below exist because this drops data irreversibly and this
+// script has no other caller today that should ever set it.
+const RESET_AND_REPLAY = process.env.D1_MIGRATIONS_RESET_AND_REPLAY === "1";
+// Required (and checked) only when RESET_AND_REPLAY is set; both stay
+// unvalidated and unused for every existing apply-missing caller.
+const CONFIRM = process.env.D1_MIGRATIONS_CONFIRM || "";
+const PROD_DATABASE_NAME = process.env.D1_MIGRATIONS_PROD_DATABASE_NAME || "";
 
 if (!DB_NAME) throw new Error("D1_DATABASE_NAME is required");
 if (!ACCOUNT_ID) throw new Error("CLOUDFLARE_ACCOUNT_ID is required");
 if (!API_TOKEN) throw new Error("CLOUDFLARE_API_TOKEN is required");
+
+// Guard 1+2: name shape. Checked before any network call, even the
+// database-id verification below -- a target that fails these two is wrong
+// regardless of what its uuid turns out to be.
+if (RESET_AND_REPLAY) {
+	if (!/-staging$/.test(DB_NAME)) {
+		throw new Error(
+			`reset-and-replay refuses: database-name "${DB_NAME}" does not end in -staging`,
+		);
+	}
+	if (!PROD_DATABASE_NAME) {
+		throw new Error(
+			"reset-and-replay refuses: prod-database-name was not supplied, so target != prod cannot be proven",
+		);
+	}
+	if (DB_NAME === PROD_DATABASE_NAME) {
+		throw new Error(
+			`reset-and-replay refuses: database-name "${DB_NAME}" equals prod-database-name -- refusing to drop prod`,
+		);
+	}
+	// Guard 3 (database-id == the id resolved from the name) is the existing
+	// verifyDatabaseId() check below, made mandatory for this mode: an empty
+	// DATABASE_ID silently no-ops that check for every other caller, which
+	// reset-and-replay cannot tolerate.
+	if (!DATABASE_ID) {
+		throw new Error(
+			"reset-and-replay refuses: database-id was not supplied, so it cannot be verified against database-name",
+		);
+	}
+	// Guard 4: typed confirm, exact match, no normalization.
+	if (CONFIRM !== DB_NAME) {
+		throw new Error(
+			`reset-and-replay refuses: confirm ("${CONFIRM}") does not exactly match database-name ("${DB_NAME}")`,
+		);
+	}
+}
 
 const log = (...parts) => console.log("[d1-migrations]", ...parts);
 
@@ -171,6 +218,81 @@ const wrangler = (args) =>
 	});
 
 const sqlEscape = (value) => value.replace(/'/g, "''");
+
+// Reset-and-replay's actual destructive step: enumerate every object in
+// sqlite_master and drop them, INCLUDING d1_migrations -- emptying the
+// database's contents without ever touching the D1 resource itself, so its
+// uuid (and therefore every wrangler.toml/manifest binding pinned to it,
+// including this script's own database-id verification above) never
+// changes. Recreating the database instead of emptying it would mint a new
+// uuid and break that pin.
+//
+// Drop order: triggers and views first (neither blocks any other drop, and
+// SQLite doesn't validate a view's referenced table until the view is
+// queried), then indexes, then tables last (DROP TABLE auto-drops any
+// index/trigger still attached to it, so dropping tables first could race
+// an explicit index/trigger drop that runs after -- ordering removes the
+// need to reason about it). d1_migrations is just another table name this
+// same query returns; no special-casing needed to include it.
+async function resetDatabase() {
+	const objects =
+		wranglerJson([
+			"d1",
+			"execute",
+			DB_NAME,
+			"--remote",
+			"--json",
+			"--command",
+			"SELECT type, name FROM sqlite_master WHERE type IN ('table','view','index','trigger') AND name NOT LIKE 'sqlite_%'",
+		])?.[0]?.results || [];
+
+	const dropOrder = { trigger: 0, view: 1, index: 2, table: 3 };
+	const drops = [...objects].sort((a, b) => dropOrder[a.type] - dropOrder[b.type]);
+
+	if (drops.length === 0) {
+		log("reset-and-replay: database already empty, nothing to drop");
+	} else {
+		log(
+			`reset-and-replay: would drop ${drops.length} object(s): ${drops
+				.map((o) => `${o.type} ${o.name}`)
+				.join(", ")}`,
+		);
+	}
+
+	if (DRY_RUN) {
+		log("dry run: not dropping anything (D1_MIGRATIONS_DRY_RUN=1)");
+		process.exit(0);
+	}
+
+	for (const { type, name } of drops) {
+		wrangler([
+			"d1",
+			"execute",
+			DB_NAME,
+			"--remote",
+			"--command",
+			`DROP ${type.toUpperCase()} IF EXISTS "${name.replace(/"/g, '""')}"`,
+		]);
+	}
+
+	// The ledger-read loop right below this needs the table to exist -- same
+	// shape wrangler's own `d1 migrations apply` creates it with, so a
+	// migration file that itself queries d1_migrations (none do today, but
+	// nothing stops one) sees the same schema either way.
+	wrangler([
+		"d1",
+		"execute",
+		DB_NAME,
+		"--remote",
+		"--command",
+		"CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+	]);
+	log("reset-and-replay: dropped and re-created an empty d1_migrations; replaying every migration from scratch");
+}
+
+if (RESET_AND_REPLAY) {
+	await resetDatabase();
+}
 
 const migrationsDir = resolve(MIGRATIONS_DIR);
 const migrationFiles = readdirSync(migrationsDir)
