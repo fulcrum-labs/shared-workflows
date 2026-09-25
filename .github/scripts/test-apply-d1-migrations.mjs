@@ -382,3 +382,52 @@ test('the generated wrangler-config directory is removed after the process exits
     server.close();
   }
 });
+
+// Structural regression test for the #58 gap this PR fixes: apply-d1-
+// migrations.mjs reading process.env.SOMETHING is worthless if
+// d1-migrations-apply.yml's own env: block never maps SOMETHING from an
+// input -- exactly what happened to D1_DATABASE_ID. Parses both files
+// directly (not a mock, not the script's own runtime behaviour) so the
+// same class of bug -- a new script-side input read with no workflow-side
+// wiring -- fails THIS test the moment it's introduced, for any future
+// input, not just this one.
+test('every process.env.D1_* / CLOUDFLARE_* the script reads is mapped in the workflow\'s job-level env block', () => {
+  const scriptPath = new URL('apply-d1-migrations.mjs', import.meta.url).pathname;
+  const workflowPath = new URL('../workflows/d1-migrations-apply.yml', import.meta.url).pathname;
+  const script = readFileSync(scriptPath, 'utf8');
+  const workflow = readFileSync(workflowPath, 'utf8');
+
+  // Not a workflow_call input, so exempt from "must be mapped in env: from
+  // an input": D1_MIGRATIONS_CF_API_BASE_FOR_TESTS_ONLY is a test-only
+  // escape hatch no real caller ever sets; RUNNER_TEMP is a GitHub Actions
+  // runner-provided ambient var, never workflow-declared; WRANGLER_BIN is
+  // written by the "Install wrangler" step via $GITHUB_ENV, not the job's
+  // own env: block (a different, already-covered wiring path).
+  const NOT_A_WORKFLOW_CALL_INPUT = new Set([
+    'D1_MIGRATIONS_CF_API_BASE_FOR_TESTS_ONLY',
+    'RUNNER_TEMP',
+    'WRANGLER_BIN',
+  ]);
+  const readNames = new Set(
+    [...script.matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g)]
+      .map((m) => m[1])
+      .filter((name) => !NOT_A_WORKFLOW_CALL_INPUT.has(name)),
+  );
+  assert.ok(readNames.size > 0, 'sanity: the script must read at least one env var, or this test is checking nothing');
+
+  // The job-level `env:` block only -- between `env:` and the next
+  // top-level-under-job key (`steps:`), so a step's own unrelated `env:`
+  // (there are none today, but a future one must not be scanned here) can
+  // never satisfy this check.
+  const envBlockMatch = workflow.match(/\n {4}env:\n([\s\S]*?)\n {4}steps:/);
+  assert.ok(envBlockMatch, 'could not find the jobs.apply.env: block in d1-migrations-apply.yml');
+  const envBlock = envBlockMatch[1];
+  const mappedNames = new Set([...envBlock.matchAll(/^ {6}([A-Z][A-Z0-9_]*):/gm)].map((m) => m[1]));
+
+  const unmapped = [...readNames].filter((name) => !mappedNames.has(name));
+  assert.deepEqual(
+    unmapped,
+    [],
+    `the script reads process.env.${unmapped[0]} but the workflow's env: block never maps it from an input -- exactly the #58 gap this test exists to catch`,
+  );
+});
