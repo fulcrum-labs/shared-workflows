@@ -299,7 +299,7 @@ function topoSortDropOrder(tableNames, edges) {
 // order (children before parents) -- refusing outright on a cycle rather
 // than guessing.
 async function resetDatabase() {
-	const objects =
+	const rawObjects =
 		wranglerJson([
 			"d1",
 			"execute",
@@ -311,6 +311,15 @@ async function resetDatabase() {
 				" AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'" +
 				" AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'",
 		])?.[0]?.results || [];
+
+	// Defence in depth alongside the (escaped, correct) SQL WHERE clause
+	// above: a plain, unambiguous JS prefix check, not a re-implementation
+	// of SQL LIKE semantics -- so a future edit that silently drops or
+	// re-breaks the SQL-side ESCAPE clause still can't let a _cf_*/sqlite_*
+	// name through to a DROP.
+	const objects = rawObjects.filter(
+		(o) => !o.name.startsWith("_cf_") && !o.name.startsWith("sqlite_"),
+	);
 
 	const withoutLedger = objects.filter((o) => !(o.type === "table" && o.name === "d1_migrations"));
 	const ledgerPresent = withoutLedger.length !== objects.length;

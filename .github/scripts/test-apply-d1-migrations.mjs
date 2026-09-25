@@ -829,6 +829,79 @@ test('reset-and-replay\'s sqlite_master enumeration query excludes D1-internal _
     const query = enumerationCall[enumerationCall.indexOf('--command') + 1];
     assert.match(query, /NOT LIKE 'sqlite\\_%' ESCAPE '\\'/, 'must exclude SQLite-internal sqlite_* tables, with the wildcard _ escaped');
     assert.match(query, /NOT LIKE '\\_cf\\_%' ESCAPE '\\'/, 'must exclude D1-internal _cf_* tables (D1 refuses a DROP on these), with the wildcard _ escaped');
+
+    // Presence of "ESCAPE" in the string isn't proof the pattern actually
+    // means what it looks like -- a bare `_cf_%` LOOKS like it means
+    // "starts with _cf_" but, unescaped, means "any-char, c, f, any-char,
+    // anything", which also matches e.g. "acfx_items" or "xcfoo". Extract
+    // both patterns straight from the real query text sent to wrangler and
+    // evaluate real SQLite LIKE semantics (with ESCAPE) against them, so a
+    // future typo that silently drops the ESCAPE clause or re-introduces
+    // the bug is caught here, not just "the string ESCAPE appears somewhere".
+    const likeMatches = (name, pattern, escapeChar) => {
+      let regexSource = '^';
+      for (let i = 0; i < pattern.length; i++) {
+        const c = pattern[i];
+        if (c === escapeChar && i + 1 < pattern.length) {
+          i++;
+          regexSource += pattern[i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          continue;
+        }
+        if (c === '%') { regexSource += '.*'; continue; }
+        if (c === '_') { regexSource += '.'; continue; }
+        regexSource += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      }
+      regexSource += '$';
+      return new RegExp(regexSource).test(name);
+    };
+    const sqlitePattern = query.match(/NOT LIKE '(sqlite\\_%)' ESCAPE '\\'/)[1];
+    const cfPattern = query.match(/NOT LIKE '(\\_cf\\_%)' ESCAPE '\\'/)[1];
+
+    assert.equal(likeMatches('_cf_KV', cfPattern, '\\'), true, '_cf_KV must match the _cf_ exclusion pattern');
+    assert.equal(likeMatches('sqlite_sequence', sqlitePattern, '\\'), true, 'sqlite_sequence must match the sqlite_ exclusion pattern');
+    // The exact false-positive risk an unescaped `_cf_%` would create: a
+    // real table whose 2nd/3rd characters happen to be "cf" must NOT match
+    // the (properly escaped) exclusion pattern, or a real table would be
+    // silently skipped by the reset.
+    assert.equal(likeMatches('acfx_items', cfPattern, '\\'), false, 'a real table like acfx_items must NOT match the escaped _cf_ pattern (would with an unescaped one)');
+    assert.equal(likeMatches('acfx_items', sqlitePattern, '\\'), false, 'acfx_items must not match the sqlite_ pattern either');
+  } finally {
+    server.close();
+  }
+});
+
+test('a fake enumeration containing _cf_KV, sqlite_sequence, and a real table named like acfx_items: only acfx_items is dropped', async () => {
+  // This is the exact false-positive risk an unescaped `_cf_%`/`sqlite_%`
+  // pattern would create -- both prefixes are properly escaped in the SQL
+  // WHERE clause (asserted separately above), and this script also
+  // re-filters client-side as defence in depth, so this fixture (standing
+  // in for whatever a real, correctly-filtered sqlite_master read would
+  // return) proves the end-to-end drop list, not just the query text.
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result } = await runApply({
+      migrationFiles: ['0001_a.sql'],
+      appliedLedgerNames: [],
+      dryRun: true,
+      databaseName: 'fronts-data-staging',
+      resetAndReplay: true,
+      confirm: 'fronts-data-staging',
+      prodDatabaseName: 'fronts-data',
+      databaseId: 'aaaaaaaa-0000-0000-0000-000000000001',
+      cfApiBase: `http://127.0.0.1:${port}`,
+      sqliteMasterObjects: [
+        { type: 'table', name: '_cf_KV' },
+        { type: 'table', name: 'sqlite_sequence' },
+        { type: 'table', name: 'acfx_items' },
+      ],
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /would drop 1 object\(s\): table acfx_items/);
+    assert.doesNotMatch(result.stdout, /_cf_KV/);
+    assert.doesNotMatch(result.stdout, /sqlite_sequence/);
   } finally {
     server.close();
   }
