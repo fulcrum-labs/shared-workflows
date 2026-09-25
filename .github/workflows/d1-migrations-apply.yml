@@ -62,6 +62,18 @@ on:
         type: string
         default: ""
         description: "Cloudflare D1 database uuid. When set, verified (via the account's D1 list endpoint, read-only) against what database-name actually resolves to, before any D1 interaction and regardless of dry-run -- refuses on a mismatch. Name alone is otherwise the only selector against the same account and token as prod, so a staging config carrying prod's uuid would otherwise silently write prod. Optional and unverified when empty, keeping every existing caller unchanged."
+      reset-and-replay:
+        type: boolean
+        default: false
+        description: "M2-19 R17: drop every object in the target D1 (including d1_migrations itself), then apply every migration file from scratch against the now-empty ledger. Irreversible. Refuses unless database-name ends in -staging, differs from prod-database-name, database-id is set and verified, and confirm exactly equals database-name. Default false keeps every existing caller unaffected -- this workflow exposes it, but only the platform-foundations staging wrapper should ever set it true."
+      confirm:
+        type: string
+        default: ""
+        description: "Required, and checked, only when reset-and-replay is true: must exactly equal database-name. Typed confirmation that the dispatcher named the right target before anything is dropped."
+      prod-database-name:
+        type: string
+        default: ""
+        description: "Required, and checked, only when reset-and-replay is true: this workflow refuses to reset a database-name equal to this value, and refuses outright if reset-and-replay is set but this is empty (an unprovable target != prod)."
     secrets:
       CF_API_TOKEN:
         required: true
@@ -100,8 +112,11 @@ jobs:
       # empty DATABASE_ID regardless of what a caller passed as database-id
       # -- #58's entire server-side verification has been dead code since it
       # merged. Every existing caller that never sets database-id is
-      # unaffected (still empty, still skipped).
+      # unaffected (still empty, still skipped). (fulcrum-labs/shared-workflows#61)
       D1_DATABASE_ID: ${{ inputs.database-id }}
+      D1_MIGRATIONS_RESET_AND_REPLAY: ${{ inputs.reset-and-replay && '1' || '' }}
+      D1_MIGRATIONS_CONFIRM: ${{ inputs.confirm }}
+      D1_MIGRATIONS_PROD_DATABASE_NAME: ${{ inputs.prod-database-name }}
     steps:
       - name: Checkout consumer repo
         uses: actions/checkout@v5

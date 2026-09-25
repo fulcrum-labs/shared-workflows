@@ -44,10 +44,57 @@ const DATABASE_ID = process.env.D1_DATABASE_ID || "";
 // runs either way) -- for a staging catch-up dispatch previewing what
 // apply-missing would do before committing to it.
 const DRY_RUN = process.env.D1_MIGRATIONS_DRY_RUN === "1";
+// Reset-then-replay (M2-19 R17): drop every object in the target D1, then
+// fall through to the normal apply-missing loop below against the now-empty
+// ledger, so it applies every migration file from scratch. Never wired to
+// anything but the platform-foundations staging wrapper -- the four guards
+// immediately below exist because this drops data irreversibly and this
+// script has no other caller today that should ever set it.
+const RESET_AND_REPLAY = process.env.D1_MIGRATIONS_RESET_AND_REPLAY === "1";
+// Required (and checked) only when RESET_AND_REPLAY is set; both stay
+// unvalidated and unused for every existing apply-missing caller.
+const CONFIRM = process.env.D1_MIGRATIONS_CONFIRM || "";
+const PROD_DATABASE_NAME = process.env.D1_MIGRATIONS_PROD_DATABASE_NAME || "";
 
 if (!DB_NAME) throw new Error("D1_DATABASE_NAME is required");
 if (!ACCOUNT_ID) throw new Error("CLOUDFLARE_ACCOUNT_ID is required");
 if (!API_TOKEN) throw new Error("CLOUDFLARE_API_TOKEN is required");
+
+// Guard 1+2: name shape. Checked before any network call, even the
+// database-id verification below -- a target that fails these two is wrong
+// regardless of what its uuid turns out to be.
+if (RESET_AND_REPLAY) {
+	if (!/-staging$/.test(DB_NAME)) {
+		throw new Error(
+			`reset-and-replay refuses: database-name "${DB_NAME}" does not end in -staging`,
+		);
+	}
+	if (!PROD_DATABASE_NAME) {
+		throw new Error(
+			"reset-and-replay refuses: prod-database-name was not supplied, so target != prod cannot be proven",
+		);
+	}
+	if (DB_NAME === PROD_DATABASE_NAME) {
+		throw new Error(
+			`reset-and-replay refuses: database-name "${DB_NAME}" equals prod-database-name -- refusing to drop prod`,
+		);
+	}
+	// Guard 3 (database-id == the id resolved from the name) is the existing
+	// verifyDatabaseId() check below, made mandatory for this mode: an empty
+	// DATABASE_ID silently no-ops that check for every other caller, which
+	// reset-and-replay cannot tolerate.
+	if (!DATABASE_ID) {
+		throw new Error(
+			"reset-and-replay refuses: database-id was not supplied, so it cannot be verified against database-name",
+		);
+	}
+	// Guard 4: typed confirm, exact match, no normalization.
+	if (CONFIRM !== DB_NAME) {
+		throw new Error(
+			`reset-and-replay refuses: confirm ("${CONFIRM}") does not exactly match database-name ("${DB_NAME}")`,
+		);
+	}
+}
 
 const log = (...parts) => console.log("[d1-migrations]", ...parts);
 
@@ -171,6 +218,212 @@ const wrangler = (args) =>
 	});
 
 const sqlEscape = (value) => value.replace(/'/g, "''");
+const quoteIdentifier = (name) => `"${name.replace(/"/g, '""')}"`;
+
+// A wrangler.d1.execute() read helper for the FK-graph queries below --
+// same shape as wranglerJson, kept separate so those call sites read as
+// "one FK-list read per table", not folded into the bigger enumeration call.
+const fkListForTable = (table) =>
+	wranglerJson([
+		"d1",
+		"execute",
+		DB_NAME,
+		"--remote",
+		"--json",
+		"--command",
+		`PRAGMA foreign_key_list(${quoteIdentifier(table)})`,
+	])?.[0]?.results || [];
+
+// Kahn's algorithm: an order where, for every edge child->parent (the child
+// holds a FK referencing the parent, so it must be dropped first), the
+// child appears before the parent. Throws -- refusing the reset outright,
+// never guessing -- on any cycle, since a cyclic FK graph among tables has
+// no drop order that avoids violating one of them.
+function topoSortDropOrder(tableNames, edges) {
+	// SQLite table names are case-insensitive, but PRAGMA foreign_key_list's
+	// `table` column is spelled exactly as written in the REFERENCES clause
+	// -- `REFERENCES Users(id)` against an actual table `users` would
+	// otherwise silently fail an exact-string Map lookup below and lose the
+	// ordering constraint entirely (the reset would then abort partway,
+	// loudly, but still abort). Resolve both sides of an edge through this
+	// case-insensitive lookup; the DROP statements themselves still use
+	// tableNames' own (real, as-enumerated) casing, untouched by this.
+	const byLowerName = new Map(tableNames.map((t) => [t.toLowerCase(), t]));
+	const inDegree = new Map(tableNames.map((t) => [t, 0]));
+	const dependents = new Map(tableNames.map((t) => [t, []]));
+	for (const { child, parent } of edges) {
+		const childName = byLowerName.get(child.toLowerCase());
+		const parentName = byLowerName.get(parent.toLowerCase());
+		if (!childName || !parentName) continue; // references a table outside this drop set (already excluded/handled)
+		if (childName === parentName) continue; // self-reference: no cross-table ordering constraint
+		dependents.get(childName).push(parentName);
+		inDegree.set(parentName, inDegree.get(parentName) + 1);
+	}
+	const queue = tableNames.filter((t) => inDegree.get(t) === 0);
+	const order = [];
+	while (queue.length > 0) {
+		const node = queue.shift();
+		order.push(node);
+		for (const next of dependents.get(node)) {
+			inDegree.set(next, inDegree.get(next) - 1);
+			if (inDegree.get(next) === 0) queue.push(next);
+		}
+	}
+	if (order.length !== tableNames.length) {
+		const unresolved = tableNames.filter((t) => !order.includes(t));
+		throw new Error(
+			`reset-and-replay refuses: a foreign-key cycle among tables prevents a safe drop order (unresolved: ${unresolved.join(", ")})`,
+		);
+	}
+	return order;
+}
+
+// Reset-and-replay's actual destructive step: enumerate every object in
+// sqlite_master and drop them, INCLUDING d1_migrations -- emptying the
+// database's contents without ever touching the D1 resource itself, so its
+// uuid (and therefore every wrangler.toml/manifest binding pinned to it,
+// including this script's own database-id verification above) never
+// changes. Recreating the database instead of emptying it would mint a new
+// uuid and break that pin.
+//
+// Excludes (escaped -- bare `_` is itself a LIKE wildcard, so an unescaped
+// pattern is not the literal match it looks like): sqlite_% (SQLite's own
+// bookkeeping, e.g. sqlite_sequence) and _cf_% (D1's own internal tables --
+// D1 refuses a DROP on these with SQLITE_AUTH, which would abort the reset
+// partway through if they were included).
+//
+// A DROP TABLE on an FTS5 virtual table cascades to its own shadow tables
+// (e.g. `_fts_data`, `_fts_idx`) automatically; this enumeration lists those
+// shadow tables too (they're ordinary rows in sqlite_master), but dropping
+// them explicitly afterward is a harmless IF EXISTS no-op either way this
+// enumeration or the cascade gets to them first -- no separate exclusion
+// needed.
+//
+// Drop order: d1_migrations FIRST, on its own -- so that a failure ANYWHERE
+// later in this same run still leaves a database with no ledger, and a
+// later plain apply-missing dispatch fails loudly ("no such table:
+// d1_migrations") instead of reading a stale-but-present ledger and
+// silently declaring "nothing to apply" against a partially-dropped
+// schema. Then triggers and views (neither blocks any other drop, and
+// SQLite doesn't validate a view's referenced table until the view is
+// queried), then indexes, then the remaining tables last, in FK-topological
+// order (children before parents) -- refusing outright on a cycle rather
+// than guessing.
+async function resetDatabase() {
+	const rawObjects =
+		wranglerJson([
+			"d1",
+			"execute",
+			DB_NAME,
+			"--remote",
+			"--json",
+			"--command",
+			"SELECT type, name FROM sqlite_master WHERE type IN ('table','view','index','trigger')" +
+				" AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'" +
+				" AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'",
+		])?.[0]?.results || [];
+
+	// Defence in depth alongside the (escaped, correct) SQL WHERE clause
+	// above: a plain, unambiguous JS prefix check, not a re-implementation
+	// of SQL LIKE semantics -- so a future edit that silently drops or
+	// re-breaks the SQL-side ESCAPE clause still can't let a _cf_*/sqlite_*
+	// name through to a DROP.
+	const objects = rawObjects.filter(
+		(o) => !o.name.startsWith("_cf_") && !o.name.startsWith("sqlite_"),
+	);
+
+	const withoutLedger = objects.filter((o) => !(o.type === "table" && o.name === "d1_migrations"));
+	const ledgerPresent = withoutLedger.length !== objects.length;
+
+	const triggers = withoutLedger.filter((o) => o.type === "trigger");
+	const views = withoutLedger.filter((o) => o.type === "view");
+	const indexes = withoutLedger.filter((o) => o.type === "index");
+	const tableNames = withoutLedger.filter((o) => o.type === "table").map((o) => o.name);
+
+	const fkEdges = [];
+	for (const table of tableNames) {
+		for (const row of fkListForTable(table)) {
+			if (row.table) fkEdges.push({ child: table, parent: row.table });
+		}
+	}
+	const orderedTableNames = topoSortDropOrder(tableNames, fkEdges);
+
+	const dropStatements = [
+		...(ledgerPresent ? [`DROP TABLE IF EXISTS ${quoteIdentifier("d1_migrations")}`] : []),
+		...triggers.map((o) => `DROP TRIGGER IF EXISTS ${quoteIdentifier(o.name)}`),
+		...views.map((o) => `DROP VIEW IF EXISTS ${quoteIdentifier(o.name)}`),
+		...indexes.map((o) => `DROP INDEX IF EXISTS ${quoteIdentifier(o.name)}`),
+		...orderedTableNames.map((name) => `DROP TABLE IF EXISTS ${quoteIdentifier(name)}`),
+	];
+
+	if (dropStatements.length === 0) {
+		log("reset-and-replay: database already empty, nothing to drop");
+	} else {
+		log(
+			`reset-and-replay: would drop ${dropStatements.length} object(s): ${[
+				...(ledgerPresent ? ["table d1_migrations"] : []),
+				...triggers.map((o) => `trigger ${o.name}`),
+				...views.map((o) => `view ${o.name}`),
+				...indexes.map((o) => `index ${o.name}`),
+				...orderedTableNames.map((name) => `table ${name}`),
+			].join(", ")}`,
+		);
+	}
+
+	if (DRY_RUN) {
+		log("dry run: not dropping anything (D1_MIGRATIONS_DRY_RUN=1)");
+		process.exit(0);
+	}
+
+	// Every drop, the FK-defer PRAGMA, and the ledger re-create run from ONE
+	// file via a single `wrangler d1 execute --file` call, under RUNNER_TEMP
+	// (self-hosted runners are persistent, so this is removed explicitly on
+	// exit, same as the generated wrangler-config pin elsewhere in this
+	// script) -- not one call per statement, and not an inline --command
+	// string. defer_foreign_keys is scoped to the transaction it runs in and
+	// resets at that transaction's end, so it has to be the first statement
+	// in this SAME file to matter at all -- and it only CAN matter if D1
+	// runs this whole file as one transaction. If D1 instead auto-commits
+	// each statement individually, defer_foreign_keys is a harmless no-op
+	// here (there is no multi-statement transaction for it to defer within),
+	// and the FK-topological drop order above is what actually makes the
+	// drops safe either way -- kept regardless, since it costs nothing and
+	// helps if the whole-file-as-one-transaction case does hold.
+	const batchDir = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "d1-reset-batch-"));
+	process.on("exit", () => {
+		rmSync(batchDir, { recursive: true, force: true });
+	});
+	const batchPath = join(batchDir, "reset.sql");
+	const statements = [
+		"PRAGMA defer_foreign_keys = true",
+		...dropStatements,
+		// Same shape wrangler's own `d1 migrations apply` creates it with, so
+		// a migration file that itself queries d1_migrations (none do today,
+		// but nothing stops one) sees the same schema either way.
+		"CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+	];
+	writeFileSync(batchPath, `${statements.join(";\n")};\n`);
+
+	try {
+		wrangler(["d1", "execute", DB_NAME, "--remote", "--file", batchPath]);
+	} catch (error) {
+		log(`RESET FAILED: ${error?.message || error}`);
+		log(
+			"reset-and-replay: the drop-and-recreate batch failed partway. d1_migrations was dropped FIRST " +
+				"in this same file specifically so that, whatever this database's actual state is now, a " +
+				"later plain apply-missing dispatch will fail loudly (no such table: d1_migrations) rather " +
+				"than silently trusting a stale ledger against a partially-dropped schema -- but do NOT " +
+				"dispatch one anyway. An operator must confirm this database's actual state by hand " +
+				"(enumerate sqlite_master) before anything else runs against it.",
+		);
+		process.exit(1);
+	}
+	log("reset-and-replay: dropped and re-created an empty d1_migrations; replaying every migration from scratch");
+}
+
+if (RESET_AND_REPLAY) {
+	await resetDatabase();
+}
 
 const migrationsDir = resolve(MIGRATIONS_DIR);
 const migrationFiles = readdirSync(migrationsDir)
