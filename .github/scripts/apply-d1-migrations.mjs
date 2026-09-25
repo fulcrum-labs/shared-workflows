@@ -23,9 +23,9 @@
 // with their D1_DATABASE_NAME and CLOUDFLARE_ACCOUNT_ID.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 
 const DB_NAME = process.env.D1_DATABASE_NAME;
 const MIGRATIONS_DIR = process.env.D1_MIGRATIONS_DIR || "migrations";
@@ -393,6 +393,24 @@ async function resetDatabase() {
 	}
 
 	if (DRY_RUN) {
+		// Team-lead LOW: a dry run that only shows the DROP side leaves the
+		// REPLAY side (what would apply, in what order, and what's ledger-only)
+		// entirely unverified until a real, irreversible run -- print the
+		// validated manifest plan here too, before this same early exit.
+		// usingReplayManifest/manifestEntries are declared later in this file
+		// (module scope, referenced here by closure) but always initialized
+		// before resetDatabase() is ever CALLED -- see the RESET_AND_REPLAY
+		// call site below.
+		if (usingReplayManifest) {
+			log(`replay manifest plan (${manifestEntries.length} entries from ${REPLAY_MANIFEST_PATH}):`);
+			for (const entry of manifestEntries) {
+				log(
+					entry.apply
+						? `  apply  ${entry.name}`
+						: `  ledger-only  ${entry.name}  (covered by ${entry.supersededBy})`,
+				);
+			}
+		}
 		log("dry run: not dropping anything (D1_MIGRATIONS_DRY_RUN=1)");
 		process.exit(0);
 	}
@@ -448,26 +466,139 @@ async function resetDatabase() {
 // (non-empty string) path, is a hard refusal, and (see the call site below)
 // this runs BEFORE resetDatabase(), so a malformed manifest is caught before
 // the irreversible drop, not after it.
+// Recognized per-entry keys. Anything else is refused (guard 4) -- a typo'd
+// key (e.g. "supercededBy") would otherwise silently do nothing, and the
+// entry it was meant to qualify would behave as if that key were absent.
+const KNOWN_ENTRY_KEYS = new Set(["path", "apply", "supersededBy"]);
+
 function loadReplayManifest(manifestPath) {
 	const resolved = resolve(manifestPath);
 	const raw = JSON.parse(readFileSync(resolved, "utf8"));
-	const entries = Array.isArray(raw) ? raw : raw?.entries;
-	if (!Array.isArray(entries) || entries.length === 0) {
+	const rawEntries = Array.isArray(raw) ? raw : raw?.entries;
+	if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
 		throw new Error(`replay-manifest-path "${manifestPath}" contains no entries`);
 	}
-	return entries.map((entry, index) => {
-		if (!entry || typeof entry.path !== "string" || entry.path === "") {
+
+	// The checkout root every entry's path must resolve inside. Computed once,
+	// as an absolute, trailing-separator-qualified prefix, so a startsWith
+	// check below can't be fooled by a sibling directory that merely shares a
+	// string prefix (e.g. "/repo" vs "/repo-evil").
+	const checkoutRoot = resolve(".") + sep;
+
+	const entries = rawEntries.map((entry, index) => {
+		if (!entry || typeof entry !== "object") {
+			throw new Error(`replay-manifest-path "${manifestPath}" entry ${index} is not an object: ${JSON.stringify(entry)}`);
+		}
+
+		// Guard 4a: unknown fields refused, never silently ignored.
+		const unknownKeys = Object.keys(entry).filter((key) => !KNOWN_ENTRY_KEYS.has(key));
+		if (unknownKeys.length > 0) {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index} has unrecognized field(s): ${unknownKeys.join(", ")}`,
+			);
+		}
+
+		if (typeof entry.path !== "string" || entry.path === "") {
 			throw new Error(
 				`replay-manifest-path "${manifestPath}" entry ${index} has no path: ${JSON.stringify(entry)}`,
 			);
 		}
+
+		// Guard 1: the path must resolve to a real .sql file INSIDE the
+		// checkout -- no absolute path, no `..` escaping it. Checked via the
+		// RESOLVED path, not the string itself: a purely lexical check (e.g.
+		// "does the string contain '..'") is trivially defeated by a path that
+		// resolves outside without ever spelling `..` (a symlink, or simply an
+		// absolute path to another directory).
+		if (!entry.path.endsWith(".sql")) {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index}'s path does not end in .sql: ${entry.path}`,
+			);
+		}
+		const resolvedEntryPath = resolve(entry.path);
+		if (resolvedEntryPath !== checkoutRoot.slice(0, -1) && !resolvedEntryPath.startsWith(checkoutRoot)) {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index}'s path resolves outside the checkout: ${entry.path}`,
+			);
+		}
+		let stat;
+		try {
+			stat = statSync(resolvedEntryPath);
+		} catch {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index}'s path does not exist: ${entry.path}`,
+			);
+		}
+		if (!stat.isFile()) {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index}'s path is not a regular file: ${entry.path}`,
+			);
+		}
+
+		// Guard 4b: `apply` must be a real boolean when present -- "false", 0,
+		// and a missing field are three different things a loose truthiness
+		// check would otherwise conflate into "apply" (this script's own
+		// `entry.apply !== false` used to do exactly that for the string
+		// "false" and the number 0, both of which are !== the boolean false).
+		if ("apply" in entry && typeof entry.apply !== "boolean") {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index}'s apply must be a real boolean, got ${JSON.stringify(entry.apply)}`,
+			);
+		}
+		const apply = "apply" in entry ? entry.apply : true;
+
+		// Guard 3: apply:false requires supersededBy, and it must name an
+		// EARLIER entry in this same manifest (checked in a second pass below,
+		// once every entry's name is known) -- a forward or dangling reference
+		// would silently record a superseded name with no real entry to back
+		// the claim "this schema effect already ran".
+		if (!apply && (typeof entry.supersededBy !== "string" || entry.supersededBy === "")) {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" entry ${index} is apply:false but has no supersededBy: ${entry.path}`,
+			);
+		}
+
 		return {
 			path: entry.path,
 			name: basename(entry.path),
-			apply: entry.apply !== false,
+			apply,
 			supersededBy: entry.supersededBy || "",
 		};
 	});
+
+	// Guard 2: basenames must be unique. The ledger is keyed on basename
+	// (d1_migrations.name is UNIQUE) -- a duplicate wouldn't fail until the
+	// SECOND entry's ledger INSERT, after its SQL (if apply:true) already ran
+	// against the live database. Checked here, before any D1 interaction.
+	const seenAt = new Map();
+	for (const entry of entries) {
+		if (seenAt.has(entry.name)) {
+			throw new Error(
+				`replay-manifest-path "${manifestPath}" has a duplicate basename "${entry.name}": `
+					+ `${seenAt.get(entry.name)} and ${entry.path}`,
+			);
+		}
+		seenAt.set(entry.name, entry.path);
+	}
+
+	// Guard 3 (continued): supersededBy must reference an entry that (a)
+	// exists in this manifest and (b) is apply:true and (c) appears EARLIER
+	// -- "this was already applied for real" can't be true of something that
+	// hasn't run yet.
+	const applyTruePathsSeenSoFar = new Set();
+	for (const entry of entries) {
+		if (!entry.apply && entry.supersededBy) {
+			if (!applyTruePathsSeenSoFar.has(entry.supersededBy)) {
+				throw new Error(
+					`replay-manifest-path "${manifestPath}" entry ${entry.path}'s supersededBy `
+						+ `(${entry.supersededBy}) is not an EARLIER apply:true entry in this manifest`,
+				);
+			}
+		}
+		if (entry.apply) applyTruePathsSeenSoFar.add(entry.path);
+	}
+
+	return entries;
 }
 
 const migrationsDir = resolve(MIGRATIONS_DIR);
@@ -543,8 +674,11 @@ for (const entry of pending) {
 	} else {
 		// A ledger-only entry: its schema effect was already applied for real,
 		// earlier in this same run, under a DIFFERENT name (entry.supersededBy)
-		// -- byte-identical content, proven and recorded in the manifest's own
-		// provenance, never re-derived here. Recording this name too keeps the
+		// -- COVERED BY that earlier entry (M2-19 R17(B): a project's manifest
+		// may cover many ledger-only names with one real entry, e.g. 116 names
+		// covered by one committed baseline -- never assumed byte-identical
+		// 1:1), proven and recorded in the manifest's own provenance, never
+		// re-derived here. Recording this name too keeps the
 		// deploy-gate ledger tripwire (which checks every file name in both
 		// migration directories has SOME ledger row) passing without ever
 		// re-running SQL that already ran under the superseding entry.

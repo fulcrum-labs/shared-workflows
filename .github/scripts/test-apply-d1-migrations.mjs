@@ -1177,3 +1177,151 @@ test('replay-manifest-path refuses an entry with no path, before the destructive
     server.close();
   }
 });
+
+// reviewer-foundry + team-lead, SW#63 REQUEST CHANGES: the manifest's SHAPE
+// was validated pre-reset, but not (1) that each path is a real file inside
+// the checkout, (2) basename uniqueness, (3) apply:false always carries a
+// supersededBy naming an earlier apply:true entry, (4) apply is a real
+// boolean and no entry carries an unrecognized field. Every test below
+// asserts zero wrangler invocations -- refused before resetDatabase() ever
+// runs, same bar every other guard in this file holds itself to.
+function refusalTest(title, entries, expectedMessagePattern) {
+  test(title, async () => {
+    const server = await startFixtureD1ListServer([
+      { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+    ]);
+    try {
+      const { port } = server.address();
+      const { result, invocations } = await runApply(
+        validResetAndReplayOptions({
+          cfApiBase: `http://127.0.0.1:${port}`,
+          migrationFiles: ['0001_a.sql'],
+          extraDirs: {
+            'other-migrations': {
+              '0002_b.sql': '-- 0002_b.sql\nSELECT 1;\n',
+              // Same basename as migrations/0001_a.sql, in a different
+              // directory -- lets the duplicate-basename refusal test exist
+              // for real on both sides, not just be refused on file-existence.
+              '0001_a.sql': '-- 0001_a.sql (other-migrations copy)\nSELECT 1;\n',
+            },
+          },
+          appliedLedgerNames: [],
+          dryRun: false,
+          replayManifest: { entries },
+        }),
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout + result.stderr, expectedMessagePattern);
+      assert.equal(invocations.length, 0, 'zero wrangler invocations -- refused before the destructive reset');
+    } finally {
+      server.close();
+    }
+  });
+}
+
+refusalTest(
+  'replay-manifest-path refuses an entry whose path does not exist on disk',
+  [{ path: 'migrations/0999_does_not_exist.sql', apply: true }],
+  /entry 0's path does not exist/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses an entry whose path escapes the checkout via ../',
+  [{ path: '../../../etc/definitely-outside.sql', apply: true }],
+  /entry 0's path resolves outside the checkout/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses an entry with an absolute path',
+  [{ path: '/etc/definitely-outside.sql', apply: true }],
+  /entry 0's path resolves outside the checkout/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses two entries with the same basename, even in different directories',
+  [
+    { path: 'migrations/0001_a.sql', apply: true },
+    { path: 'other-migrations/0001_a.sql', apply: false, supersededBy: 'migrations/0001_a.sql' },
+  ],
+  /duplicate basename "0001_a\.sql"/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses an apply:false entry with no supersededBy',
+  [{ path: 'migrations/0001_a.sql', apply: false }],
+  /entry 0 is apply:false but has no supersededBy/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses an apply:false entry whose supersededBy is dangling (no such entry)',
+  [{ path: 'migrations/0001_a.sql', apply: false, supersededBy: 'other-migrations/0002_b.sql' }],
+  /supersededBy \(other-migrations\/0002_b\.sql\) is not an EARLIER apply:true entry/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses an apply:false entry whose supersededBy points FORWARD, not backward',
+  [
+    { path: 'migrations/0001_a.sql', apply: false, supersededBy: 'other-migrations/0002_b.sql' },
+    { path: 'other-migrations/0002_b.sql', apply: true },
+  ],
+  /supersededBy \(other-migrations\/0002_b\.sql\) is not an EARLIER apply:true entry/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses apply as the string "false" rather than a real boolean',
+  [{ path: 'migrations/0001_a.sql', apply: 'false' }],
+  /entry 0's apply must be a real boolean, got "false"/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses apply as 0 rather than a real boolean',
+  [{ path: 'migrations/0001_a.sql', apply: 0 }],
+  /entry 0's apply must be a real boolean, got 0/,
+);
+
+refusalTest(
+  'replay-manifest-path refuses an entry with an unrecognized field',
+  [{ path: 'migrations/0001_a.sql', apply: true, supercededBy: 'a typo, not supersededBy' }],
+  /unrecognized field\(s\): supercededBy/,
+);
+
+test('reset-and-replay dry run with a replay manifest prints the validated plan (order, apply vs ledger-only, supersededBy) before the dry-run exit, and still performs zero D1 writes', async () => {
+  const server = await startFixtureD1ListServer([
+    { name: 'fronts-data-staging', uuid: 'aaaaaaaa-0000-0000-0000-000000000001' },
+  ]);
+  try {
+    const { port } = server.address();
+    const { result, invocations } = await runApply(
+      validResetAndReplayOptions({
+        cfApiBase: `http://127.0.0.1:${port}`,
+        migrationFiles: ['0029_fronts_copy.sql'],
+        extraDirs: { 'other-migrations': { '0002_superseded.sql': '-- 0002_superseded.sql\nSELECT 1;\n' } },
+        appliedLedgerNames: [],
+        dryRun: true,
+        replayManifest: {
+          entries: [
+            { path: 'migrations/0029_fronts_copy.sql', apply: true },
+            { path: 'other-migrations/0002_superseded.sql', apply: false, supersededBy: 'migrations/0029_fronts_copy.sql' },
+          ],
+        },
+      }),
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /replay manifest plan \(2 entries/);
+    assert.match(result.stdout, /apply {2}0029_fronts_copy\.sql/);
+    assert.match(result.stdout, /ledger-only {2}0002_superseded\.sql {2}\(covered by migrations\/0029_fronts_copy\.sql\)/);
+    assert.match(result.stdout, /dry run: not dropping anything/);
+    // The plan is printed, but this is still a dry run: zero real D1 writes.
+    // sqliteMasterObjects defaults to [] in validResetAndReplayOptions, so the
+    // only invocation possible before the early exit is the enumeration read.
+    for (const call of invocations) {
+      assert.ok(!call.includes('--file'), `dry run must never apply a file: ${JSON.stringify(call)}`);
+      assert.ok(
+        !call.some((arg) => typeof arg === 'string' && arg.includes('INSERT INTO d1_migrations')),
+        `dry run must never write to the ledger: ${JSON.stringify(call)}`,
+      );
+    }
+  } finally {
+    server.close();
+  }
+});
