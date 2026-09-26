@@ -448,7 +448,14 @@ jobs:
               echo "::warning::Could not fully remove $HOME/setup-pnpm (concurrent job on this host); continuing because PNPM_HOME is pinned under RUNNER_TEMP"
           fi
 
-          echo "NPM_CONFIG_STORE_DIR=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
+          # pnpm 10 reads the lowercase npm_config_* form only, and pnpm 11 reads
+          # pnpm_config_* only; the uppercase NPM_CONFIG_STORE_DIR this step used
+          # to export was read by neither, so every job on a host silently shared
+          # the runner unit's npm_config_store_dir (/var/cache/ci/pnpm) and their
+          # installs raced one store (ERR_PNPM_ENOENT copyfile / READ_FROM_STORE,
+          # 2026-09-25/26). Export both spellings pnpm actually reads.
+          echo "npm_config_store_dir=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
+          echo "pnpm_config_store_dir=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v5
         with:
