@@ -136,7 +136,7 @@ test('pnpm cache discovery uses a store owned by the current runner job', () => 
   assert.ok(guardStart >= 0 && setupNodeStart > guardStart, 'pnpm isolation guard must precede setup-node');
   assert.match(
     guardStep,
-    /echo "NPM_CONFIG_STORE_DIR=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
+    /echo "npm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
   );
 });
 

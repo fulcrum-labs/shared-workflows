@@ -138,7 +138,7 @@ test('every pnpm cache uses a store owned by the current runner job', () => {
       assert.ok(setupNodeStart >= 0, `${file}:${jobName} pnpm cache must use setup-node`);
       assert.match(
         beforeSetupNode,
-        /echo "NPM_CONFIG_STORE_DIR=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
+        /echo "npm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
         `${file}:${jobName} must isolate pnpm's store before setup-node cache discovery`,
       );
     }
