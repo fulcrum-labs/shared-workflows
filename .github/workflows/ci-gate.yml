@@ -609,14 +609,6 @@ jobs:
           cache-db: false
           output-format: table
 
-      - name: Upload grype SARIF
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: grype-sarif
-          path: grype-results.sarif
-          retention-days: 7
-
   trigger-cf-build:
     # Optional: after the gate passes, POST to the Workers Builds manual-trigger
     # endpoint to start the build immediately instead of waiting for CF Builds'
