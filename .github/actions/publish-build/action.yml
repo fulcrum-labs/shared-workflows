@@ -1,0 +1,171 @@
+# Publish a main-branch build as a GitHub Release asset, never Actions artifact storage.
+#
+# Operator ruling 2026-09-27: nothing is stored in GitHub Actions artifact
+# storage (the fulcrum-labs Actions budget is exhausted and uploads fail).
+# Builds that an installer downloads -- foundry's release-watch and
+# prepare-release, cockpit's node rollout, fulcrum-projects' activate scripts
+# and mac app -- are published here instead, as assets on one rolling
+# prerelease per repo (tag `ci-builds` by default), which is not billed as
+# Actions storage. This action:
+#   - refuses to run unless the event is `push` to `refs/heads/main`; a
+#     pull_request run never publishes;
+#   - requires `name` to end in the run's own full 40-hex commit
+#     (`<prefix>-<GITHUB_SHA>`);
+#   - packs `files` into one deterministic `<name>.tar.gz` (GNU tar, sorted
+#     names, mtime 0, owner/group 0, gzip -n) and prints exactly one line:
+#       FULCRUM-BUILD-DIGEST <name>.tar.gz sha256=<hex> run=<id> attempt=<n> sha=<commit>
+#     That log line is the integrity anchor. Only this main push run writes its
+#     own log, so a consumer trusts an asset only when its sha256 equals the
+#     digest printed by the main push run for that commit. The asset itself is
+#     uploaded with --clobber and is never trusted on its own;
+#   - creates the rolling prerelease once if it is missing, uploads the asset,
+#     and prunes the release to the newest `keep` assets named
+#     `<prefix>-<40hex>.tar.gz` (oldest first by created_at, one delete per
+#     asset, other prefixes never touched).
+# Consumers verify by the protocol in docs/publish-build.md; skipping any step
+# of it forfeits the integrity guarantee.
+#
+# The calling job needs `permissions: contents: write` (release create, upload
+# and asset delete) and `gh` on the runner. GNU tar is required; on a macOS
+# runner that means `gtar` (Homebrew gnu-tar) on PATH -- the action fails
+# loudly without it rather than produce a non-deterministic archive. Give the
+# calling job a concurrency group so two main runs never prune the same release
+# at once.
+#
+# Usage:
+#   permissions:
+#     contents: write
+#   steps:
+#     - uses: fulcrum-labs/shared-workflows/.github/actions/publish-build@<sha>
+#       with:
+#         name: foundry-linux-amd64-${{ github.sha }}
+#         files: |
+#           dist/foundryd
+#           dist/foundry
+name: Publish build (rolling GitHub Release asset)
+description: Pack a main-branch build deterministically, print its sha256 as the integrity anchor, upload it to a rolling prerelease and prune old builds of the same name prefix.
+inputs:
+  name:
+    description: Build name, `<prefix>-<full 40-hex commit>` (e.g. foundry-linux-amd64-<sha>); the commit must be this run's GITHUB_SHA. The asset is `<name>.tar.gz`.
+    required: true
+  files:
+    description: Newline-separated paths to pack, relative to the working directory (directories are packed recursively).
+    required: true
+  keep:
+    description: How many builds with this name prefix to keep on the rolling release.
+    required: false
+    default: '30'
+  release-tag:
+    description: Tag and title of the rolling prerelease that stores the builds.
+    required: false
+    default: ci-builds
+  github-token:
+    description: Token with contents:write on this repository.
+    required: false
+    default: ${{ github.token }}
+outputs:
+  asset:
+    description: The uploaded asset name, `<name>.tar.gz`.
+    value: ${{ steps.pack.outputs.asset }}
+  sha256:
+    description: sha256 of the uploaded asset (hex), as printed on the FULCRUM-BUILD-DIGEST line.
+    value: ${{ steps.pack.outputs.sha256 }}
+runs:
+  using: composite
+  steps:
+    - name: Refuse anything but a push to main
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+        NAME: ${{ inputs.name }}
+        KEEP: ${{ inputs.keep }}
+        RELEASE_TAG: ${{ inputs.release-tag }}
+      run: |
+        set -euo pipefail
+        if [ "${EVENT_NAME}" != "push" ] || [ "${REF}" != "refs/heads/main" ]; then
+          echo "::error::publish-build: refusing to publish from event '${EVENT_NAME}' on ref '${REF}'; only a push to refs/heads/main publishes a build." >&2
+          exit 1
+        fi
+        bash "${GITHUB_ACTION_PATH}/publish-build.sh" check-name "${NAME}" "${GITHUB_SHA}" >/dev/null
+        if ! [[ "${KEEP}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::publish-build: keep '${KEEP}' must be a whole number of at least 1." >&2
+          exit 1
+        fi
+        if ! [[ "${RELEASE_TAG}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          echo "::error::publish-build: release-tag '${RELEASE_TAG}' must use only A-Z a-z 0-9 . _ -" >&2
+          exit 1
+        fi
+    - name: Pack the build and print its digest
+      id: pack
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        FILES: ${{ inputs.files }}
+      run: |
+        set -euo pipefail
+        outdir="${RUNNER_TEMP}/publish-build"
+        line="$(printf '%s\n' "${FILES}" | bash "${GITHUB_ACTION_PATH}/publish-build.sh" pack "${NAME}" "${outdir}")"
+        echo "${line}"
+        sha256="${line#* sha256=}"; sha256="${sha256%% *}"
+        {
+          echo "asset=${NAME}.tar.gz"
+          echo "archive=${outdir}/${NAME}.tar.gz"
+          echo "sha256=${sha256}"
+        } >> "$GITHUB_OUTPUT"
+    - name: Upload to the rolling release and prune
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        NAME: ${{ inputs.name }}
+        KEEP: ${{ inputs.keep }}
+        RELEASE_TAG: ${{ inputs.release-tag }}
+        ASSET: ${{ steps.pack.outputs.asset }}
+        ARCHIVE: ${{ steps.pack.outputs.archive }}
+      run: |
+        set -euo pipefail
+        die() { echo "::error::publish-build: $*" >&2; exit 1; }
+        helper="${GITHUB_ACTION_PATH}/publish-build.sh"
+        prefix="$(bash "${helper}" check-name "${NAME}" "${GITHUB_SHA}")"
+
+        # Ensure the rolling prerelease exists. Two main runs may race to create
+        # it; a failed create is fine only when the release now exists.
+        if ! gh release view "${RELEASE_TAG}" --json tagName >/dev/null 2>&1; then
+          notes="Rolling CI build store for ${GH_REPO}, written by fulcrum-labs/shared-workflows publish-build on pushes to main. This is not a product release. Assets are overwritten and pruned; never trust one without the FULCRUM-BUILD-DIGEST check in shared-workflows docs/publish-build.md."
+          if ! gh release create "${RELEASE_TAG}" --prerelease --latest=false --target main --title "${RELEASE_TAG}" --notes "${notes}"; then
+            gh release view "${RELEASE_TAG}" --json tagName >/dev/null || die "could not create or read release '${RELEASE_TAG}' in ${GH_REPO}"
+          fi
+        fi
+        is_pre="$(gh release view "${RELEASE_TAG}" --json isPrerelease --jq .isPrerelease)"
+        [ "${is_pre}" = "true" ] || die "release '${RELEASE_TAG}' in ${GH_REPO} exists but is not a prerelease; refusing to store CI builds on a product release"
+
+        gh release upload "${RELEASE_TAG}" "${ARCHIVE}" --clobber
+        echo "publish-build: uploaded ${ASSET} to release ${RELEASE_TAG} in ${GH_REPO}."
+
+        release_id="$(gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" --jq .id)"
+        list_assets() { gh api --paginate "repos/${GH_REPO}/releases/${release_id}/assets?per_page=100" --jq '.[] | [.created_at, .name] | @tsv'; }
+        assets="$(list_assets)"
+        printf '%s\n' "${assets}" | cut -f2 | grep -qxF -- "${ASSET}" || die "uploaded ${ASSET}, but it is not listed on release ${RELEASE_TAG}"
+
+        doomed="$(printf '%s\n' "${assets}" | bash "${helper}" prune-select "${prefix}" "${KEEP}" "${ASSET}")"
+        if [ -z "${doomed}" ]; then
+          echo "publish-build: nothing to prune for prefix ${prefix} (keep ${KEEP})."
+          exit 0
+        fi
+        failed=""
+        while IFS= read -r old; do
+          [ -n "${old}" ] || continue
+          if gh release delete-asset "${RELEASE_TAG}" "${old}" --yes; then
+            echo "publish-build: pruned ${old}."
+          else
+            failed="${failed}${old}"$'\n'
+          fi
+        done <<< "${doomed}"
+        if [ -n "${failed}" ]; then
+          # One re-read, no retries: a delete that failed because a concurrent
+          # run already removed the asset is fine; anything still present is not.
+          still="$(list_assets | cut -f2 | grep -xF -f <(printf '%s' "${failed}") || true)"
+          [ -z "${still}" ] || die "could not prune these assets from ${RELEASE_TAG}: $(echo ${still})"
+          echo "publish-build: some prune deletes failed, but those assets are already gone."
+        fi
