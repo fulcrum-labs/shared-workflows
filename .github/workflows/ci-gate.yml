@@ -561,35 +561,15 @@ jobs:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     # anchore/scan-action@v7.4.0 runs 'grype dir:.' (binary download, no Docker required)
     runs-on: [self-hosted, Linux, X64]
-    # Two scan passes now (SARIF + table below) instead of one; 10m was tight
-    # even for a single fresh-DB pull.
+    # One scan pass (the findings table). The SARIF pass was dropped: nothing
+    # read its output once Actions artifact storage stopped being used
+    # (operator ruling 2026-09-27). 10m was tight even for a single fresh-DB pull.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
-      - name: Grype vulnerability scan (SARIF)
-        uses: anchore/scan-action@v7.4.0
-        with:
-          path: '.'
-          # Nothing reads this SARIF output (the upload step that used to
-          # retain it is gone — Actions artifact storage is not used, per
-          # operator ruling 2026-09-27). fail-build: false here so a real
-          # scan failure (non-"vulnerabilities found" exit) still fails this
-          # step without double-failing the job on findings alone; the
-          # table step further down is what gates the job.
-          fail-build: false
-          severity-cutoff: high
-          # Do not restore the vulnerability DB from the Actions cache: on the self-hosted
-          # fleet the restored copy went stale and its refresh failed, so grype aborted with
-          # "the vulnerability database was built 1 week ago (max allowed age is 5 days)"
-          # before scanning anything (invoice-portal run 32390381477, forge-7, 2026-08-20).
-          # A fresh download per job is the fail-loud, always-current path.
-          grype-version: v0.117.0
-          cache-db: false
-          output-format: sarif
-
       - name: Grype vulnerability scan (findings table)
-        # Re-runs the same scan with a human-readable table. anchore/scan-action
+        # Scans with a human-readable table. anchore/scan-action
         # prints table output back into the job log (it does not for
         # sarif/json — those go to a file only), so a failure here names the
         # package, installed version, advisory and fixed version directly in
@@ -604,6 +584,9 @@ jobs:
           fail-build: true
           severity-cutoff: high
           grype-version: v0.117.0
+          # Fresh DB per job, never the Actions cache: a restored copy went stale on
+          # the self-hosted fleet and grype aborted on its max-age check
+          # (invoice-portal run 32390381477, forge-7, 2026-08-20).
           cache-db: false
           output-format: table
 
