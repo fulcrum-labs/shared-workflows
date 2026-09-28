@@ -460,7 +460,6 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'pnpm'
 
       - run: pnpm install --frozen-lockfile
 
