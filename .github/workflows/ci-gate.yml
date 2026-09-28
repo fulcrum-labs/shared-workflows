@@ -133,7 +133,6 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'pnpm'
 
       - run: pnpm install --frozen-lockfile
 
@@ -453,7 +452,6 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'pnpm'
 
       - run: pnpm install --frozen-lockfile
 
@@ -573,11 +571,12 @@ jobs:
         uses: anchore/scan-action@v7.4.0
         with:
           path: '.'
-          # This step only produces the SARIF artifact retained below; the
-          # table step further down is what gates the job. fail-build: false
-          # here so a real scan failure (non-"vulnerabilities found" exit)
-          # still fails this step without double-failing the job on findings
-          # alone.
+          # Nothing reads this SARIF output (the upload step that used to
+          # retain it is gone — Actions artifact storage is not used, per
+          # operator ruling 2026-09-27). fail-build: false here so a real
+          # scan failure (non-"vulnerabilities found" exit) still fails this
+          # step without double-failing the job on findings alone; the
+          # table step further down is what gates the job.
           fail-build: false
           severity-cutoff: high
           # Do not restore the vulnerability DB from the Actions cache: on the self-hosted
@@ -588,7 +587,6 @@ jobs:
           grype-version: v0.117.0
           cache-db: false
           output-format: sarif
-          output-file: grype-results.sarif
 
       - name: Grype vulnerability scan (findings table)
         # Re-runs the same scan with a human-readable table. anchore/scan-action

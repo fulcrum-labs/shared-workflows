@@ -126,24 +126,39 @@ test('no job anywhere in this repo may run on GitHub-hosted compute', () => {
   assert.ok(runsOnCount > 0, 'expected at least one runs-on: line under .github/workflows/');
 });
 
-test('every pnpm cache uses a store owned by the current runner job', () => {
-  let cacheJobCount = 0;
+test('no setup-node step restores a package manager cache from GitHub Actions', () => {
   for (const [file, { jobs, source }] of workflows) {
     for (const jobName of jobs) {
       const job = jobSource(source, jobName);
-      if (!/cache: 'pnpm'/.test(job)) continue;
-      cacheJobCount += 1;
-      const setupNodeStart = job.indexOf('      - uses: actions/setup-node@v5');
-      const beforeSetupNode = job.slice(0, setupNodeStart);
-      assert.ok(setupNodeStart >= 0, `${file}:${jobName} pnpm cache must use setup-node`);
-      assert.match(
-        beforeSetupNode,
-        /echo "npm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
-        `${file}:${jobName} must isolate pnpm's store before setup-node cache discovery`,
+      if (!job.includes('      - uses: actions/setup-node@v5')) continue;
+      assert.doesNotMatch(
+        job,
+        /cache: 'pnpm'/,
+        `${file}:${jobName} must not use setup-node's GitHub Actions cache -- ` +
+          'nothing is stored on GitHub (operator ruling 2026-09-27).',
       );
     }
   }
-  assert.equal(cacheJobCount, 4, 'contract must cover every pnpm-cached reusable job');
+});
+
+test('every setup-node job still isolates pnpm to a store owned by the current runner job', () => {
+  let setupNodeJobCount = 0;
+  for (const [file, { jobs, source }] of workflows) {
+    for (const jobName of jobs) {
+      const job = jobSource(source, jobName);
+      const setupNodeStart = job.indexOf('      - uses: actions/setup-node@v5');
+      if (setupNodeStart === -1) continue;
+      setupNodeJobCount += 1;
+      const beforeSetupNode = job.slice(0, setupNodeStart);
+      assert.match(
+        beforeSetupNode,
+        /echo "npm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
+        `${file}:${jobName} must isolate pnpm's store before setup-node runs, ` +
+          'so concurrent jobs on the same self-hosted runner never share a pnpm store dir',
+      );
+    }
+  }
+  assert.equal(setupNodeJobCount, 4, 'contract must cover every setup-node reusable job');
 });
 
 test('preview gate rebuilds the upload artifact with the caller production command', () => {
