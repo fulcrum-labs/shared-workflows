@@ -4,8 +4,12 @@
 # self-hosted fleet never serves a public repo (operator ruling 2026-09-19), so
 # a public shared library would have no CI at all. A consumer job that resolves
 # Go modules runs this step before any `go` command. It:
-#   - mints a per-job installation token of the existing fulcrum-platform-automation
-#     GitHub App, scoped to contents:read on growth-labs/packages-go only;
+#   - mints a per-job installation token of the read-only fulcrum-ci-read GitHub
+#     App, scoped to contents:read on growth-labs/packages-go only. Never pass the
+#     near-admin fulcrum-platform-automation key here: on the shared self-hosted
+#     runners a co-tenant job can read a concurrent job's environment, so a CI
+#     job that only reads must hold only a key that can only read (ES-11,
+#     lead ruling 2026-09-25);
 #   - sets GOPRIVATE and GONOSUMDB for github.com/growth-labs/* (the go command
 #     fetches those modules directly, never through proxy.golang.org or
 #     sum.golang.org; go.sum still pins every hash);
@@ -18,16 +22,16 @@
 # Usage:
 #   - uses: fulcrum-labs/shared-workflows/.github/actions/go-private-modules@<sha>
 #     with:
-#       app-id: ${{ secrets.FULCRUM_APP_ID }}
-#       private-key: ${{ secrets.FULCRUM_APP_PRIVATE_KEY }}
+#       app-id: ${{ secrets.FULCRUM_CI_READ_APP_ID }}
+#       private-key: ${{ secrets.FULCRUM_CI_READ_APP_PRIVATE_KEY }}
 name: Go private modules (growth-labs/packages-go)
 description: Per-job read access to growth-labs/packages-go for the go command, with GOPRIVATE/GONOSUMDB and job-scoped git auth.
 inputs:
   app-id:
-    description: fulcrum-platform-automation App id (secrets.FULCRUM_APP_ID).
+    description: fulcrum-ci-read App id (secrets.FULCRUM_CI_READ_APP_ID). Read-only App; never the platform-automation App.
     required: true
   private-key:
-    description: fulcrum-platform-automation App private key (secrets.FULCRUM_APP_PRIVATE_KEY).
+    description: fulcrum-ci-read App private key (secrets.FULCRUM_CI_READ_APP_PRIVATE_KEY). Read-only App; never the platform-automation App.
     required: true
 runs:
   using: composite
