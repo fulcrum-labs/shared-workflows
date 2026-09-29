@@ -290,6 +290,28 @@ test('the Go cold-cache leg proves its caches are empty scratch before building'
   assert.equal(chmods.length, removals.length);
 });
 
+test('the Go cold-cache leg uses a Go already on PATH and runs setup-go only on GitHub when go is absent', () => {
+  const cold = readFileSync(new URL('../workflows/go-cold-cache.yml', import.meta.url), 'utf8');
+  assert.match(cold, /^      GOTOOLCHAIN: local$/m);
+  const uses = [...cold.matchAll(/uses: actions\/setup-go@/g)];
+  assert.equal(uses.length, 1, 'exactly one setup-go step');
+  const setupAt = cold.indexOf('uses: actions/setup-go@');
+  const stepStart = cold.lastIndexOf('\n      - ', setupAt);
+  const stepEnd = cold.indexOf('\n      - ', setupAt);
+  const step = cold.slice(stepStart, stepEnd);
+  // Gated on both conditions, and on nothing that would let Forgejo through.
+  assert.match(step, /if: \$\{\{ steps\.go-probe\.outputs\.present != 'true' && github\.server_url == 'https:\/\/github\.com' \}\}/);
+  // The probe precedes setup-go and reads PATH.
+  const probe = cold.indexOf('id: go-probe');
+  assert.ok(probe >= 0 && probe < setupAt, 'the go probe must precede setup-go');
+  assert.match(cold.slice(probe, setupAt), /command -v go/);
+  assert.match(cold.slice(probe, setupAt), /present=true/);
+  // A plain `go version` follows, unconditional, so Forgejo fails loudly with no go.
+  const after = cold.slice(stepEnd, cold.indexOf('- name: Point every Go cache'));
+  assert.match(after, /- name: Go toolchain\n(?:        #.*\n)*        run: go version\n/);
+  assert.doesNotMatch(after, /\n        if:/);
+});
+
 test('a strict Turbo repo that runs vitest must pass the cap through, or the gate says so', async () => {
   const { execFileSync } = await import('node:child_process')
   const { mkdtempSync, writeFileSync, mkdirSync } = await import('node:fs')

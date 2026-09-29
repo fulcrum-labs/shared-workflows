@@ -59,10 +59,30 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      # A Go already on PATH is used as is (the Forgejo executor image carries
+      # one with GOTOOLCHAIN=local); actions/setup-go is not mirrored on Forgejo
+      # and its toolchain manifest lives on GitHub. setup-go runs only when go
+      # is absent AND the run is on GitHub.
+      - name: Probe for a Go toolchain on PATH
+        id: go-probe
+        run: |
+          if command -v go >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Go (GitHub only, when none is on PATH)
+        if: ${{ steps.go-probe.outputs.present != 'true' && github.server_url == 'https://github.com' }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: ${{ inputs.go-version }}
           cache: false
+
+      - name: Go toolchain
+        # On Forgejo there is no setup-go fallback, so a missing go fails
+        # here, loudly, instead of deep inside the build.
+        run: go version
 
       - name: Point every Go cache at this job's empty scratch
         run: |
