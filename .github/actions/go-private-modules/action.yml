@@ -15,6 +15,14 @@
 # The token is never echoed: create-github-app-token masks it, and it only
 # reaches $GITHUB_ENV.
 #
+# On a forge that is not github.com (Forgejo: github.server_url differs) the App
+# token cannot be minted (create-github-app-token is unmirrored and needs an App
+# key). The "forge" step below runs instead: it points git at the Forgejo copy of
+# packages-go (an insteadOf rewrite scoped to that one repo) with a read token from
+# the forge-token input (Forgejo Actions secret FORGE_MODULES_READ_TOKEN). The Go
+# module path stays github.com/growth-labs/packages-go; nothing is renamed. It fails
+# loudly, naming the secret, when forge-token is empty.
+#
 # Usage:
 #   - uses: fulcrum-labs/shared-workflows/.github/actions/go-private-modules@<sha>
 #     with:
@@ -24,16 +32,23 @@ name: Go private modules (growth-labs/packages-go)
 description: Per-job read access to growth-labs/packages-go for the go command, with GOPRIVATE/GONOSUMDB and job-scoped git auth.
 inputs:
   app-id:
-    description: fulcrum-platform-automation App id (secrets.FULCRUM_APP_ID).
-    required: true
+    description: fulcrum-platform-automation App id (secrets.FULCRUM_APP_ID). Used on github.com only.
+    required: false
+    default: ''
   private-key:
-    description: fulcrum-platform-automation App private key (secrets.FULCRUM_APP_PRIVATE_KEY).
-    required: true
+    description: fulcrum-platform-automation App private key (secrets.FULCRUM_APP_PRIVATE_KEY). Used on github.com only.
+    required: false
+    default: ''
+  forge-token:
+    description: Read token for growth-labs/packages-go on this Forgejo (secrets.FORGE_MODULES_READ_TOKEN). Required, and used, off github.com only.
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
     - name: Mint a packages-go read token
       id: token
+      if: ${{ github.server_url == 'https://github.com' }}
       uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
       with:
         app-id: ${{ inputs.app-id }}
@@ -42,6 +57,7 @@ runs:
         repositories: packages-go
         permission-contents: read
     - name: Point the go command at packages-go privately
+      if: ${{ github.server_url == 'https://github.com' }}
       shell: bash
       env:
         PACKAGES_GO_TOKEN: ${{ steps.token.outputs.token }}
@@ -62,3 +78,29 @@ runs:
           echo "GIT_CONFIG_VALUE_${n}=https://github.com/growth-labs/packages-go"
         } >> "$GITHUB_ENV"
         echo "go-private-modules: GOPRIVATE/GONOSUMDB set for ${pattern}; git auth for growth-labs/packages-go is job-scoped (GIT_CONFIG_KEY_${n})."
+    - name: Point the go command at the forge copy of packages-go
+      if: ${{ github.server_url != 'https://github.com' }}
+      shell: bash
+      env:
+        FORGE_MODULES_TOKEN: ${{ inputs.forge-token }}
+        FORGE_SERVER_URL: ${{ github.server_url }}
+      run: |
+        set -euo pipefail
+        if [ -z "${FORGE_MODULES_TOKEN}" ]; then
+          echo '::error::go-private-modules: forge-token is empty; add the Forgejo Actions secret FORGE_MODULES_READ_TOKEN and pass it as forge-token so packages-go can be fetched from '"${FORGE_SERVER_URL}"'.' >&2
+          exit 1
+        fi
+        scheme="${FORGE_SERVER_URL%%://*}"
+        host="${FORGE_SERVER_URL#*://}"
+        host="${host%/}"
+        pattern='github.com/growth-labs/*'
+        append() { if [ -n "$1" ]; then printf '%s,%s' "$1" "$pattern"; else printf '%s' "$pattern"; fi; }
+        n="${GIT_CONFIG_COUNT:-0}"
+        {
+          echo "GOPRIVATE=$(append "${GOPRIVATE:-}")"
+          echo "GONOSUMDB=$(append "${GONOSUMDB:-}")"
+          echo "GIT_CONFIG_COUNT=$((n + 1))"
+          echo "GIT_CONFIG_KEY_${n}=url.${scheme}://x-access-token:${FORGE_MODULES_TOKEN}@${host}/growth-labs/packages-go.insteadOf"
+          echo "GIT_CONFIG_VALUE_${n}=https://github.com/growth-labs/packages-go"
+        } >> "$GITHUB_ENV"
+        echo "go-private-modules: GOPRIVATE/GONOSUMDB set for ${pattern}; git resolves growth-labs/packages-go from ${host} (job-scoped, GIT_CONFIG_KEY_${n})."
