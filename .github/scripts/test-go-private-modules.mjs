@@ -32,7 +32,7 @@ test('never writes a global git config and never echoes the token', () => {
 
 function runStep(env) {
   const script = source
-    .slice(source.indexOf('run: |') + 'run: |'.length)
+    .slice(source.indexOf('run: |') + 'run: |'.length, source.indexOf('- name: Point the go command at the forge copy of packages-go'))
     .split('\n')
     .map((line) => line.replace(/^ {8}/, ''))
     .join('\n');
@@ -85,4 +85,74 @@ test('fails loudly on an empty token', () => {
   const { result } = runStep({ PACKAGES_GO_TOKEN: '' });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /App token is empty/);
+});
+
+// Forgejo path: the App-token mint and the GitHub step run on github.com only;
+// a forge step rewrites packages-go to this server with the forge-token input.
+const forgeStart = source.indexOf('- name: Point the go command at the forge copy of packages-go');
+const forgeStep = source.slice(forgeStart);
+const githubStep = source.slice(source.indexOf('- name: Mint a packages-go read token'), forgeStart);
+const onGithub = "if: ${{ github.server_url == 'https://github.com' }}";
+const offGithub = "if: ${{ github.server_url != 'https://github.com' }}";
+
+test('on github.com the App-token and GitHub steps run and the forge step does not', () => {
+  assert.ok(forgeStart > 0);
+  const [mint, point] = githubStep.split('- name: Point the go command at packages-go privately');
+  assert.ok(mint.includes(onGithub), 'App-token mint is gated to github.com');
+  assert.ok(point.includes(onGithub), 'GitHub git-auth step is gated to github.com');
+  assert.ok(forgeStep.includes(offGithub));
+  assert.ok(!forgeStep.includes(onGithub));
+});
+
+test('on any other server the App-token step is skipped and the rewrite step runs', () => {
+  assert.doesNotMatch(forgeStep, /create-github-app-token/);
+  assert.match(forgeStep, /FORGE_SERVER_URL: \$\{\{ github\.server_url \}\}/);
+  assert.match(forgeStep, /FORGE_MODULES_TOKEN: \$\{\{ inputs\.forge-token \}\}/);
+  assert.match(source, /forge-token:\n\s+description: .*FORGE_MODULES_READ_TOKEN/);
+});
+
+function runForge(env) {
+  const script = forgeStep
+    .slice(forgeStep.indexOf('run: |') + 'run: |'.length)
+    .split('\n')
+    .map((line) => line.replace(/^ {8}/, ''))
+    .join('\n');
+  const dir = mkdtempSync(join(tmpdir(), 'go-private-modules-forge-'));
+  const githubEnv = join(dir, 'github_env');
+  writeFileSync(githubEnv, '');
+  try {
+    const result = spawnSync('bash', ['-c', script], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, GITHUB_ENV: githubEnv, ...env },
+    });
+    const written = Object.fromEntries(
+      readFileSync(githubEnv, 'utf8').split('\n').filter(Boolean).map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
+    );
+    return { result, written };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('forge rewrite maps github.com/growth-labs/packages-go to the Forgejo repo, module path unchanged', () => {
+  const { result, written } = runForge({ FORGE_MODULES_TOKEN: 'ftok-1', FORGE_SERVER_URL: 'https://git.fulcrum-labs.com' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(written.GOPRIVATE, 'github.com/growth-labs/*');
+  assert.equal(written.GONOSUMDB, 'github.com/growth-labs/*');
+  assert.equal(written.GOFLAGS, undefined);
+  assert.equal(written.GOTOOLCHAIN, undefined);
+  assert.equal(written.GIT_CONFIG_COUNT, '1');
+  assert.doesNotMatch(result.stdout + result.stderr, /ftok-1/);
+  const seen = execFileSync('git', ['config', '--get-regexp', '^url\\..*\\.insteadof$'], {
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH, HOME: tmpdir(), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: written.GIT_CONFIG_COUNT, GIT_CONFIG_KEY_0: written.GIT_CONFIG_KEY_0, GIT_CONFIG_VALUE_0: written.GIT_CONFIG_VALUE_0 },
+  }).trim();
+  assert.equal(seen, 'url.https://x-access-token:ftok-1@git.fulcrum-labs.com/growth-labs/packages-go.insteadof https://github.com/growth-labs/packages-go');
+});
+
+test('an empty forge-token on Forgejo fails loudly and names the secret', () => {
+  const { result, written } = runForge({ FORGE_MODULES_TOKEN: '', FORGE_SERVER_URL: 'https://git.fulcrum-labs.com' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /FORGE_MODULES_READ_TOKEN/);
+  assert.deepEqual(written, {});
 });
