@@ -100,9 +100,10 @@ function manifestFlagFromArgv(argv) {
 // POST /accounts/{account}/d1/database/{id}/query. There is no database lookup
 // or listing: the database is addressed by the id given as --database-id (or
 // D1_DATABASE_ID), which the caller's registry owns, and every request goes to
-// that one id. CLOUDFLARE_API_BASE_URL (wrangler's own variable) selects the
-// base, so the delivery broker can stand in for api.cloudflare.com and hand out
-// a per-run grant handle as CLOUDFLARE_API_TOKEN; redirects are refused.
+// that one id. CLOUDFLARE_API_BASE_URL (wrangler's own variable) is the ONLY
+// thing that selects the base, so the delivery broker can stand in for
+// api.cloudflare.com and hand out a per-run grant handle as CLOUDFLARE_API_TOKEN;
+// redirects are refused. The legacy mode's test-only base override is not read.
 //
 // Wire format (fixed, so a broker can check a request body exactly): only two
 // shapes of {"sql": ...} are ever sent.
@@ -344,11 +345,12 @@ async function runManifestMode(flag) {
 		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(databaseId)) {
 			throw new ManifestInvalid("--database-id (or D1_DATABASE_ID) must be the database uuid: manifest mode addresses the database by id only");
 		}
-		const base = (
-			process.env.D1_MIGRATIONS_CF_API_BASE_FOR_TESTS_ONLY ||
-			process.env.CLOUDFLARE_API_BASE_URL ||
-			"https://api.cloudflare.com/client/v4"
-		).replace(/\/+$/, "");
+		// The ONE knob for where the credential is sent is CLOUDFLARE_API_BASE_URL
+		// (wrangler's own variable, set by the delivery unit to the broker). The
+		// legacy mode's D1_MIGRATIONS_CF_API_BASE_FOR_TESTS_ONLY is deliberately
+		// not read here: a second, higher-precedence redirect knob has no place in
+		// a mode that carries a grant handle (sec-review, #75).
+		const base = (process.env.CLOUDFLARE_API_BASE_URL || "https://api.cloudflare.com/client/v4").replace(/\/+$/, "");
 		const timeoutMs = Number(process.env.D1_MIGRATIONS_REQUEST_TIMEOUT_MS || 120000);
 
 		const { entries, manifestSha256 } = readManifest(flag.path);
