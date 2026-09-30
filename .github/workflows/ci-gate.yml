@@ -270,7 +270,9 @@ jobs:
           observe &
           observer=$!
           set +e
-          ${{ inputs.check-command }}
+          # The caller's command arrives through the environment, never spliced into this script as an
+          # expression (run-shell-injection); eval runs it in this same shell, exactly as the inline text did.
+          eval "$CHECK_COMMAND"
           status=$?
           set -e
           kill "$observer" 2>/dev/null || true
@@ -278,6 +280,7 @@ jobs:
           echo "vitest workers observed (this step only): at most $per fork workers under one vitest process, $total at once in total (cap $VITEST_MAX_WORKERS)"
           exit "$status"
         env:
+          CHECK_COMMAND: ${{ inputs.check-command }}
           VITEST_MAX_WORKERS: ${{ steps.vitest-cap.outputs.workers }}
           VITEST_MAX_THREADS: ${{ steps.vitest-cap.outputs.workers }}
           VITEST_MAX_FORKS: ${{ steps.vitest-cap.outputs.workers }}
@@ -475,12 +478,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install gitleaks
+        # Its own directory under RUNNER_TEMP, and no move: on a runner whose RUNNER_TEMP is /tmp (Forgejo's),
+        # extracting to /tmp and then moving onto "$RUNNER_TEMP/gitleaks" moved the file onto itself and failed.
         run: |
-          curl -sSL -o /tmp/gitleaks.tar.gz \
+          dir="$(mktemp -d "$RUNNER_TEMP/gitleaks.XXXXXX")"
+          curl -sSL -o "$dir/gitleaks.tar.gz" \
             https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp
-          mv /tmp/gitleaks "$RUNNER_TEMP/gitleaks"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          tar -xzf "$dir/gitleaks.tar.gz" -C "$dir" gitleaks
+          echo "$dir" >> "$GITHUB_PATH"
 
       - name: Gitleaks scan
         # --verbose prints each finding (file, line, rule, redacted value) so a red job is actionable

@@ -161,8 +161,11 @@ test('non-container scanner jobs use the self-hosted fleet safely', () => {
   assert.match(docsLint, /PNPM_HOME must be under RUNNER_TEMP/);
 
   const gitleaks = workflow.slice(jobStarts.get('gitleaks'), jobStarts.get('semgrep'));
-  assert.match(gitleaks, /mv \/tmp\/gitleaks "\$RUNNER_TEMP\/gitleaks"/);
-  assert.match(gitleaks, /echo "\$RUNNER_TEMP" >> "\$GITHUB_PATH"/);
+  // its own directory under RUNNER_TEMP and no move: Forgejo's RUNNER_TEMP is /tmp, where the old mv moved onto itself
+  assert.match(gitleaks, /dir="\$\(mktemp -d "\$RUNNER_TEMP\/gitleaks\.XXXXXX"\)"/);
+  assert.match(gitleaks, /tar -xzf "\$dir\/gitleaks\.tar\.gz" -C "\$dir" gitleaks/);
+  assert.match(gitleaks, /echo "\$dir" >> "\$GITHUB_PATH"/);
+  assert.doesNotMatch(gitleaks, /\bmv\b|\/tmp\//);
   assert.equal(gitleaks.includes('sudo '), false, 'gitleaks install must not require privileged mutation');
 });
 
@@ -352,4 +355,13 @@ test('the gate reports the vitest worker count it observed, not only the cap it 
   assert.match(gate, /\(ppid\[p\] in desc\)/)
   assert.match(gate, /vitest workers observed \(this step only\): at most \$per fork workers/)
   assert.match(gate, /exit "\$status"/)
+})
+
+test('the caller\'s check command reaches the gate through env, never spliced into the script', () => {
+  const gateStart = workflow.indexOf('      - name: CI gate (typecheck + lint + test + build)')
+  const gate = workflow.slice(gateStart, workflow.indexOf('      - name: Lockfile integrity', gateStart))
+  const run = gate.slice(gate.indexOf('run: |'), gate.indexOf('        env:'))
+  assert.doesNotMatch(run, /\$\{\{/, 'no ${{ }} expression inside the gate run script (run-shell-injection)')
+  assert.match(run, /eval "\$CHECK_COMMAND"/)
+  assert.match(gate, /CHECK_COMMAND: \$\{\{ inputs\.check-command \}\}/)
 })
