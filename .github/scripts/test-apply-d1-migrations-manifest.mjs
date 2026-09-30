@@ -588,3 +588,14 @@ test('the reusable workflow never selects manifest mode: it does not pass --mani
   const workflow = readFileSync(join(dirname(SCRIPT), '..', 'workflows', 'd1-migrations-apply.yml'), 'utf8');
   assert.ok(!workflow.includes('--manifest'));
 });
+
+test('the credential goes only where CLOUDFLARE_API_BASE_URL says: the legacy test-only base override is not read in manifest mode', async () => {
+  const d1 = await startD1();
+  const decoy = await startD1();
+  const dir = makeArtifact(TRIO);
+  const out = await run(dir, d1, { env: { D1_MIGRATIONS_CF_API_BASE_FOR_TESTS_ONLY: decoy.base } });
+  assert.equal(out.code, 0, out.stdout + out.stderr);
+  assert.equal(decoy.requests.length, 0, 'the decoy named by the test-only variable received a request');
+  assert.ok(d1.requests.length > 0);
+  assert.ok(d1.requests.every((r) => r.auth === `Bearer ${HANDLE}`));
+});
