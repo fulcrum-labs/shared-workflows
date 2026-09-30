@@ -434,10 +434,35 @@ async function runManifestMode(flag) {
 			}
 			const detail = JSON.stringify(reply.json?.errors ?? reply.text ?? "").slice(0, 500);
 			if (reply.json && reply.json.success === false && reply.status >= 400 && reply.status < 500) {
-				// The database answered and refused: the batch did not commit.
+				// The database answered and refused. Whether that means "nothing of the
+				// entry is applied" rests on D1 running the body as one atomic batch,
+				// which is proven by the record-mode rehearsal, not assumed here: so
+				// read the ledger back and require the exact prefix this run had
+				// reached. Only then is the refusal reported as a clean failure; a
+				// ledger that shows the entry, shows anything else, or cannot be read
+				// is ambiguous and nothing further is attempted.
+				let back;
+				try {
+					back = await readLedger();
+				} catch (error) {
+					result.ambiguousAt = entry.id;
+					mlog(`AMBIGUOUS: ${entry.id} was refused (HTTP ${reply.status}) but the ledger re-read failed: ${error?.message || error}`);
+					return finish("ambiguous", MANIFEST_EXIT.ambiguous, `${entry.id} was refused by the database (HTTP ${reply.status}) but the ledger could not be re-read to confirm it was not recorded: ${error?.message || error}`);
+				}
+				const expectedKeys = entries.slice(0, appliedCount + result.applied.length).map((e) => ledgerKey(e.id));
+				const backKeys = back.names.map(ledgerKey);
+				if (back.missing || backKeys.length !== expectedKeys.length || backKeys.some((name, i) => name !== expectedKeys[i])) {
+					result.ambiguousAt = entry.id;
+					mlog(`AMBIGUOUS: ${entry.id} was refused (HTTP ${reply.status}) but the ledger re-read is not the prefix this run had reached`);
+					return finish("ambiguous", MANIFEST_EXIT.ambiguous, `${entry.id} was refused by the database (HTTP ${reply.status}) but the ledger re-read is not the prefix this run had reached: the refusal cannot be taken to mean nothing was applied`);
+				}
 				result.failedAt = entry.id;
-				mlog(`FAILED applying ${entry.id}: HTTP ${reply.status} ${detail}`);
-				return finish("failed", MANIFEST_EXIT.failed, `${entry.id} refused by the database: HTTP ${reply.status} ${detail}`);
+				mlog(`FAILED applying ${entry.id}: HTTP ${reply.status} ${detail}; batch refused, ledger re-read confirms it was not recorded`);
+				return finish(
+					"failed",
+					MANIFEST_EXIT.failed,
+					`${entry.id} refused by the database: HTTP ${reply.status} ${detail}; batch refused, the ledger re-read confirms it was not recorded; atomicity per the rehearsal receipt`,
+				);
 			}
 			// 5xx, a redirect, or an answer we cannot read: unknown outcome.
 			result.ambiguousAt = entry.id;
