@@ -62,7 +62,9 @@ jobs:
   quality:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 25
+    # 45, not 25: under a saturated self-hosted pool (2026-09-30 Forgejo flip day) infra's quality ran past 25
+    # minutes three times with no failing test and was cancelled each time; a timeout is a guard, not a budget.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
         with:
