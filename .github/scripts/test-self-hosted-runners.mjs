@@ -126,19 +126,54 @@ test('no job anywhere in this repo may run on GitHub-hosted compute', () => {
   assert.ok(runsOnCount > 0, 'expected at least one runs-on: line under .github/workflows/');
 });
 
-test('no setup-node step restores a package manager cache from GitHub Actions', () => {
-  for (const [file, { jobs, source }] of workflows) {
-    for (const jobName of jobs) {
-      const job = jobSource(source, jobName);
-      if (!job.includes('      - uses: actions/setup-node@v5')) continue;
+// One `- uses: actions/setup-node@...` step: its own line through the line
+// before the next step at the same indent (or anything less indented).
+function setupNodeSteps(source) {
+  const lines = source.split('\n');
+  const steps = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = lines[i].match(/^(\s*)- uses: actions\/setup-node@/);
+    if (!match) continue;
+    const indent = match[1].length;
+    let end = i + 1;
+    while (end < lines.length) {
+      const line = lines[end];
+      if (line.trim() !== '' && line.search(/\S/) <= indent) break;
+      end += 1;
+    }
+    steps.push({ line: i + 1, text: lines.slice(i, end).join('\n') });
+  }
+  return steps;
+}
+
+// setup-node v5 caches the package manager's store by DEFAULT whenever
+// package.json names a packageManager (src/main.ts: package-manager-cache
+// defaults to 'true'), so the absence of `cache: 'pnpm'` never proved the
+// cache was off: every ci-gate job wrote its pnpm store to the GitHub Actions
+// cache anyway. On Forgejo it cost ~70 s a job: forgejo-runner's cache server
+// lowercases every key (act/artifactcache/handler.go), setup-node compares
+// the key it gets back case-sensitively (src/cache-save.ts), and so it
+// re-uploaded the whole store after every hit.
+test('every setup-node step turns its package manager cache off explicitly', () => {
+  let setupNodeStepCount = 0;
+  for (const [file, source] of allWorkflows()) {
+    for (const { line, text } of setupNodeSteps(source)) {
+      setupNodeStepCount += 1;
       assert.doesNotMatch(
-        job,
-        /cache: 'pnpm'/,
-        `${file}:${jobName} must not use setup-node's GitHub Actions cache -- ` +
+        text,
+        /^\s*cache:\s*\S/m,
+        `${file}:${line} must not use setup-node's cache -- ` +
           'nothing is stored on GitHub (operator ruling 2026-09-27).',
+      );
+      assert.match(
+        text,
+        /^\s*package-manager-cache:\s*false\s*$/m,
+        `${file}:${line} must set package-manager-cache: false -- setup-node v5 caches the ` +
+          'pnpm store by default, and nothing is stored on GitHub (operator ruling 2026-09-27).',
       );
     }
   }
+  assert.ok(setupNodeStepCount > 0, 'expected at least one setup-node step under .github/workflows/');
 });
 
 test('every setup-node job still isolates pnpm to a store owned by the current runner job', () => {
