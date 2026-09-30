@@ -494,9 +494,17 @@ test('every process.env.D1_* / CLOUDFLARE_* the script reads is mapped in the wo
   // escape hatch no real caller ever sets; RUNNER_TEMP is a GitHub Actions
   // runner-provided ambient var, never workflow-declared; WRANGLER_BIN is
   // written by the "Install wrangler" step via $GITHUB_ENV, not the job's
-  // own env: block (a different, already-covered wiring path).
+  // own env: block (a different, already-covered wiring path). The three
+  // D1_MIGRATIONS_RESULT_PATH / CLOUDFLARE_API_BASE_URL /
+  // D1_MIGRATIONS_REQUEST_TIMEOUT_MS reads exist only in `--manifest` mode,
+  // which a CLI flag selects and this reusable workflow never passes (asserted
+  // in test-apply-d1-migrations-manifest.mjs); foundry's d1.migrate executor
+  // sets them directly.
   const NOT_A_WORKFLOW_CALL_INPUT = new Set([
     'D1_MIGRATIONS_CF_API_BASE_FOR_TESTS_ONLY',
+    'D1_MIGRATIONS_RESULT_PATH',
+    'D1_MIGRATIONS_REQUEST_TIMEOUT_MS',
+    'CLOUDFLARE_API_BASE_URL',
     'RUNNER_TEMP',
     'WRANGLER_BIN',
   ]);

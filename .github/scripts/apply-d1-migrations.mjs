@@ -21,11 +21,463 @@
 // repos opt in by adding a thin wrapper workflow that calls
 // fulcrum-labs/shared-workflows/.github/workflows/d1-migrations-apply.yml
 // with their D1_DATABASE_NAME and CLOUDFLARE_ACCOUNT_ID.
+//
+// `--manifest <path>` (delivery, foundry d1.migrate): a stricter mode that
+// replaces "apply whatever file names the ledger lacks" with an ORDERED
+// per-database list [{id, file, sha256}]. The d1_migrations ledger must be an
+// exact prefix of that list; a gap, reorder, unknown applied id, duplicate or
+// digest mismatch is a divergence (exit 3) that never replays anything. See
+// the MANIFEST MODE section below for the contract, exit codes and result file.
 
 import { execFileSync } from "node:child_process";
-import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
+
+// Hoisted (a function declaration) because MANIFEST_FLAG below is read at
+// module top level. Returns null when --manifest is absent (every legacy
+// caller); otherwise {path, databaseId} or {error} when a flag is malformed
+// (missing value, repeated, unknown), so the mode refuses instead of silently
+// running the legacy apply-missing path. `--database-id` is only meaningful
+// alongside --manifest.
+function manifestFlagFromArgv(argv) {
+	if (!argv.some((arg) => arg === "--manifest" || arg.startsWith("--manifest="))) return null;
+	const values = { manifest: null, "database-id": null };
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		const match = /^--(manifest|database-id)(?:=(.*))?$/.exec(arg);
+		if (!match) return { error: `unknown argument ${JSON.stringify(arg)}` };
+		const [, name, inline] = match;
+		if (values[name] !== null) return { error: `--${name} was supplied more than once` };
+		let value = inline;
+		if (value === undefined) {
+			if (i + 1 >= argv.length || argv[i + 1].startsWith("--")) return { error: `--${name} requires a value` };
+			value = argv[++i];
+		}
+		if (value === "") return { error: `--${name} requires a non-empty value` };
+		values[name] = value;
+	}
+	return { path: values.manifest, databaseId: values["database-id"] || "" };
+}
+
+// ---------------------------------------------------------------------------
+// MANIFEST MODE (`--manifest <path>`)
+//
+// What it is: apply the NEXT entries of an ORDERED per-database list, and
+// refuse to do anything at all when the database is not exactly where that
+// list says it is. It exists because "apply every file name the ledger lacks"
+// (the legacy mode) silently replays or skips on a ledger that has drifted: the
+// fronts-data R17 case, where @growth-labs/analytics migrations 0002-0004 were
+// applied to fronts-data again as fronts 0029/0030/0032 with non-idempotent
+// ALTERs, so a name-set diff sees "0002..0004 pending" and re-runs them.
+//
+// Manifest file (JSON; a bare array is also accepted):
+//   {"schemaVersion":1,"entries":[{"id":"0001_init","file":"migrations/0001_init.sql","sha256":"<64 hex>"}, ...]}
+//   - order is the apply order;
+//   - `id` is the d1_migrations.name value (charset [A-Za-z0-9._-]); a trailing
+//     ".sql" is ignored when comparing with the ledger, because historical
+//     rows omit it, but the id is inserted exactly as written;
+//   - `file` is relative to the working directory (the artifact root): no
+//     absolute path, no "..", no symlink, must end in .sql and be a regular file;
+//   - `sha256` is the lowercase hex digest of the file's bytes, and EVERY
+//     entry's file is read and verified before any network call.
+//
+// Rules, all enforced before anything is written:
+//   - the ledger (SELECT ... ORDER BY id) must be an EXACT PREFIX of the
+//     manifest's ids. A gap (a later id applied while an earlier one is not),
+//     a reorder, an applied id the manifest does not know, a duplicate ledger
+//     row, a missing ledger table or a digest mismatch is a DIVERGENCE: exit 3,
+//     nothing is applied, nothing is replayed, and no flag turns that off;
+//   - the remaining entries apply strictly in order, each as ONE request to
+//     the D1 query endpoint (see the wire format above), which D1 runs as a
+//     single batch (all of it or none of it). The SQL is exactly the verified
+//     bytes; no other script or command runs;
+//   - after the last entry the ledger is read again and must equal the
+//     manifest prefix through that entry, otherwise the run is ambiguous.
+//
+// Transport: plain Cloudflare REST, never wrangler, and ONE endpoint only:
+// POST /accounts/{account}/d1/database/{id}/query. There is no database lookup
+// or listing: the database is addressed by the id given as --database-id (or
+// D1_DATABASE_ID), which the caller's registry owns, and every request goes to
+// that one id. CLOUDFLARE_API_BASE_URL (wrangler's own variable) selects the
+// base, so the delivery broker can stand in for api.cloudflare.com and hand out
+// a per-run grant handle as CLOUDFLARE_API_TOKEN; redirects are refused.
+//
+// Wire format (fixed, so a broker can check a request body exactly): only two
+// shapes of {"sql": ...} are ever sent.
+//   ledger read   sql = "SELECT id, name FROM d1_migrations ORDER BY id"
+//   entry apply   sql = <the file's bytes, unmodified> + "\n;\nINSERT INTO
+//                 d1_migrations (name, applied_at) VALUES ('<id>', CURRENT_TIMESTAMP);"
+// so the sha256 of everything before the fixed suffix IS the manifest's
+// sha256 for that entry. Files must be valid UTF-8. The whole entry apply is a
+// single statement list that D1 runs as one batch: all of it or none of it.
+//
+// Not offered here, by design: reset-and-replay, the replay manifest and any
+// "skip"/"force" escape hatch. Combining --manifest with either is refused.
+//
+// Exit codes:  0 applied / nothing pending / dry run     1 an entry failed (the
+//   database refused it; nothing of that entry is applied)   2 invalid manifest,
+//   arguments or environment (nothing was contacted)       3 divergence (never
+//   replays)   4 ambiguous: the outcome of a request or the final ledger is
+//   not known, so nothing further was attempted and nobody may assume success.
+//
+// Result file: with D1_MIGRATIONS_RESULT_PATH set, a JSON document is written
+// there (atomically) on every exit path of this mode:
+//   {schemaVersion:1, status: noop|applied|dry-run|divergence|failed|ambiguous|invalid,
+//    database:{name,id}, manifestSha256, exitCode, ledgerBefore:[names],
+//    applied:[ids], pending:[ids], failedAt, ambiguousAt,
+//    divergence:{kind,index,expected,actual}, error}
+// D1_MIGRATIONS_DRY_RUN=1 reads and verifies everything and lists what would
+// apply, changing nothing.
+// ---------------------------------------------------------------------------
+
+const MANIFEST_EXIT = { ok: 0, failed: 1, invalid: 2, divergence: 3, ambiguous: 4 };
+const MANIFEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+const MANIFEST_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const MANIFEST_LEDGER_READ_SQL = "SELECT id, name FROM d1_migrations ORDER BY id";
+const manifestLedgerInsertSuffix = (id) =>
+	`\n;\nINSERT INTO d1_migrations (name, applied_at) VALUES ('${id}', CURRENT_TIMESTAMP);`;
+const MANIFEST_ENTRY_KEYS = new Set(["id", "file", "sha256"]);
+const MANIFEST_DOC_KEYS = new Set(["schemaVersion", "entries"]);
+
+class ManifestInvalid extends Error {}
+class ManifestDivergence extends Error {
+	constructor(message, detail) {
+		super(message);
+		this.detail = detail;
+	}
+}
+
+const ledgerKey = (name) => String(name).replace(/\.sql$/, "");
+
+function readManifest(manifestPath) {
+	let raw;
+	try {
+		raw = readFileSync(resolve(manifestPath));
+	} catch (error) {
+		throw new ManifestInvalid(`manifest "${manifestPath}" cannot be read: ${error?.code || error?.message}`);
+	}
+	let doc;
+	try {
+		doc = JSON.parse(raw.toString("utf8"));
+	} catch (error) {
+		throw new ManifestInvalid(`manifest "${manifestPath}" is not valid JSON: ${error?.message}`);
+	}
+	let entries;
+	if (Array.isArray(doc)) {
+		entries = doc;
+	} else if (doc && typeof doc === "object") {
+		const unknown = Object.keys(doc).filter((key) => !MANIFEST_DOC_KEYS.has(key));
+		if (unknown.length > 0) throw new ManifestInvalid(`manifest has unrecognized field(s): ${unknown.join(", ")}`);
+		if ("schemaVersion" in doc && doc.schemaVersion !== 1) {
+			throw new ManifestInvalid(`manifest schemaVersion ${JSON.stringify(doc.schemaVersion)} is not supported (want 1)`);
+		}
+		entries = doc.entries;
+	}
+	if (!Array.isArray(entries) || entries.length === 0) throw new ManifestInvalid("manifest contains no entries");
+
+	const checkoutRoot = resolve(".");
+	const realCheckoutRoot = realpathSync(".");
+	const seenKeys = new Map();
+	const seenFiles = new Map();
+	const seenDigests = new Map();
+	const parsed = entries.map((entry, index) => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+			throw new ManifestInvalid(`manifest entry ${index} is not an object`);
+		}
+		const unknown = Object.keys(entry).filter((key) => !MANIFEST_ENTRY_KEYS.has(key));
+		if (unknown.length > 0) throw new ManifestInvalid(`manifest entry ${index} has unrecognized field(s): ${unknown.join(", ")}`);
+		const { id, file, sha256 } = entry;
+		if (typeof id !== "string" || !MANIFEST_ID_PATTERN.test(id)) {
+			throw new ManifestInvalid(`manifest entry ${index} has an invalid id: ${JSON.stringify(id)}`);
+		}
+		if (typeof file !== "string" || file === "" || !file.endsWith(".sql") || file.includes("\0")) {
+			throw new ManifestInvalid(`manifest entry ${index} (${id}) file must be a non-empty .sql path: ${JSON.stringify(file)}`);
+		}
+		if (isAbsolute(file) || file.split(/[\\/]/).includes("..")) {
+			throw new ManifestInvalid(`manifest entry ${index} (${id}) file must be relative with no "..": ${file}`);
+		}
+		if (typeof sha256 !== "string" || !MANIFEST_SHA256_PATTERN.test(sha256)) {
+			throw new ManifestInvalid(`manifest entry ${index} (${id}) sha256 must be 64 lowercase hex characters`);
+		}
+		const key = ledgerKey(id);
+		if (seenKeys.has(key)) {
+			throw new ManifestInvalid(`manifest id "${id}" repeats entry ${seenKeys.get(key)} (ids are compared without a trailing .sql)`);
+		}
+		seenKeys.set(key, index);
+		const resolved = resolve(file);
+		if (!resolved.startsWith(checkoutRoot + sep)) {
+			throw new ManifestInvalid(`manifest entry ${index} (${id}) file resolves outside the working directory: ${file}`);
+		}
+		if (seenFiles.has(resolved)) {
+			throw new ManifestInvalid(`manifest entry ${index} (${id}) repeats the file of entry ${seenFiles.get(resolved)}: ${file}`);
+		}
+		seenFiles.set(resolved, index);
+		let lstat;
+		try {
+			lstat = lstatSync(resolved);
+		} catch {
+			throw new ManifestInvalid(`manifest entry ${index} (${id}) file does not exist: ${file}`);
+		}
+		if (lstat.isSymbolicLink()) throw new ManifestInvalid(`manifest entry ${index} (${id}) file is a symlink, refused outright: ${file}`);
+		if (!lstat.isFile()) throw new ManifestInvalid(`manifest entry ${index} (${id}) file is not a regular file: ${file}`);
+		if (!realpathSync(resolved).startsWith(realCheckoutRoot + sep)) {
+			throw new ManifestInvalid(`manifest entry ${index} (${id}) file resolves outside the working directory via a symlinked ancestor: ${file}`);
+		}
+		if (seenDigests.has(sha256)) {
+			// Two entries with byte-identical SQL is the R17 shape (one set of
+			// ALTERs listed under two names). The builder must list it once.
+			throw new ManifestInvalid(
+				`manifest entry ${index} (${id}) has the same sha256 as entry ${seenDigests.get(sha256)}: identical SQL listed twice would run twice`,
+			);
+		}
+		seenDigests.set(sha256, index);
+		return { index, id, file, sha256, path: resolved };
+	});
+
+	// Every digest is verified before any network call: the bytes that will run
+	// are the bytes the manifest names, or nothing runs.
+	for (const entry of parsed) {
+		const bytes = readFileSync(entry.path);
+		const actual = createHash("sha256").update(bytes).digest("hex");
+		if (actual !== entry.sha256) {
+			throw new ManifestDivergence(
+				`digest mismatch for ${entry.id}: manifest says ${entry.sha256}, ${entry.file} is ${actual}`,
+				{ kind: "digest-mismatch", index: entry.index, expected: entry.sha256, actual },
+			);
+		}
+		try {
+			entry.sql = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+		} catch {
+			throw new ManifestInvalid(`manifest entry ${entry.index} (${entry.id}) file is not valid UTF-8: ${entry.file}`);
+		}
+	}
+	return { entries: parsed, manifestSha256: createHash("sha256").update(raw).digest("hex") };
+}
+
+// The ledger must be an exact prefix of the manifest. Returns the number of
+// entries already applied; throws ManifestDivergence otherwise. Pure.
+function checkLedgerPrefix(entries, ledgerNames) {
+	const manifestIndex = new Map(entries.map((entry, index) => [ledgerKey(entry.id), index]));
+	const seen = new Set();
+	for (let i = 0; i < ledgerNames.length; i++) {
+		const applied = ledgerNames[i];
+		const key = ledgerKey(applied);
+		if (seen.has(key)) {
+			throw new ManifestDivergence(`ledger row ${i} "${applied}" duplicates an earlier ledger row`, {
+				kind: "duplicate-applied", index: i, expected: i < entries.length ? entries[i].id : null, actual: applied,
+			});
+		}
+		seen.add(key);
+		const position = manifestIndex.get(key);
+		if (position === undefined) {
+			throw new ManifestDivergence(`applied migration "${applied}" (ledger row ${i}) is not in the manifest`, {
+				kind: "unknown-applied", index: i, expected: i < entries.length ? entries[i].id : null, actual: applied,
+			});
+		}
+		if (i >= entries.length || position !== i) {
+			const expected = i < entries.length ? entries[i].id : null;
+			// "reorder" when the entry the manifest wants here was applied LATER
+			// (the ledger has both, in the wrong order); "gap" when it was not
+			// applied at all while a later one was.
+			const expectedAppliedLater = expected !== null && ledgerNames.slice(i + 1).some((later) => ledgerKey(later) === ledgerKey(expected));
+			const kind = position > i && !expectedAppliedLater ? "gap" : "reorder";
+			throw new ManifestDivergence(
+				kind === "gap"
+					? `ledger row ${i} is "${applied}" (manifest position ${position}) but "${expected}" is not applied: a gap, refusing to replay`
+					: `ledger row ${i} is "${applied}" but the manifest puts it at position ${position}: reordered, refusing to replay`,
+				{ kind, index: i, expected, actual: applied },
+			);
+		}
+	}
+	return ledgerNames.length;
+}
+
+async function runManifestMode(flag) {
+	const mlog = (...parts) => console.log("[d1-migrations]", ...parts);
+	const resultPath = process.env.D1_MIGRATIONS_RESULT_PATH || "";
+	const result = {
+		schemaVersion: 1,
+		status: "invalid",
+		database: { name: DB_NAME || "", id: flag.databaseId || DATABASE_ID },
+		manifestSha256: "",
+		exitCode: MANIFEST_EXIT.invalid,
+		ledgerBefore: [],
+		applied: [],
+		pending: [],
+		failedAt: null,
+		ambiguousAt: null,
+		divergence: null,
+		error: "",
+	};
+	const finish = (status, exitCode, error = "") => {
+		result.status = status;
+		result.exitCode = exitCode;
+		if (error) result.error = error;
+		if (resultPath) {
+			try {
+				const tmp = `${resultPath}.tmp-${process.pid}`;
+				writeFileSync(tmp, `${JSON.stringify(result)}\n`, { mode: 0o600 });
+				renameSync(tmp, resultPath);
+			} catch (writeError) {
+				mlog(`could not write the result file: ${writeError?.message || writeError}`);
+				if (exitCode === MANIFEST_EXIT.ok) return MANIFEST_EXIT.failed;
+			}
+		}
+		return exitCode;
+	};
+
+	let phase = "preflight";
+	try {
+		if (flag.error) throw new ManifestInvalid(flag.error);
+		if (RESET_AND_REPLAY || REPLAY_MANIFEST_PATH) {
+			throw new ManifestInvalid("--manifest never combines with reset-and-replay or replay-manifest-path: replay is not offered in this mode");
+		}
+		if (!ACCOUNT_ID || !/^[0-9a-f]{32}$/.test(ACCOUNT_ID)) throw new ManifestInvalid("CLOUDFLARE_ACCOUNT_ID must be a 32-character hex account id");
+		if (!API_TOKEN) throw new ManifestInvalid("CLOUDFLARE_API_TOKEN is required");
+		if (flag.databaseId && DATABASE_ID && flag.databaseId !== DATABASE_ID) {
+			throw new ManifestInvalid("--database-id and D1_DATABASE_ID name different databases");
+		}
+		const databaseId = flag.databaseId || DATABASE_ID;
+		result.database.id = databaseId;
+		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(databaseId)) {
+			throw new ManifestInvalid("--database-id (or D1_DATABASE_ID) must be the database uuid: manifest mode addresses the database by id only");
+		}
+		const base = (
+			process.env.D1_MIGRATIONS_CF_API_BASE_FOR_TESTS_ONLY ||
+			process.env.CLOUDFLARE_API_BASE_URL ||
+			"https://api.cloudflare.com/client/v4"
+		).replace(/\/+$/, "");
+		const timeoutMs = Number(process.env.D1_MIGRATIONS_REQUEST_TIMEOUT_MS || 120000);
+
+		const { entries, manifestSha256 } = readManifest(flag.path);
+		result.manifestSha256 = manifestSha256;
+		mlog(`manifest ${flag.path}: ${entries.length} entries, sha256 ${manifestSha256}; every file digest verified`);
+
+		const call = async (method, path, body) => {
+			const response = await fetch(`${base}${path}`, {
+				method,
+				redirect: "manual",
+				signal: AbortSignal.timeout(timeoutMs),
+				headers: {
+					Authorization: `Bearer ${API_TOKEN}`,
+					...(body === undefined ? {} : { "content-type": "application/json" }),
+				},
+				body: body === undefined ? undefined : JSON.stringify(body),
+			});
+			const text = await response.text();
+			let json = null;
+			try {
+				json = JSON.parse(text);
+			} catch {
+				// not JSON: classified by status below
+			}
+			return { status: response.status, json, text };
+		};
+
+		const queryPath = `/accounts/${ACCOUNT_ID}/d1/database/${databaseId}/query`;
+		const readLedger = async () => {
+			const reply = await call("POST", queryPath, { sql: MANIFEST_LEDGER_READ_SQL });
+			const errors = JSON.stringify(reply.json?.errors ?? reply.text ?? "");
+			if (reply.status !== 200 || reply.json?.success !== true) {
+				if (/no such table:?\s*d1_migrations/i.test(errors)) return { missing: true, names: [] };
+				throw new Error(`ledger read failed: HTTP ${reply.status} ${errors.slice(0, 300)}`);
+			}
+			const rows = reply.json?.result?.[0]?.results;
+			if (!Array.isArray(rows)) throw new Error("ledger read returned no result rows");
+			return { missing: false, names: rows.map((row) => String(row.name)) };
+		};
+
+		const before = await readLedger();
+		if (before.missing) {
+			throw new ManifestDivergence("the d1_migrations ledger table does not exist: refusing to guess where this database is", {
+				kind: "ledger-missing", index: 0, expected: entries[0].id, actual: null,
+			});
+		}
+		result.ledgerBefore = before.names;
+		const appliedCount = checkLedgerPrefix(entries, before.names);
+		const pending = entries.slice(appliedCount);
+		result.pending = pending.map((entry) => entry.id);
+		mlog(`${appliedCount} of ${entries.length} entries applied; ledger is an exact prefix of the manifest`);
+
+		if (pending.length === 0) {
+			mlog("nothing to apply");
+			return finish("noop", MANIFEST_EXIT.ok);
+		}
+		mlog(`${pending.length} pending: ${result.pending.join(", ")}`);
+		if (DRY_RUN) {
+			mlog("dry run: not applying (D1_MIGRATIONS_DRY_RUN=1)");
+			return finish("dry-run", MANIFEST_EXIT.ok);
+		}
+
+		phase = "applying";
+		for (const entry of pending) {
+			mlog(`applying ${entry.id}…`);
+			// exactly the verified bytes, then the fixed ledger suffix: nothing trimmed
+			const batch = `${entry.sql}${manifestLedgerInsertSuffix(entry.id)}`;
+			let reply;
+			try {
+				reply = await call("POST", queryPath, { sql: batch });
+			} catch (error) {
+				// The request may or may not have been executed.
+				result.ambiguousAt = entry.id;
+				mlog(`AMBIGUOUS applying ${entry.id}: no response (${error?.name || "error"}); not retrying`);
+				return finish("ambiguous", MANIFEST_EXIT.ambiguous, `no response for ${entry.id}: ${error?.message || error}`);
+			}
+			if (reply.status === 200 && reply.json?.success === true) {
+				result.applied.push(entry.id);
+				mlog(`applied ${entry.id}`);
+				continue;
+			}
+			const detail = JSON.stringify(reply.json?.errors ?? reply.text ?? "").slice(0, 500);
+			if (reply.json && reply.json.success === false && reply.status >= 400 && reply.status < 500) {
+				// The database answered and refused: the batch did not commit.
+				result.failedAt = entry.id;
+				mlog(`FAILED applying ${entry.id}: HTTP ${reply.status} ${detail}`);
+				return finish("failed", MANIFEST_EXIT.failed, `${entry.id} refused by the database: HTTP ${reply.status} ${detail}`);
+			}
+			// 5xx, a redirect, or an answer we cannot read: unknown outcome.
+			result.ambiguousAt = entry.id;
+			mlog(`AMBIGUOUS applying ${entry.id}: HTTP ${reply.status} ${detail}; not retrying`);
+			return finish("ambiguous", MANIFEST_EXIT.ambiguous, `unreadable answer for ${entry.id}: HTTP ${reply.status}`);
+		}
+
+		// Never inferred: read the ledger back and require the exact prefix.
+		let after;
+		try {
+			after = await readLedger();
+		} catch (error) {
+			mlog(`AMBIGUOUS: applied ${result.applied.length} entries but the final ledger read failed: ${error?.message || error}`);
+			return finish("ambiguous", MANIFEST_EXIT.ambiguous, `final ledger read failed: ${error?.message || error}`);
+		}
+		const want = entries.map((entry) => ledgerKey(entry.id));
+		const got = after.names.map(ledgerKey);
+		if (after.missing || got.length !== want.length || got.some((name, i) => name !== want[i])) {
+			mlog("AMBIGUOUS: after applying, the ledger is not the manifest prefix it should be");
+			return finish("ambiguous", MANIFEST_EXIT.ambiguous, "the ledger after applying is not the expected prefix");
+		}
+		mlog(`done; applied ${result.applied.length} migration(s), ledger verified`);
+		return finish("applied", MANIFEST_EXIT.ok);
+	} catch (error) {
+		if (error instanceof ManifestInvalid) {
+			mlog(`INVALID: ${error.message}`);
+			return finish("invalid", MANIFEST_EXIT.invalid, error.message);
+		}
+		if (error instanceof ManifestDivergence) {
+			result.divergence = error.detail;
+			mlog(`DIVERGENCE (${error.detail.kind}): ${error.message}; nothing was applied or replayed`);
+			return finish("divergence", MANIFEST_EXIT.divergence, error.message);
+		}
+		const message = error?.message || String(error);
+		if (phase === "applying") {
+			mlog(`AMBIGUOUS: unexpected error while applying: ${message}`);
+			return finish("ambiguous", MANIFEST_EXIT.ambiguous, message);
+		}
+		mlog(`FAILED: ${message}`);
+		return finish("failed", MANIFEST_EXIT.failed, message);
+	}
+}
 
 const DB_NAME = process.env.D1_DATABASE_NAME;
 const MIGRATIONS_DIR = process.env.D1_MIGRATIONS_DIR || "migrations";
@@ -63,6 +515,17 @@ const PROD_DATABASE_NAME = process.env.D1_MIGRATIONS_PROD_DATABASE_NAME || "";
 // existing caller (and every apply-missing caller) reading MIGRATIONS_DIR
 // alphabetically, exactly as before this existed.
 const REPLAY_MANIFEST_PATH = process.env.D1_MIGRATIONS_REPLAY_MANIFEST_PATH || "";
+// `--manifest <path>` / `--manifest=<path>`: see the MANIFEST MODE section.
+// Only the CLI flag selects the mode, never an environment variable, so an
+// inherited environment can never silently switch an existing caller into it.
+const MANIFEST_FLAG = manifestFlagFromArgv(process.argv.slice(2));
+
+// Manifest mode validates its own environment (exit 2, not a stack trace) and
+// always ends the process; everything below is the legacy apply-missing path,
+// untouched by it.
+if (MANIFEST_FLAG) {
+	process.exit(await runManifestMode(MANIFEST_FLAG));
+}
 
 if (!DB_NAME) throw new Error("D1_DATABASE_NAME is required");
 if (!ACCOUNT_ID) throw new Error("CLOUDFLARE_ACCOUNT_ID is required");
