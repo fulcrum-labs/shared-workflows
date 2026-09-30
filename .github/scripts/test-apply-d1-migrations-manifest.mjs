@@ -66,6 +66,10 @@ async function startD1({ ledger = 'create', seedLedger = [], seedSql = '', hooks
         record.sql = sql;
         const isRead = /^\s*SELECT\b/i.test(sql);
         if (isRead) {
+          if (hooks.failRead && hooks.failRead(requests.filter((r) => r.sql && /^\s*SELECT\b/i.test(r.sql)).length)) {
+            send(500, { success: false, errors: [{ message: 'read unavailable' }] });
+            return;
+          }
           if (hooks.onRead) {
             const replaced = hooks.onRead(requests.filter((r) => r.sql && /^\s*SELECT\b/i.test(r.sql)).length);
             if (replaced) {
@@ -414,6 +418,9 @@ test('an entry the database refuses fails the run, rolls back the whole entry, a
   assert.equal(out.code, 1, out.stdout + out.stderr);
   assert.equal(out.result.status, 'failed');
   assert.equal(out.result.failedAt, '0002_bad');
+  assert.match(out.result.error, /batch refused, the ledger re-read confirms it was not recorded; atomicity per the rehearsal receipt/);
+  const readsAfterFailure = d1.requests.filter((r) => r.sql === LEDGER_READ_SQL);
+  assert.equal(readsAfterFailure.length, 2, 'the ledger is read before and again after the refusal');
   assert.deepEqual(out.result.applied, ['0001_posts']);
   assert.deepEqual(d1.ledger(), ['0001_posts']);
   assert.ok(!d1.tables().includes('half_done'), 'the batch is all-or-nothing: no half-applied entry');
@@ -598,4 +605,36 @@ test('the credential goes only where CLOUDFLARE_API_BASE_URL says: the legacy te
   assert.equal(decoy.requests.length, 0, 'the decoy named by the test-only variable received a request');
   assert.ok(d1.requests.length > 0);
   assert.ok(d1.requests.every((r) => r.auth === `Bearer ${HANDLE}`));
+});
+
+test('a refused entry whose ledger re-read shows it recorded anyway is ambiguous, not a clean failure', async () => {
+  // reads: (1) before the run, (2) the re-read after the refusal; the re-read lies that 0002_bad is recorded
+  const d1 = await startD1({ hooks: { onRead: (n) => (n === 2 ? [{ id: 1, name: '0001_posts' }, { id: 2, name: '0002_bad' }] : null) } });
+  const bad = E('0002_bad', 'CREATE TABLE half_done (id INTEGER);\nALTER TABLE does_not_exist ADD COLUMN x TEXT;');
+  const out = await run(makeArtifact([TRIO[0], bad, TRIO[2]]), d1);
+  assert.equal(out.code, 4, out.stdout + out.stderr);
+  assert.equal(out.result.status, 'ambiguous');
+  assert.equal(out.result.ambiguousAt, '0002_bad');
+  assert.equal(out.result.failedAt, null);
+  assert.match(out.result.error, /cannot be taken to mean nothing was applied/);
+  assert.equal(d1.writeRequests().length, 2, 'nothing after the refused entry is attempted');
+});
+
+test('a refused entry whose ledger cannot be re-read is ambiguous', async () => {
+  const d1 = await startD1({ hooks: { failRead: (n) => n === 2 } });
+  const bad = E('0002_bad', 'ALTER TABLE does_not_exist ADD COLUMN x TEXT;');
+  const out = await run(makeArtifact([TRIO[0], bad]), d1);
+  assert.equal(out.code, 4, out.stdout + out.stderr);
+  assert.equal(out.result.status, 'ambiguous');
+  assert.equal(out.result.ambiguousAt, '0002_bad');
+  assert.match(out.result.error, /could not be re-read/);
+});
+
+test('a refusal on the first entry is a clean failure when the ledger is still the empty prefix', async () => {
+  const d1 = await startD1();
+  const out = await run(makeArtifact([E('0001_bad', 'ALTER TABLE nope ADD COLUMN x TEXT;')]), d1);
+  assert.equal(out.code, 1, out.stdout + out.stderr);
+  assert.equal(out.result.status, 'failed');
+  assert.equal(out.result.failedAt, '0001_bad');
+  assert.deepEqual(d1.ledger(), []);
 });
