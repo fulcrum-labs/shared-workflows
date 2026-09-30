@@ -122,9 +122,13 @@ jobs:
 
       - name: Build from cold caches
         working-directory: ${{ inputs.working-directory }}
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
         run: |
           set -euo pipefail
-          ${{ inputs.build-command }}
+          # The caller's command arrives through the environment, never spliced into this script as an
+          # expression (run-shell-injection); eval runs it in this same shell, exactly as the inline text did.
+          eval "$BUILD_COMMAND"
 
       - name: Cold-cache footprint
         # This is the size a cold build needs, recorded so the per-host cache

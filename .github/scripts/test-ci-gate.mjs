@@ -277,6 +277,11 @@ test('the Go cold-cache leg proves its caches are empty scratch before building'
   const build = cold.indexOf('      - name: Build from cold caches');
   assert.ok(prove >= 0 && build > prove, 'the coldness proof must precede the build');
   assert.match(cold.slice(prove, build), /is not empty at the start of the cold leg/);
+  // The caller's build command reaches the shell through the environment, never as an expression in the script.
+  const buildStep = cold.slice(build, cold.indexOf('      - name: Cold-cache footprint'));
+  assert.match(buildStep, /\n        env:\n          BUILD_COMMAND: \$\{\{ inputs\.build-command \}\}\n/);
+  assert.match(buildStep, /\n          eval "\$BUILD_COMMAND"\n/);
+  assert.doesNotMatch(buildStep.slice(buildStep.indexOf('run: |')), /\$\{\{/);
   assert.doesNotMatch(cold, /always\(\)/);
   // The job's budget is a literal; no caller can raise it.
   assert.match(cold, /^    timeout-minutes: 30$/m);
