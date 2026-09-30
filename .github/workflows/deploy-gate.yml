@@ -460,6 +460,10 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node-version }}
+          # v5 caches the pnpm store by default whenever package.json names a packageManager.
+          # Off: nothing is stored on GitHub (operator ruling 2026-09-27), and on Forgejo the
+          # runner's cache server lowercases keys, so every job re-uploaded the whole store.
+          package-manager-cache: false
 
       - run: pnpm install --frozen-lockfile
 
