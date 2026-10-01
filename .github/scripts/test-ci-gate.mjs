@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 const workflow = readFileSync(
@@ -369,4 +372,75 @@ test('the caller\'s check command reaches the gate through env, never spliced in
   assert.doesNotMatch(run, /\$\{\{/, 'no ${{ }} expression inside the gate run script (run-shell-injection)')
   assert.match(run, /eval "\$CHECK_COMMAND"/)
   assert.match(gate, /CHECK_COMMAND: \$\{\{ inputs\.check-command \}\}/)
+})
+
+test('gitleaks scans the commits of the event, not every branch of the checkout', () => {
+  const start = workflow.indexOf('      - name: Gitleaks scan')
+  const step = workflow.slice(start, workflow.indexOf('\n  semgrep:', start))
+  const run = step.slice(step.indexOf('run: |'))
+  assert.doesNotMatch(run, /\$\{\{/, 'no ${{ }} expression inside the scan script (run-shell-injection)')
+  for (const name of ['EVENT_NAME', 'PR_BASE', 'PR_HEAD', 'MG_BASE', 'MG_HEAD', 'PUSHED_SHA']) {
+    assert.match(step, new RegExp(`${name}: \\$\\{\\{ github\\.`), `${name} is passed through env`)
+  }
+
+  // Run the step's own script with a gitleaks that records its argv.
+  const dir = mkdtempSync(join(tmpdir(), 'gitleaks-scope-'))
+  writeFileSync(join(dir, 'gitleaks'), '#!/bin/sh\necho "ARGS: $*"\n')
+  chmodSync(join(dir, 'gitleaks'), 0o755)
+  const script = run.split('\n').slice(1).map(line => line.replace(/^ {10}/, '')).join('\n')
+  // A real repository, so that "is this SHA a commit here" is answered by git, not by the test.
+  const repo = mkdtempSync(join(tmpdir(), 'gitleaks-scope-repo-'))
+  const git = (...args) => spawnSync('git', args, { cwd: repo, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).stdout.trim()
+  git('init', '-q', '-b', 'main')
+  git('commit', '-q', '--allow-empty', '-m', 'one')
+  const one = git('rev-parse', 'HEAD')
+  git('commit', '-q', '--allow-empty', '-m', 'two')
+  const two = git('rev-parse', 'HEAD')
+  const runScan = (event, vars) => spawnSync('bash', ['-c', script], {
+    cwd: repo,
+    encoding: 'utf8',
+    env: { PATH: `${dir}:${process.env.PATH}`, EVENT_NAME: event, ...vars },
+  })
+  const scan = (event, vars = { PR_BASE: one, PR_HEAD: two, MG_BASE: one, MG_HEAD: two, PUSHED_SHA: two }) => runScan(event, vars).stdout.trim()
+  const common = 'detect --source . --no-banner --redact --verbose'
+  assert.equal(scan('pull_request'), `ARGS: ${common} --log-opts=${one}..${two}`)
+  assert.equal(scan('pull_request_target'), `ARGS: ${common} --log-opts=${one}..${two}`)
+  assert.equal(scan('merge_group'), `ARGS: ${common} --log-opts=${one}..${two}`)
+  assert.equal(scan('push'), `ARGS: ${common} --log-opts=${two}`)
+  assert.equal(scan('schedule'), `ARGS: ${common}`, 'a scheduled run still scans every branch')
+  assert.equal(scan('workflow_dispatch'), `ARGS: ${common}`)
+})
+
+test('gitleaks fails closed on a scan range it cannot read: gitleaks itself exits 0 on a missing commit', () => {
+  const start = workflow.indexOf('      - name: Gitleaks scan')
+  const step = workflow.slice(start, workflow.indexOf('\n  semgrep:', start))
+  const script = step.slice(step.indexOf('run: |')).split('\n').slice(1).map(line => line.replace(/^ {10}/, '')).join('\n')
+  const dir = mkdtempSync(join(tmpdir(), 'gitleaks-closed-'))
+  writeFileSync(join(dir, 'gitleaks'), '#!/bin/sh\necho "GITLEAKS RAN"\n')
+  chmodSync(join(dir, 'gitleaks'), 0o755)
+  const repo = mkdtempSync(join(tmpdir(), 'gitleaks-closed-repo-'))
+  const g = (...a) => spawnSync('git', a, { cwd: repo, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).stdout.trim()
+  g('init', '-q', '-b', 'main'); g('commit', '-q', '--allow-empty', '-m', 'one')
+  const sha = g('rev-parse', 'HEAD')
+  const missing = '0123456789abcdef0123456789abcdef01234567'
+  const run = vars => spawnSync('bash', ['-c', script], { cwd: repo, encoding: 'utf8', env: { PATH: `${dir}:${process.env.PATH}`, ...vars } })
+  const cases = [
+    ['a missing head', { EVENT_NAME: 'pull_request', PR_BASE: sha, PR_HEAD: missing }],
+    ['a missing base', { EVENT_NAME: 'pull_request_target', PR_BASE: missing, PR_HEAD: sha }],
+    ['an empty base', { EVENT_NAME: 'pull_request', PR_BASE: '', PR_HEAD: sha }],
+    ['a branch name for a SHA', { EVENT_NAME: 'pull_request', PR_BASE: 'main', PR_HEAD: sha }],
+    ['a missing merge-group head', { EVENT_NAME: 'merge_group', MG_BASE: sha, MG_HEAD: missing }],
+    ['a missing pushed commit', { EVENT_NAME: 'push', PUSHED_SHA: missing }],
+    ['an empty pushed commit', { EVENT_NAME: 'push', PUSHED_SHA: '' }],
+  ]
+  for (const [why, vars] of cases) {
+    const result = run(vars)
+    assert.notEqual(result.status, 0, `${why}: the job must fail`)
+    assert.doesNotMatch(result.stdout, /GITLEAKS RAN/, `${why}: gitleaks must not run on a range it cannot read`)
+    assert.match(result.stderr, /gitleaks scan range/, why)
+  }
+  // The same step still runs for a readable range.
+  const good = run({ EVENT_NAME: 'pull_request', PR_BASE: sha, PR_HEAD: sha })
+  assert.equal(good.status, 0)
+  assert.match(good.stdout, /GITLEAKS RAN/)
 })

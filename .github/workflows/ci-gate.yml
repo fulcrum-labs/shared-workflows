@@ -498,7 +498,48 @@ jobs:
       - name: Gitleaks scan
         # --verbose prints each finding (file, line, rule, redacted value) so a red job is actionable
         # without reproducing the scan locally; secrets stay redacted.
-        run: gitleaks detect --source . --no-banner --redact --verbose
+        #
+        # What is scanned depends on the event. gitleaks' default is `git log --all`, and the checkout above
+        # fetched every branch, so one leaked-looking literal on ANY branch used to fail gitleaks on EVERY pull
+        # request (and anyone who can push a branch could block them all). A pull request now scans only its own
+        # commits; a merge-queue group only its own; a push the history of the pushed commit, which is the
+        # full-history scan of main; a schedule or manual run still scans every branch. The event data reaches
+        # the script through env, never spliced into it.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSHED_SHA: ${{ github.sha }}
+        run: |
+          # gitleaks 8.21.2 exits 0 ("no leaks found") when --log-opts names a commit that does not exist in the
+          # checkout (a fork head on pull_request_target, an empty event field), so a bad range would pass the
+          # scan unread. Every SHA must be 40 hex and present as a commit, or the job fails.
+          need_commit() {
+            case "$1" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+              *) echo "::error::gitleaks scan range: '$2' is not a commit SHA ('$1')" >&2; exit 1 ;;
+            esac
+            git cat-file -e "$1^{commit}" 2>/dev/null || { echo "::error::gitleaks scan range: $2 $1 is not in the checkout, so it cannot be scanned" >&2; exit 1; }
+          }
+          case "$EVENT_NAME" in
+            pull_request | pull_request_target)
+              need_commit "$PR_BASE" "the base"; need_commit "$PR_HEAD" "the head"
+              range="$PR_BASE..$PR_HEAD" ;;
+            merge_group)
+              need_commit "$MG_BASE" "the group base"; need_commit "$MG_HEAD" "the group head"
+              range="$MG_BASE..$MG_HEAD" ;;
+            push)
+              need_commit "$PUSHED_SHA" "the pushed commit"
+              range="$PUSHED_SHA" ;;
+            *) range="" ;;
+          esac
+          if [ -n "$range" ]; then
+            gitleaks detect --source . --no-banner --redact --verbose --log-opts="$range"
+          else
+            gitleaks detect --source . --no-banner --redact --verbose
+          fi
 
   semgrep:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
