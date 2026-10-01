@@ -444,3 +444,18 @@ test('gitleaks fails closed on a scan range it cannot read: gitleaks itself exit
   assert.equal(good.status, 0)
   assert.match(good.stdout, /GITLEAKS RAN/)
 })
+
+test('the gitleaks download is pinned by sha256 and verified before it is unpacked', () => {
+  const start = workflow.indexOf('      - name: Install gitleaks')
+  const step = workflow.slice(start, workflow.indexOf('      - name: Gitleaks scan', start))
+  const version = /gitleaks\/releases\/download\/(v\d+\.\d+\.\d+)\/gitleaks_(\d+\.\d+\.\d+)_linux_x64\.tar\.gz/.exec(step)
+  assert.ok(version, 'the download URL is versioned')
+  assert.equal(version[1], `v${version[2]}`, 'tag and file version agree')
+  const check = /echo "([0-9a-f]{64})  \$dir\/gitleaks\.tar\.gz" \| sha256sum -c -/.exec(step)
+  assert.ok(check, 'a 64-hex sha256 is checked with sha256sum -c')
+  assert.ok(step.indexOf('sha256sum -c -') > step.indexOf('curl -sSL'), 'the check follows the download')
+  assert.ok(step.indexOf('sha256sum -c -') < step.indexOf('tar -xzf'), 'the check precedes the unpack')
+  // gitleaks 8.21.2 linux_x64, from the release's checksums file; changing the version means changing this value.
+  assert.equal(check[1], '5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba')
+  assert.equal(version[2], '8.21.2')
+})
