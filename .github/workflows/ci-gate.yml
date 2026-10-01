@@ -490,8 +490,11 @@ jobs:
         # extracting to /tmp and then moving onto "$RUNNER_TEMP/gitleaks" moved the file onto itself and failed.
         run: |
           dir="$(mktemp -d "$RUNNER_TEMP/gitleaks.XXXXXX")"
+          # sha256 of gitleaks_8.21.2_linux_x64.tar.gz as listed in the v8.21.2 release's own gitleaks_8.21.2_checksums.txt
+          # (and equal to the tarball downloaded from that release); bump it together with the version in the URL.
           curl -sSL -o "$dir/gitleaks.tar.gz" \
             https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          echo "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba  $dir/gitleaks.tar.gz" | sha256sum -c -
           tar -xzf "$dir/gitleaks.tar.gz" -C "$dir" gitleaks
           echo "$dir" >> "$GITHUB_PATH"
 
