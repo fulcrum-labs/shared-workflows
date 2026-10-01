@@ -71,6 +71,26 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Refuse a tracked node_modules
+        # A node_modules entry in the commit (a directory, a file, or a symlink to someone's installed tree) ships a
+        # whole dependency tree, or a pointer into another checkout's, to everyone who clones. `node_modules/` in a
+        # .gitignore hides a real directory but not a symlink, so this reads the index itself. It fails closed: a git
+        # that cannot list the index fails the job, and so does a grep that errors (grep exits 1 for "no match", 2+ for
+        # an error), where a pipeline under `bash -e` without pipefail would have passed on either.
+        run: |
+          list="$(mktemp -d "${RUNNER_TEMP:-/tmp}/tracked.XXXXXX")"
+          git ls-files -z > "$list/all"
+          status=0
+          grep -zE '(^|/)node_modules(/|$)' "$list/all" > "$list/hit" || status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "::error::node_modules is tracked in this commit; remove it from the index (git rm --cached) and ignore it as 'node_modules', without a trailing slash" >&2
+            tr '\0' '\n' < "$list/hit" | head -n 20 >&2 || true
+            exit 1
+          elif [ "$status" -ne 1 ]; then
+            echo "::error::the tracked-file scan failed (grep exit $status); refusing to treat that as a clean tree" >&2
+            exit 1
+          fi
+
       - name: Resolve pnpm version
         id: pnpm-version
         run: |
