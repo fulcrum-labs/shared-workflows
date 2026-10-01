@@ -69,6 +69,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve pnpm version
         id: pnpm-version
@@ -398,6 +399,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Resolve pnpm version
         id: pnpm-version
@@ -484,6 +487,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install gitleaks
         # Its own directory under RUNNER_TEMP, and no move: on a runner whose RUNNER_TEMP is /tmp (Forgejo's),
@@ -552,6 +556,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install semgrep
         env:
@@ -626,6 +632,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Grype vulnerability scan (findings table)
         # Scans with a human-readable table. anchore/scan-action

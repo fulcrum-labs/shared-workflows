@@ -459,3 +459,23 @@ test('the gitleaks download is pinned by sha256 and verified before it is unpack
   assert.equal(check[1], '5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba')
   assert.equal(version[2], '8.21.2')
 })
+
+test('no checkout in the gate leaves the job token in .git/config', () => {
+  // Every job here goes on to run repository code (pnpm install, the consumer's scripts, a scanner), and a token left in
+  // .git/config by actions/checkout is readable by all of it. No step runs git against the remote after the checkout, so no
+  // checkout needs the credential. A new job that does need it must say why in this test, not drop the line.
+  const lines = workflow.split('\n')
+  const checkouts = []
+  lines.forEach((line, index) => {
+    if (!/^\s*(- )?uses:\s*actions\/checkout@/.test(line)) return
+    const indent = line.match(/^\s*/)[0].length + (line.trimStart().startsWith('- ') ? 2 : 0)
+    let end = index + 1
+    while (end < lines.length && (lines[end].trim() === '' ? false : lines[end].match(/^\s*/)[0].length >= indent)) end += 1
+    checkouts.push(lines.slice(index, end).join('\n'))
+  })
+  assert.equal(checkouts.length, 5, 'quality, docs-lint, gitleaks, semgrep and grype each check out once')
+  for (const checkout of checkouts) {
+    assert.match(checkout, /persist-credentials: false/, checkout)
+  }
+  assert.doesNotMatch(workflow, /persist-credentials: true/)
+})
