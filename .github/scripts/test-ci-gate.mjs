@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -478,4 +478,53 @@ test('no checkout in the gate leaves the job token in .git/config', () => {
     assert.match(checkout, /persist-credentials: false/, checkout)
   }
   assert.doesNotMatch(workflow, /persist-credentials: true/)
+})
+
+test('the quality job refuses any tracked node_modules entry, symlinks included', () => {
+  const start = workflow.indexOf('      - name: Refuse a tracked node_modules')
+  assert.ok(start > workflow.indexOf('  quality:'), 'the step is in the quality job')
+  assert.ok(start < workflow.indexOf('      - name: Resolve pnpm version'), 'and runs before anything is installed')
+  const block = workflow.slice(start, workflow.indexOf('      - name: Resolve pnpm version', start))
+  const script = block
+    .slice(block.indexOf('run: |\n') + 'run: |\n'.length)
+    .split('\n')
+    .map(line => line.slice(10))
+    .join('\n')
+  const verdict = (setup, source = script) => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-gate-node-modules-'))
+    const git = (...args) => spawnSync('git', args, { cwd: dir, encoding: 'utf8' })
+    git('init', '-q')
+    git('config', 'user.email', 'test@example.invalid')
+    git('config', 'user.name', 'test')
+    setup(dir)
+    git('add', '-A', '-f')
+    git('commit', '-q', '--allow-empty', '-m', 'fixture')
+    return spawnSync('bash', ['-ec', source], { cwd: dir, encoding: 'utf8' })
+  }
+  const clean = dir => writeFileSync(join(dir, 'a.txt'), 'x')
+  const symlink = (dir) => symlinkSync('/tmp', join(dir, 'node_modules'))
+  const nested = (dir) => {
+    mkdirSync(join(dir, 'packages', 'x', 'node_modules'), { recursive: true })
+    writeFileSync(join(dir, 'packages', 'x', 'node_modules', 'index.js'), '1')
+  }
+  const lookalike = (dir) => {
+    mkdirSync(join(dir, 'node_modules_backup'))
+    writeFileSync(join(dir, 'node_modules_backup', 'a'), '1')
+    writeFileSync(join(dir, 'my_node_modules.txt'), '1')
+  }
+  assert.equal(verdict(clean).status, 0, 'a tree without node_modules passes')
+  assert.equal(verdict(lookalike).status, 0, 'names that only contain the word pass')
+  const refused = verdict(symlink)
+  assert.notEqual(refused.status, 0, 'a tracked node_modules symlink fails the job')
+  assert.match(refused.stderr, /node_modules is tracked/)
+  assert.match(refused.stderr, /^node_modules$/m, 'and the offending path is printed')
+  assert.notEqual(verdict(nested).status, 0, 'a tracked nested node_modules tree fails the job')
+  // Mutation checks: the fixtures must tell the real step from a weaker one. A pattern that needs the trailing slash
+  // (what a `node_modules/` ignore rule matches) lets the symlink through, and so does a step that never fails.
+  const needsSlash = script.replace('(^|/)node_modules(/|$)', '(^|/)node_modules/')
+  assert.notEqual(needsSlash, script, 'the mutation changed the script')
+  assert.equal(verdict(symlink, needsSlash).status, 0, 'mutation: a slash-only pattern misses the symlink')
+  const neverFails = script.replace('exit 1', 'exit 0')
+  assert.notEqual(neverFails, script)
+  assert.equal(verdict(nested, neverFails).status, 0, 'mutation: a step that cannot fail passes the nested tree')
 })
