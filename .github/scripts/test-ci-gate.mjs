@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 const workflow = readFileSync(
@@ -369,4 +372,31 @@ test('the caller\'s check command reaches the gate through env, never spliced in
   assert.doesNotMatch(run, /\$\{\{/, 'no ${{ }} expression inside the gate run script (run-shell-injection)')
   assert.match(run, /eval "\$CHECK_COMMAND"/)
   assert.match(gate, /CHECK_COMMAND: \$\{\{ inputs\.check-command \}\}/)
+})
+
+test('gitleaks scans the commits of the event, not every branch of the checkout', () => {
+  const start = workflow.indexOf('      - name: Gitleaks scan')
+  const step = workflow.slice(start, workflow.indexOf('\n  semgrep:', start))
+  const run = step.slice(step.indexOf('run: |'))
+  assert.doesNotMatch(run, /\$\{\{/, 'no ${{ }} expression inside the scan script (run-shell-injection)')
+  for (const name of ['EVENT_NAME', 'PR_BASE', 'PR_HEAD', 'MG_BASE', 'MG_HEAD', 'PUSHED_SHA']) {
+    assert.match(step, new RegExp(`${name}: \\$\\{\\{ github\\.`), `${name} is passed through env`)
+  }
+
+  // Run the step's own script with a gitleaks that records its argv.
+  const dir = mkdtempSync(join(tmpdir(), 'gitleaks-scope-'))
+  writeFileSync(join(dir, 'gitleaks'), '#!/bin/sh\necho "ARGS: $*"\n')
+  chmodSync(join(dir, 'gitleaks'), 0o755)
+  const script = run.split('\n').slice(1).map(line => line.replace(/^ {10}/, '')).join('\n')
+  const scan = (event) => spawnSync('bash', ['-c', script], {
+    encoding: 'utf8',
+    env: { PATH: `${dir}:${process.env.PATH}`, EVENT_NAME: event, PR_BASE: 'base1', PR_HEAD: 'head1', MG_BASE: 'mgbase', MG_HEAD: 'mghead', PUSHED_SHA: 'pushed1' },
+  }).stdout.trim()
+  const common = 'detect --source . --no-banner --redact --verbose'
+  assert.equal(scan('pull_request'), `ARGS: ${common} --log-opts=base1..head1`)
+  assert.equal(scan('pull_request_target'), `ARGS: ${common} --log-opts=base1..head1`)
+  assert.equal(scan('merge_group'), `ARGS: ${common} --log-opts=mgbase..mghead`)
+  assert.equal(scan('push'), `ARGS: ${common} --log-opts=pushed1`)
+  assert.equal(scan('schedule'), `ARGS: ${common}`, 'a scheduled run still scans every branch')
+  assert.equal(scan('workflow_dispatch'), `ARGS: ${common}`)
 })

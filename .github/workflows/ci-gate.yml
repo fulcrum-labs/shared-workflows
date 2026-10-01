@@ -498,7 +498,32 @@ jobs:
       - name: Gitleaks scan
         # --verbose prints each finding (file, line, rule, redacted value) so a red job is actionable
         # without reproducing the scan locally; secrets stay redacted.
-        run: gitleaks detect --source . --no-banner --redact --verbose
+        #
+        # What is scanned depends on the event. gitleaks' default is `git log --all`, and the checkout above
+        # fetched every branch, so one leaked-looking literal on ANY branch used to fail gitleaks on EVERY pull
+        # request (and anyone who can push a branch could block them all). A pull request now scans only its own
+        # commits; a merge-queue group only its own; a push the history of the pushed commit, which is the
+        # full-history scan of main; a schedule or manual run still scans every branch. The event data reaches
+        # the script through env, never spliced into it.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSHED_SHA: ${{ github.sha }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request | pull_request_target) range="$PR_BASE..$PR_HEAD" ;;
+            merge_group) range="$MG_BASE..$MG_HEAD" ;;
+            push) range="$PUSHED_SHA" ;;
+            *) range="" ;;
+          esac
+          if [ -n "$range" ]; then
+            gitleaks detect --source . --no-banner --redact --verbose --log-opts="$range"
+          else
+            gitleaks detect --source . --no-banner --redact --verbose
+          fi
 
   semgrep:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
