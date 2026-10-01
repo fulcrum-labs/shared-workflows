@@ -388,15 +388,59 @@ test('gitleaks scans the commits of the event, not every branch of the checkout'
   writeFileSync(join(dir, 'gitleaks'), '#!/bin/sh\necho "ARGS: $*"\n')
   chmodSync(join(dir, 'gitleaks'), 0o755)
   const script = run.split('\n').slice(1).map(line => line.replace(/^ {10}/, '')).join('\n')
-  const scan = (event) => spawnSync('bash', ['-c', script], {
+  // A real repository, so that "is this SHA a commit here" is answered by git, not by the test.
+  const repo = mkdtempSync(join(tmpdir(), 'gitleaks-scope-repo-'))
+  const git = (...args) => spawnSync('git', args, { cwd: repo, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).stdout.trim()
+  git('init', '-q', '-b', 'main')
+  git('commit', '-q', '--allow-empty', '-m', 'one')
+  const one = git('rev-parse', 'HEAD')
+  git('commit', '-q', '--allow-empty', '-m', 'two')
+  const two = git('rev-parse', 'HEAD')
+  const runScan = (event, vars) => spawnSync('bash', ['-c', script], {
+    cwd: repo,
     encoding: 'utf8',
-    env: { PATH: `${dir}:${process.env.PATH}`, EVENT_NAME: event, PR_BASE: 'base1', PR_HEAD: 'head1', MG_BASE: 'mgbase', MG_HEAD: 'mghead', PUSHED_SHA: 'pushed1' },
-  }).stdout.trim()
+    env: { PATH: `${dir}:${process.env.PATH}`, EVENT_NAME: event, ...vars },
+  })
+  const scan = (event, vars = { PR_BASE: one, PR_HEAD: two, MG_BASE: one, MG_HEAD: two, PUSHED_SHA: two }) => runScan(event, vars).stdout.trim()
   const common = 'detect --source . --no-banner --redact --verbose'
-  assert.equal(scan('pull_request'), `ARGS: ${common} --log-opts=base1..head1`)
-  assert.equal(scan('pull_request_target'), `ARGS: ${common} --log-opts=base1..head1`)
-  assert.equal(scan('merge_group'), `ARGS: ${common} --log-opts=mgbase..mghead`)
-  assert.equal(scan('push'), `ARGS: ${common} --log-opts=pushed1`)
+  assert.equal(scan('pull_request'), `ARGS: ${common} --log-opts=${one}..${two}`)
+  assert.equal(scan('pull_request_target'), `ARGS: ${common} --log-opts=${one}..${two}`)
+  assert.equal(scan('merge_group'), `ARGS: ${common} --log-opts=${one}..${two}`)
+  assert.equal(scan('push'), `ARGS: ${common} --log-opts=${two}`)
   assert.equal(scan('schedule'), `ARGS: ${common}`, 'a scheduled run still scans every branch')
   assert.equal(scan('workflow_dispatch'), `ARGS: ${common}`)
+})
+
+test('gitleaks fails closed on a scan range it cannot read: gitleaks itself exits 0 on a missing commit', () => {
+  const start = workflow.indexOf('      - name: Gitleaks scan')
+  const step = workflow.slice(start, workflow.indexOf('\n  semgrep:', start))
+  const script = step.slice(step.indexOf('run: |')).split('\n').slice(1).map(line => line.replace(/^ {10}/, '')).join('\n')
+  const dir = mkdtempSync(join(tmpdir(), 'gitleaks-closed-'))
+  writeFileSync(join(dir, 'gitleaks'), '#!/bin/sh\necho "GITLEAKS RAN"\n')
+  chmodSync(join(dir, 'gitleaks'), 0o755)
+  const repo = mkdtempSync(join(tmpdir(), 'gitleaks-closed-repo-'))
+  const g = (...a) => spawnSync('git', a, { cwd: repo, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).stdout.trim()
+  g('init', '-q', '-b', 'main'); g('commit', '-q', '--allow-empty', '-m', 'one')
+  const sha = g('rev-parse', 'HEAD')
+  const missing = '0123456789abcdef0123456789abcdef01234567'
+  const run = vars => spawnSync('bash', ['-c', script], { cwd: repo, encoding: 'utf8', env: { PATH: `${dir}:${process.env.PATH}`, ...vars } })
+  const cases = [
+    ['a missing head', { EVENT_NAME: 'pull_request', PR_BASE: sha, PR_HEAD: missing }],
+    ['a missing base', { EVENT_NAME: 'pull_request_target', PR_BASE: missing, PR_HEAD: sha }],
+    ['an empty base', { EVENT_NAME: 'pull_request', PR_BASE: '', PR_HEAD: sha }],
+    ['a branch name for a SHA', { EVENT_NAME: 'pull_request', PR_BASE: 'main', PR_HEAD: sha }],
+    ['a missing merge-group head', { EVENT_NAME: 'merge_group', MG_BASE: sha, MG_HEAD: missing }],
+    ['a missing pushed commit', { EVENT_NAME: 'push', PUSHED_SHA: missing }],
+    ['an empty pushed commit', { EVENT_NAME: 'push', PUSHED_SHA: '' }],
+  ]
+  for (const [why, vars] of cases) {
+    const result = run(vars)
+    assert.notEqual(result.status, 0, `${why}: the job must fail`)
+    assert.doesNotMatch(result.stdout, /GITLEAKS RAN/, `${why}: gitleaks must not run on a range it cannot read`)
+    assert.match(result.stderr, /gitleaks scan range/, why)
+  }
+  // The same step still runs for a readable range.
+  const good = run({ EVENT_NAME: 'pull_request', PR_BASE: sha, PR_HEAD: sha })
+  assert.equal(good.status, 0)
+  assert.match(good.stdout, /GITLEAKS RAN/)
 })

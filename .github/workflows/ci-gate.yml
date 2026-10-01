@@ -513,10 +513,26 @@ jobs:
           MG_HEAD: ${{ github.event.merge_group.head_sha }}
           PUSHED_SHA: ${{ github.sha }}
         run: |
+          # gitleaks 8.21.2 exits 0 ("no leaks found") when --log-opts names a commit that does not exist in the
+          # checkout (a fork head on pull_request_target, an empty event field), so a bad range would pass the
+          # scan unread. Every SHA must be 40 hex and present as a commit, or the job fails.
+          need_commit() {
+            case "$1" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+              *) echo "::error::gitleaks scan range: '$2' is not a commit SHA ('$1')" >&2; exit 1 ;;
+            esac
+            git cat-file -e "$1^{commit}" 2>/dev/null || { echo "::error::gitleaks scan range: $2 $1 is not in the checkout, so it cannot be scanned" >&2; exit 1; }
+          }
           case "$EVENT_NAME" in
-            pull_request | pull_request_target) range="$PR_BASE..$PR_HEAD" ;;
-            merge_group) range="$MG_BASE..$MG_HEAD" ;;
-            push) range="$PUSHED_SHA" ;;
+            pull_request | pull_request_target)
+              need_commit "$PR_BASE" "the base"; need_commit "$PR_HEAD" "the head"
+              range="$PR_BASE..$PR_HEAD" ;;
+            merge_group)
+              need_commit "$MG_BASE" "the group base"; need_commit "$MG_HEAD" "the group head"
+              range="$MG_BASE..$MG_HEAD" ;;
+            push)
+              need_commit "$PUSHED_SHA" "the pushed commit"
+              range="$PUSHED_SHA" ;;
             *) range="" ;;
           esac
           if [ -n "$range" ]; then
