@@ -524,7 +524,14 @@ test('the quality job refuses any tracked node_modules entry, symlinks included'
   const needsSlash = script.replace('(^|/)node_modules(/|$)', '(^|/)node_modules/')
   assert.notEqual(needsSlash, script, 'the mutation changed the script')
   assert.equal(verdict(symlink, needsSlash).status, 0, 'mutation: a slash-only pattern misses the symlink')
-  const neverFails = script.replace('exit 1', 'exit 0')
+  const neverFails = script.replaceAll('exit 1', 'exit 0')
   assert.notEqual(neverFails, script)
   assert.equal(verdict(nested, neverFails).status, 0, 'mutation: a step that cannot fail passes the nested tree')
+  // Fail closed: where git cannot list the index (no repository here), the job fails instead of reading that as a clean tree.
+  const notARepository = spawnSync('bash', ['-ec', script], { cwd: mkdtempSync(join(tmpdir(), 'ci-gate-no-repo-')), encoding: 'utf8', env: { ...process.env, GIT_CEILING_DIRECTORIES: tmpdir() } })
+  assert.notEqual(notARepository.status, 0, 'a git that cannot list the index fails the job')
+  // grep exits 2 on an error (an unreadable list); that must fail too, not pass as "no match".
+  const grepErrors = script.replace("grep -zE '(^|/)node_modules(/|$)'", "grep -zE '(^|/)node_modules(/|$)' --no-such-flag")
+  assert.notEqual(grepErrors, script)
+  assert.notEqual(verdict(clean, grepErrors).status, 0, 'a grep that errors fails the job')
 })
