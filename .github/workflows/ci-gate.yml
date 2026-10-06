@@ -644,38 +644,161 @@ jobs:
 
   grype:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    # anchore/scan-action@v7.4.0 runs 'grype dir:.' (binary download, no Docker required)
     runs-on: [self-hosted, Linux, X64]
-    # One scan pass (the findings table). The SARIF pass was dropped: nothing
-    # read its output once Actions artifact storage stopped being used
-    # (operator ruling 2026-09-27). 10m was tight even for a single fresh-DB pull.
-    timeout-minutes: 15
+    # One fresh-DB pull, then one scan (two on a pull request, which also checks
+    # out the whole history). 15m was set for a single scan; a timeout is a guard,
+    # not a budget.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
+          # Every commit, so a pull request's merge base with its base branch is
+          # in the checkout: the base is scanned from it, and nothing can be
+          # fetched later (the job token is not left in .git).
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Grype vulnerability scan (findings table)
-        # Scans with a human-readable table. anchore/scan-action
-        # prints table output back into the job log (it does not for
-        # sarif/json — those go to a file only), so a failure here names the
-        # package, installed version, advisory and fixed version directly in
-        # the log. Before this step, that gap left GHSA-26w7-cxv4-gfx2 (astro
-        # RCE, 2026-09-10) unnamed across the fleet for two days — the SARIF
-        # was written to an unretained temp file and code scanning is off on
-        # most repos, so the only way to learn the CVE was rerunning grype
-        # locally. This step is the one that actually fails the job.
-        uses: anchore/scan-action@v7.4.0
-        with:
-          path: '.'
-          fail-build: true
-          severity-cutoff: high
-          grype-version: v0.117.0
-          # Fresh DB per job, never the Actions cache: a restored copy went stale on
-          # the self-hosted fleet and grype aborted on its max-age check
+      - name: Install grype
+        # The pinned grype release itself, verified before it is unpacked, like gitleaks above. The job ran this
+        # same version through anchore/scan-action@v7.4.0 until a pull request needed two scans over one DB, which
+        # the action (one install and one DB check per call) cannot share.
+        run: |
+          dir="$(mktemp -d "$RUNNER_TEMP/grype.XXXXXX")"
+          # sha256 of grype_0.117.0_linux_amd64.tar.gz as listed in the v0.117.0 release's own grype_0.117.0_checksums.txt
+          # (and equal to the tarball downloaded from that release); bump it together with the version in the URL.
+          curl -fsSL -o "$dir/grype.tar.gz" \
+            https://github.com/anchore/grype/releases/download/v0.117.0/grype_0.117.0_linux_amd64.tar.gz
+          echo "38525dab1e06f162ebaa02f94d82d1f807076b011a44180cf2777edf1a7b9c26  $dir/grype.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/grype.tar.gz" -C "$dir" grype
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Grype vulnerability scan
+        # What fails the job depends on the event (DEP-01). A pull request fails only on the findings it
+        # introduces: its head and its merge base with the base branch are both scanned, over one DB and each
+        # with its own .grype.yaml, and a finding at or above the cutoff is introduced when its (vulnerability,
+        # package) pair is not among the merge base's findings at or above the cutoff. A finding the base branch
+        # already has is printed as inherited and does not fail the pull request: before this, one advisory
+        # published against a dependency already on main failed every pull request of the repository, convention
+        # syncs that change no dependency included (11 publication sync PRs stranded on 2026-10-06; KB
+        # security-pr-grype-deadlock-2026-08-05). Every other event (a push to main, a merge group, a schedule, a
+        # manual run, and pull_request_target, whose checkout is the base) is judged on the whole tree as before:
+        # any finding at or above the cutoff fails it, so main stays strict. A base that cannot be named, found,
+        # checked out or scanned fails the job; it never passes unread.
+        #
+        # The log names every finding: grype's own table of the scanned tree (package, installed version, fixed
+        # version, advisory, severity), and on a pull request the introduced and the inherited findings, each in a
+        # table of its own. Before grype printed a table here, GHSA-26w7-cxv4-gfx2 (astro RCE, 2026-09-10) went
+        # unnamed across the fleet for two days -- the SARIF was written to an unretained temp file and code
+        # scanning is off on most repos, so the only way to learn the CVE was rerunning grype locally.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          cutoff=high
+          fail() { echo "::error::grype: $*" >&2; exit 1; }
+          command -v jq >/dev/null 2>&1 || fail "jq is not on PATH, so a scan report cannot be read"
+          work="$(mktemp -d "$RUNNER_TEMP/grype-scan.XXXXXX")"
+          case "$work/" in "$PWD/"*) fail "the scratch directory $work is inside the checkout, which the head scan reads" ;; esac
+
+          # One fresh vulnerability DB for this job, pulled once and read by every scan below. Never the Actions
+          # cache: a restored copy went stale on the self-hosted fleet and grype aborted on its max-age check
           # (invoice-portal run 32390381477, forge-7, 2026-08-20).
-          cache-db: false
-          output-format: table
+          export GRYPE_DB_CACHE_DIR="$work/db" GRYPE_CHECK_FOR_APP_UPDATE=false
+          grype db update
+          export GRYPE_DB_AUTO_UPDATE=false
+          grype db status
+
+          if [ "$EVENT_NAME" != pull_request ]; then
+            echo "grype: a ${EVENT_NAME:-unnamed} event is judged on the whole tree: any finding at or above $cutoff fails the job."
+            status=0
+            grype dir:. --fail-on "$cutoff" --output table || status=$?
+            case "$status" in
+              0) exit 0 ;;
+              2) fail "the table above has findings at or above $cutoff; on a $EVENT_NAME event every one fails the job" ;;
+              *) fail "the scan did not finish (grype exit $status)" ;;
+            esac
+          fi
+
+          # Severity in grype's own order (an unknown severity ranks below negligible), and a report that is not
+          # grype's JSON is an error, never an empty list.
+          defs='def rank: {"negligible": 1, "low": 2, "medium": 3, "high": 4, "critical": 5}[(. // "") | ascii_downcase] // 0;
+            def at_or_above: (.vulnerability.severity | rank) >= ($cutoff | rank);
+            def findings: if (.matches | type) == "array" then .matches[] else error("not a grype JSON report") end;'
+
+          # scan DIR NAME TABLE: grype over DIR, reading DIR's own .grype.yaml (grype takes it from the working
+          # directory), its JSON report in $work/NAME.json. grype exits 2 when a finding is at or above the cutoff,
+          # so 0 and 2 are both a finished scan; grype's own log is printed only for a scan that did not finish (on
+          # a finished one it only says a finding is at or above the cutoff, which here is decided below). The
+          # comparison reads the report, so a report that disagrees with grype's exit status is refused.
+          scan() {
+            local status=0 found
+            (cd "$1" && grype dir:. --fail-on "$cutoff" --output "$3" --output "json=$work/$2.json") 2> "$work/$2.log" || status=$?
+            if [ "$status" != 0 ] && [ "$status" != 2 ]; then
+              cat "$work/$2.log" >&2
+              echo "::error::grype: the scan of the $2 did not finish (grype exit $status)" >&2
+              return 1
+            fi
+            found="$(jq -n --arg cutoff "$cutoff" --slurpfile report "$work/$2.json" "$defs"' [$report[0] | findings | select(at_or_above)] | length')" || return 1
+            if { [ "$status" = 2 ] && [ "$found" = 0 ]; } || { [ "$status" = 0 ] && [ "$found" != 0 ]; }; then
+              echo "::error::grype: the $2 report counts $found finding(s) at or above $cutoff but grype exited $status" >&2
+              return 1
+            fi
+          }
+
+          [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]] \
+            || fail "the pull request's base '$PR_BASE' is not a commit SHA, so the base cannot be scanned; failing closed"
+          git cat-file -e "$PR_BASE^{commit}" 2>/dev/null \
+            || fail "the base commit $PR_BASE is not in the checkout, so it cannot be scanned; failing closed"
+          base="$(git merge-base HEAD "$PR_BASE")" \
+            || fail "HEAD and the base commit $PR_BASE have no merge base, so the pull request cannot be compared with its base; failing closed"
+          git worktree add --detach --quiet "$work/base" "$base" \
+            || fail "the merge base $base could not be checked out, so it cannot be scanned; failing closed"
+
+          echo "grype: a pull request is judged on what it introduces; its head is compared with the merge base $base."
+          scan . head table || fail "the head could not be scanned"
+          scan "$work/base" base "table=$work/base.table" \
+            || fail "the merge base $base could not be scanned, so the pull request cannot be compared with its base; failing closed"
+
+          jq -rn --arg cutoff "$cutoff" --slurpfile head "$work/head.json" --slurpfile base "$work/base.json" "$defs"'
+            def key: [.vulnerability.id, .artifact.name];
+            def fixed_in: (.vulnerability.fix.versions // []) as $v
+              | if ($v | length) > 0 then $v | join(", ") else "(" + (.vulnerability.fix.state // "unknown") + ")" end;
+            [$base[0] | findings | select(at_or_above) | key] as $at_base
+            | [$head[0] | findings | select(at_or_above)]
+            | sort_by([0 - (.vulnerability.severity | rank), .artifact.name, .vulnerability.id])
+            | .[]
+            | [(if key | IN($at_base[]) then "inherited" else "introduced" end),
+               .artifact.name, .artifact.version, fixed_in, .artifact.type, .vulnerability.id, .vulnerability.severity]
+            | @tsv' > "$work/findings.tsv"
+
+          count() { awk -F'\t' -v class="$1" '$1 == class { n++ } END { print n + 0 }' "$work/findings.tsv"; }
+          table() {
+            awk -F'\t' -v class="$1" '
+              BEGIN { split("NAME|INSTALLED|FIXED IN|TYPE|VULNERABILITY|SEVERITY", h, "|"); for (i = 1; i <= 6; i++) { cell[0, i] = h[i]; w[i] = length(h[i]) } }
+              $1 == class { n++; for (i = 1; i <= 6; i++) { cell[n, i] = $(i + 1); if (length($(i + 1)) > w[i]) w[i] = length($(i + 1)) } }
+              END {
+                if (n == 0) { print "  (none)"; exit }
+                for (r = 0; r <= n; r++) { line = ""; for (i = 1; i <= 6; i++) line = line "  " sprintf("%-" w[i] "s", cell[r, i]); sub(/ +$/, "", line); print line }
+              }' "$work/findings.tsv"
+          }
+          introduced="$(count introduced)"
+          inherited="$(count inherited)"
+          branch="${BASE_REF:-the base branch}"
+          echo
+          echo "Introduced by this pull request ($introduced): at or above $cutoff and absent at the merge base. These fail the job."
+          table introduced
+          echo
+          echo "Inherited from $branch ($inherited): at or above $cutoff and already at the merge base $base."
+          echo "Reported, not failed on here; each one fails every push to $branch until it is fixed there."
+          table inherited
+          if [ "$introduced" -gt 0 ]; then
+            fail "this pull request introduces $introduced finding(s) at or above $cutoff, listed above under Introduced"
+          fi
+          if [ "$inherited" -gt 0 ]; then
+            echo "::warning::grype: $inherited finding(s) at or above $cutoff are inherited from $branch (listed above); they fail its pushes until fixed there"
+          fi
 
   trigger-cf-build:
     # Optional: after the gate passes, POST to the Workers Builds manual-trigger
