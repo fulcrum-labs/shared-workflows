@@ -673,17 +673,26 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: Grype vulnerability scan
-        # What fails the job depends on the event (DEP-01). A pull request fails only on the findings it
-        # introduces: its head and its merge base with the base branch are both scanned, over one DB and each
-        # with its own .grype.yaml, and a finding at or above the cutoff is introduced when its (vulnerability,
-        # package) pair is not among the merge base's findings at or above the cutoff. A finding the base branch
-        # already has is printed as inherited and does not fail the pull request: before this, one advisory
-        # published against a dependency already on main failed every pull request of the repository, convention
-        # syncs that change no dependency included (11 publication sync PRs stranded on 2026-10-06; KB
-        # security-pr-grype-deadlock-2026-08-05). Every other event (a push to main, a merge group, a schedule, a
-        # manual run, and pull_request_target, whose checkout is the base) is judged on the whole tree as before:
-        # any finding at or above the cutoff fails it, so main stays strict. A base that cannot be named, found,
-        # checked out or scanned fails the job; it never passes unread.
+        # What fails the job depends on what was checked out (DEP-01). A pull request's head fails only on the
+        # findings it introduces: the head and its merge base with the base branch are both scanned, over one DB
+        # and each with its own .grype.yaml, and a finding at or above the cutoff is introduced when its
+        # (vulnerability, package) pair is not among the merge base's findings at or above the cutoff. A finding
+        # the base branch already has is printed as inherited and does not fail the pull request: before this,
+        # one advisory published against a dependency already on main failed every pull request of the
+        # repository, convention syncs that change no dependency included (11 publication sync PRs stranded on
+        # 2026-10-06; KB security-pr-grype-deadlock-2026-08-05).
+        #
+        # The path is chosen from the checkout and the pull_request payload, never from the event name: every
+        # consumer calls this gate as a local reusable workflow, and inside it Forgejo reports the event as
+        # workflow_call although the caller ran on pull_request and the payload still arrives (fronts #10, run
+        # 9279, took the strict path on the PR head). The diff-aware path is taken exactly when the payload's base
+        # and head are both commit SHAs and HEAD is that head, or a merge whose second parent is that head
+        # (GitHub's merge-ref checkout). Everything else -- a push to main, a schedule, a manual run, a
+        # workflow_call with no pull_request payload, and pull_request_target, whose checkout is the base -- is
+        # judged on the whole tree as before: any finding at or above the cutoff fails it, so main stays strict.
+        # The log's first grype line names the event, whether a payload came with it and the path taken. A
+        # payload whose base or head is not a SHA, and a base that cannot be found, checked out or scanned, fail
+        # the job; they never pass unread.
         #
         # The log names every finding: grype's own table of the scanned tree (package, installed version, fixed
         # version, advisory, severity), and on a pull request the introduced and the inherited findings, each in a
@@ -693,6 +702,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
@@ -702,6 +712,27 @@ jobs:
           work="$(mktemp -d "$RUNNER_TEMP/grype-scan.XXXXXX")"
           case "$work/" in "$PWD/"*) fail "the scratch directory $work is inside the checkout, which the head scan reads" ;; esac
 
+          # The path, from the checkout and the payload (the comment above says why not from the event name).
+          event="${EVENT_NAME:-unnamed}"
+          checkout="$(git rev-parse HEAD)" || fail "the checkout has no HEAD commit"
+          if [ -z "$PR_BASE" ] && [ -z "$PR_HEAD" ]; then
+            payload=absent path=strict why="the event carries no pull_request payload"
+          else
+            payload=present
+            [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]] \
+              || fail "event $event: the pull request's base '$PR_BASE' is not a commit SHA, so the base cannot be scanned; failing closed"
+            [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] \
+              || fail "event $event: the pull request's head '$PR_HEAD' is not a commit SHA, so the checkout cannot be matched to it; failing closed"
+            if [ "$checkout" = "$PR_HEAD" ]; then
+              path=diff-aware why="the checkout is the pull request's head $PR_HEAD"
+            elif [ "$(git rev-parse --verify --quiet 'HEAD^2' || true)" = "$PR_HEAD" ]; then
+              path=diff-aware why="the checkout $checkout merges the pull request's head $PR_HEAD"
+            else
+              path=strict why="the checkout $checkout is not the pull request's head $PR_HEAD"
+            fi
+          fi
+          echo "grype: event $event, pull_request payload $payload, $path path: $why."
+
           # One fresh vulnerability DB for this job, pulled once and read by every scan below. Never the Actions
           # cache: a restored copy went stale on the self-hosted fleet and grype aborted on its max-age check
           # (invoice-portal run 32390381477, forge-7, 2026-08-20).
@@ -710,13 +741,13 @@ jobs:
           export GRYPE_DB_AUTO_UPDATE=false
           grype db status
 
-          if [ "$EVENT_NAME" != pull_request ]; then
-            echo "grype: a ${EVENT_NAME:-unnamed} event is judged on the whole tree: any finding at or above $cutoff fails the job."
+          if [ "$path" = strict ]; then
+            echo "grype: a $event event is judged on the whole tree: any finding at or above $cutoff fails the job."
             status=0
             grype dir:. --fail-on "$cutoff" --output table || status=$?
             case "$status" in
               0) exit 0 ;;
-              2) fail "the table above has findings at or above $cutoff; on a $EVENT_NAME event every one fails the job" ;;
+              2) fail "the table above has findings at or above $cutoff; on a $event event every one fails the job" ;;
               *) fail "the scan did not finish (grype exit $status)" ;;
             esac
           fi
@@ -747,8 +778,6 @@ jobs:
             fi
           }
 
-          [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]] \
-            || fail "the pull request's base '$PR_BASE' is not a commit SHA, so the base cannot be scanned; failing closed"
           git cat-file -e "$PR_BASE^{commit}" 2>/dev/null \
             || fail "the base commit $PR_BASE is not in the checkout, so it cannot be scanned; failing closed"
           base="$(git merge-base HEAD "$PR_BASE")" \
