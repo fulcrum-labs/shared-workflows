@@ -168,25 +168,80 @@ jobs:
         env:
           TURBO_CACHE_ENABLED: ${{ inputs.turbo-cache-enabled }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_AFTER: ${{ github.event.after }}
         run: |
-          # Credentials are only ever injected for an explicit event allowlist:
-          # push, merge_group, and same-repository pull_request. Every other
-          # event (fork PRs, pull_request_target, issue_comment, workflow_run,
-          # ...) gets an empty credential set and Turbo stays on its local
-          # cache.
+          # Credentials are only ever injected for an explicit allowlist: a push, a merge group, and a
+          # same-repository pull request. A pull request and a push are recognised from the checkout and the
+          # payload (the lines below), not from the event name, which is workflow_call under a Forgejo consumer;
+          # a merge group, which Forgejo does not have, by its event name. Every other run (fork PRs,
+          # pull_request_target, issue_comment, workflow_run, ...) gets an empty credential set and Turbo stays on
+          # its local cache.
+          # >>> pull-request checkout (DEP-01): the same lines in grype, gitleaks and quality's Turbo step;
+          # platform-foundations' gate tests refuse copies that differ, so the three cannot drift.
+          # A run is a pull request's when its pull_request payload names a base and a head that are commit SHAs and
+          # the checkout is that head, or a merge whose second parent is that head (GitHub's merge ref). Never from
+          # the event name: a consumer calls this gate as a local reusable workflow, where Forgejo names the event
+          # workflow_call although the caller ran on pull_request (fronts #10, run 9279). pull_request_target checks
+          # out the base, so it is not one. With no pull_request payload, a run whose push payload names the
+          # checked-out commit is a push's. A pull_request payload whose base or head is not a commit SHA is refused.
+          pr_checkout() {
+            event="${EVENT_NAME:-unnamed}" kind=none
+            local checkout
+            checkout="$(git rev-parse HEAD)" || { echo "::error::$1: the checkout has no HEAD commit" >&2; return 1; }
+            if [ -z "$PR_BASE" ] && [ -z "$PR_HEAD" ]; then
+              payload=absent why="the event carries no pull_request payload"
+              if [[ "${PUSH_AFTER:-}" =~ ^[0-9a-f]{40}$ ]] && [ "$PUSH_AFTER" = "$checkout" ]; then
+                kind=push why="the event carries no pull_request payload and the checkout is the pushed commit $PUSH_AFTER"
+              fi
+              return 0
+            fi
+            payload=present
+            if ! [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::$1: event $event: the pull request's base '$PR_BASE' is not a commit SHA, so the pull request cannot be compared with its base; failing closed" >&2
+              return 1
+            fi
+            if ! [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::$1: event $event: the pull request's head '$PR_HEAD' is not a commit SHA, so the checkout cannot be matched to it; failing closed" >&2
+              return 1
+            fi
+            if [ "$checkout" = "$PR_HEAD" ]; then
+              kind=pull_request why="the checkout is the pull request's head $PR_HEAD"
+            elif [ "$(git rev-parse --verify --quiet 'HEAD^2' || true)" = "$PR_HEAD" ]; then
+              kind=pull_request why="the checkout $checkout merges the pull request's head $PR_HEAD"
+            else
+              why="the checkout $checkout is not the pull request's head $PR_HEAD"
+            fi
+          }
+          # <<< pull-request checkout
+
+          pr_checkout "Turbo cache" || exit 1
           eligible=false
-          if [ "$TURBO_CACHE_ENABLED" = "true" ]; then
-            case "$GITHUB_EVENT_NAME" in
-              push|merge_group)
-                eligible=true
-                ;;
+          if [ "$TURBO_CACHE_ENABLED" != "true" ]; then
+            reason="turbo-cache-enabled is not true"
+          else
+            case "$kind" in
               pull_request)
                 if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ]; then
-                  eligible=true
+                  eligible=true reason="a same-repository pull request"
+                else
+                  reason="the pull request's head is in ${HEAD_REPO:-an unnamed repository}, not $GITHUB_REPOSITORY"
                 fi
+                ;;
+              push)
+                eligible=true reason="a push"
+                ;;
+              *)
+                case "$EVENT_NAME" in
+                  push | merge_group) eligible=true reason="a $EVENT_NAME event" ;;
+                  *) reason="not a push, a merge group or a same-repository pull request" ;;
+                esac
                 ;;
             esac
           fi
+          echo "Turbo cache: event $event, pull_request payload $payload, eligible=$eligible ($reason): $why."
           echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
 
       - name: Enforce signed-cache consumer contract
@@ -531,11 +586,15 @@ jobs:
         # request (and anyone who can push a branch could block them all). A pull request now scans only its own
         # commits; a merge-queue group only its own; a push the history of the pushed commit, which is the
         # full-history scan of main; a schedule or manual run still scans every branch. The event data reaches
-        # the script through env, never spliced into it.
+        # the script through env, never spliced into it. A pull request and a push are recognised from the
+        # checkout and the payload as well as by event name (the pull-request checkout lines in the script), so a
+        # Forgejo consumer, whose call to this gate is a workflow_call, still scans only the pull request's
+        # commits or the pushed commit's history; one log line names the event, the payload and the range.
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_AFTER: ${{ github.event.after }}
           MG_BASE: ${{ github.event.merge_group.base_sha }}
           MG_HEAD: ${{ github.event.merge_group.head_sha }}
           PUSHED_SHA: ${{ github.sha }}
@@ -550,18 +609,70 @@ jobs:
             esac
             git cat-file -e "$1^{commit}" 2>/dev/null || { echo "::error::gitleaks scan range: $2 $1 is not in the checkout, so it cannot be scanned" >&2; exit 1; }
           }
-          case "$EVENT_NAME" in
-            pull_request | pull_request_target)
-              need_commit "$PR_BASE" "the base"; need_commit "$PR_HEAD" "the head"
-              range="$PR_BASE..$PR_HEAD" ;;
-            merge_group)
-              need_commit "$MG_BASE" "the group base"; need_commit "$MG_HEAD" "the group head"
-              range="$MG_BASE..$MG_HEAD" ;;
-            push)
-              need_commit "$PUSHED_SHA" "the pushed commit"
-              range="$PUSHED_SHA" ;;
-            *) range="" ;;
-          esac
+
+          # >>> pull-request checkout (DEP-01): the same lines in grype, gitleaks and quality's Turbo step;
+          # platform-foundations' gate tests refuse copies that differ, so the three cannot drift.
+          # A run is a pull request's when its pull_request payload names a base and a head that are commit SHAs and
+          # the checkout is that head, or a merge whose second parent is that head (GitHub's merge ref). Never from
+          # the event name: a consumer calls this gate as a local reusable workflow, where Forgejo names the event
+          # workflow_call although the caller ran on pull_request (fronts #10, run 9279). pull_request_target checks
+          # out the base, so it is not one. With no pull_request payload, a run whose push payload names the
+          # checked-out commit is a push's. A pull_request payload whose base or head is not a commit SHA is refused.
+          pr_checkout() {
+            event="${EVENT_NAME:-unnamed}" kind=none
+            local checkout
+            checkout="$(git rev-parse HEAD)" || { echo "::error::$1: the checkout has no HEAD commit" >&2; return 1; }
+            if [ -z "$PR_BASE" ] && [ -z "$PR_HEAD" ]; then
+              payload=absent why="the event carries no pull_request payload"
+              if [[ "${PUSH_AFTER:-}" =~ ^[0-9a-f]{40}$ ]] && [ "$PUSH_AFTER" = "$checkout" ]; then
+                kind=push why="the event carries no pull_request payload and the checkout is the pushed commit $PUSH_AFTER"
+              fi
+              return 0
+            fi
+            payload=present
+            if ! [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::$1: event $event: the pull request's base '$PR_BASE' is not a commit SHA, so the pull request cannot be compared with its base; failing closed" >&2
+              return 1
+            fi
+            if ! [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::$1: event $event: the pull request's head '$PR_HEAD' is not a commit SHA, so the checkout cannot be matched to it; failing closed" >&2
+              return 1
+            fi
+            if [ "$checkout" = "$PR_HEAD" ]; then
+              kind=pull_request why="the checkout is the pull request's head $PR_HEAD"
+            elif [ "$(git rev-parse --verify --quiet 'HEAD^2' || true)" = "$PR_HEAD" ]; then
+              kind=pull_request why="the checkout $checkout merges the pull request's head $PR_HEAD"
+            else
+              why="the checkout $checkout is not the pull request's head $PR_HEAD"
+            fi
+          }
+          # <<< pull-request checkout
+
+          pr_checkout gitleaks || exit 1
+          if [ "$kind" = pull_request ]; then
+            need_commit "$PR_BASE" "the base"; need_commit "$PR_HEAD" "the head"
+            range="$PR_BASE..$PR_HEAD" scope="the pull request's commits"
+          else
+            case "$EVENT_NAME" in
+              pull_request | pull_request_target)
+                need_commit "$PR_BASE" "the base"; need_commit "$PR_HEAD" "the head"
+                range="$PR_BASE..$PR_HEAD" scope="the pull request's commits" ;;
+              merge_group)
+                need_commit "$MG_BASE" "the group base"; need_commit "$MG_HEAD" "the group head"
+                range="$MG_BASE..$MG_HEAD" scope="the merge group's commits" ;;
+              push)
+                need_commit "$PUSHED_SHA" "the pushed commit"
+                range="$PUSHED_SHA" scope="the pushed commit's history" ;;
+              *)
+                if [ "$kind" = push ]; then
+                  need_commit "$PUSHED_SHA" "the pushed commit"
+                  range="$PUSHED_SHA" scope="the pushed commit's history"
+                else
+                  range="" scope="every branch"
+                fi ;;
+            esac
+          fi
+          echo "gitleaks: event $event, pull_request payload $payload, scanning $scope${range:+ ($range)}: $why."
           if [ -n "$range" ]; then
             gitleaks detect --source . --no-banner --redact --verbose --log-opts="$range"
           else
@@ -703,6 +814,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_AFTER: ${{ github.event.after }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
@@ -712,25 +824,46 @@ jobs:
           work="$(mktemp -d "$RUNNER_TEMP/grype-scan.XXXXXX")"
           case "$work/" in "$PWD/"*) fail "the scratch directory $work is inside the checkout, which the head scan reads" ;; esac
 
-          # The path, from the checkout and the payload (the comment above says why not from the event name).
-          event="${EVENT_NAME:-unnamed}"
-          checkout="$(git rev-parse HEAD)" || fail "the checkout has no HEAD commit"
-          if [ -z "$PR_BASE" ] && [ -z "$PR_HEAD" ]; then
-            payload=absent path=strict why="the event carries no pull_request payload"
-          else
-            payload=present
-            [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]] \
-              || fail "event $event: the pull request's base '$PR_BASE' is not a commit SHA, so the base cannot be scanned; failing closed"
-            [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]] \
-              || fail "event $event: the pull request's head '$PR_HEAD' is not a commit SHA, so the checkout cannot be matched to it; failing closed"
-            if [ "$checkout" = "$PR_HEAD" ]; then
-              path=diff-aware why="the checkout is the pull request's head $PR_HEAD"
-            elif [ "$(git rev-parse --verify --quiet 'HEAD^2' || true)" = "$PR_HEAD" ]; then
-              path=diff-aware why="the checkout $checkout merges the pull request's head $PR_HEAD"
-            else
-              path=strict why="the checkout $checkout is not the pull request's head $PR_HEAD"
+          # >>> pull-request checkout (DEP-01): the same lines in grype, gitleaks and quality's Turbo step;
+          # platform-foundations' gate tests refuse copies that differ, so the three cannot drift.
+          # A run is a pull request's when its pull_request payload names a base and a head that are commit SHAs and
+          # the checkout is that head, or a merge whose second parent is that head (GitHub's merge ref). Never from
+          # the event name: a consumer calls this gate as a local reusable workflow, where Forgejo names the event
+          # workflow_call although the caller ran on pull_request (fronts #10, run 9279). pull_request_target checks
+          # out the base, so it is not one. With no pull_request payload, a run whose push payload names the
+          # checked-out commit is a push's. A pull_request payload whose base or head is not a commit SHA is refused.
+          pr_checkout() {
+            event="${EVENT_NAME:-unnamed}" kind=none
+            local checkout
+            checkout="$(git rev-parse HEAD)" || { echo "::error::$1: the checkout has no HEAD commit" >&2; return 1; }
+            if [ -z "$PR_BASE" ] && [ -z "$PR_HEAD" ]; then
+              payload=absent why="the event carries no pull_request payload"
+              if [[ "${PUSH_AFTER:-}" =~ ^[0-9a-f]{40}$ ]] && [ "$PUSH_AFTER" = "$checkout" ]; then
+                kind=push why="the event carries no pull_request payload and the checkout is the pushed commit $PUSH_AFTER"
+              fi
+              return 0
             fi
-          fi
+            payload=present
+            if ! [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::$1: event $event: the pull request's base '$PR_BASE' is not a commit SHA, so the pull request cannot be compared with its base; failing closed" >&2
+              return 1
+            fi
+            if ! [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::$1: event $event: the pull request's head '$PR_HEAD' is not a commit SHA, so the checkout cannot be matched to it; failing closed" >&2
+              return 1
+            fi
+            if [ "$checkout" = "$PR_HEAD" ]; then
+              kind=pull_request why="the checkout is the pull request's head $PR_HEAD"
+            elif [ "$(git rev-parse --verify --quiet 'HEAD^2' || true)" = "$PR_HEAD" ]; then
+              kind=pull_request why="the checkout $checkout merges the pull request's head $PR_HEAD"
+            else
+              why="the checkout $checkout is not the pull request's head $PR_HEAD"
+            fi
+          }
+          # <<< pull-request checkout
+
+          pr_checkout grype || exit 1
+          if [ "$kind" = pull_request ]; then path=diff-aware; else path=strict; fi
           echo "grype: event $event, pull_request payload $payload, $path path: $why."
 
           # One fresh vulnerability DB for this job, pulled once and read by every scan below. Never the Actions
