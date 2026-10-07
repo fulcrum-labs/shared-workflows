@@ -638,3 +638,75 @@ test('a refusal on the first entry is a clean failure when the ledger is still t
   assert.equal(out.result.failedAt, '0001_bad');
   assert.deepEqual(d1.ledger(), []);
 });
+
+// ---- declared baseline (--baseline-rows / --baseline-names-sha256) ----------
+//
+// The Fronts shape: a ledger whose history no manifest can reproduce (rows out
+// of filename order, a row recorded twice with and without ".sql", rows from
+// files that no longer exist). The baseline pins it by the digest of its names.
+
+const namesDigest = (names) => sha256(names.map((name) => `${name}\n`).join(''));
+const LEGACY_LEDGER = ['0000_drizzle_gone', '0002_posts_author', '0001_posts', '0002_posts_author.sql'];
+const LEGACY_SQL = 'CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT, author TEXT);';
+const baselineArgs = (names, rows = names.length) => ['--manifest', 'manifest.json', '--baseline-rows', String(rows), '--baseline-names-sha256', namesDigest(names)];
+
+test('baseline: a ledger whose verified history covers the whole manifest is a clean no-op', async () => {
+  const d1 = await startD1({ seedLedger: LEGACY_LEDGER, seedSql: LEGACY_SQL });
+  const out = await run(makeArtifact(TRIO.slice(0, 2)), d1, { args: baselineArgs(LEGACY_LEDGER) });
+  assert.equal(out.code, 0, out.stdout + out.stderr);
+  assert.equal(out.result.status, 'noop');
+  assert.deepEqual(out.result.pending, []);
+  assert.equal(d1.writeRequests().length, 0);
+});
+
+test('baseline: entries after it apply in order, and the final ledger is the baseline plus them', async () => {
+  const d1 = await startD1({ seedLedger: LEGACY_LEDGER, seedSql: LEGACY_SQL });
+  const out = await run(makeArtifact(TRIO), d1, { args: baselineArgs(LEGACY_LEDGER) });
+  assert.equal(out.code, 0, out.stdout + out.stderr);
+  assert.equal(out.result.status, 'applied');
+  assert.deepEqual(out.result.applied, ['0003_comments']);
+  const writes = d1.writeRequests();
+  assert.equal(writes.length, 1);
+  assert.ok(writes[0].sql.startsWith(TRIO[2].sql));
+});
+
+test('baseline: rows after it keep the exact-prefix rule (resume, and a gap diverges)', async () => {
+  const four = [...TRIO, E('0004_tags', 'CREATE TABLE tags (id INTEGER PRIMARY KEY);')];
+  const resumed = await startD1({ seedLedger: [...LEGACY_LEDGER, '0003_comments'], seedSql: LEGACY_SQL + '\nCREATE TABLE comments (id INTEGER PRIMARY KEY, post_id INTEGER);' });
+  const ok = await run(makeArtifact(four), resumed, { args: baselineArgs(LEGACY_LEDGER) });
+  assert.equal(ok.code, 0, ok.stdout + ok.stderr);
+  assert.deepEqual(ok.result.applied, ['0004_tags']);
+  const gapped = await startD1({ seedLedger: [...LEGACY_LEDGER, '0004_tags'], seedSql: LEGACY_SQL + '\nCREATE TABLE tags (id INTEGER PRIMARY KEY);' });
+  const gap = await run(makeArtifact(four), gapped, { args: baselineArgs(LEGACY_LEDGER) });
+  assert.equal(gap.code, 3, gap.stdout + gap.stderr);
+  assert.equal(gap.result.divergence.kind, 'gap');
+  assert.equal(gapped.writeRequests().length, 0);
+});
+
+test('baseline: changed history (an edited, deleted or reordered row) is a divergence that writes nothing', async () => {
+  for (const ledger of [
+    ['0000_drizzle_gone', '0002_posts_author', '0001_posts', '0002_posts_author_edited.sql'],
+    ['0000_drizzle_gone', '0001_posts', '0002_posts_author', '0002_posts_author.sql'],
+    ['0000_drizzle_gone', '0002_posts_author', '0001_posts'],
+  ]) {
+    const d1 = await startD1({ seedLedger: ledger, seedSql: LEGACY_SQL });
+    const out = await run(makeArtifact(TRIO), d1, { args: baselineArgs(LEGACY_LEDGER) });
+    assert.equal(out.code, 3, `${ledger}: ${out.stdout}${out.stderr}`);
+    assert.equal(out.result.divergence.kind, 'baseline-mismatch');
+    assert.equal(d1.writeRequests().length, 0);
+  }
+});
+
+test('baseline: the two flags come together and well-formed, or nothing is contacted', async () => {
+  for (const args of [
+    ['--manifest', 'manifest.json', '--baseline-rows', '4'],
+    ['--manifest', 'manifest.json', '--baseline-names-sha256', namesDigest(LEGACY_LEDGER)],
+    ['--manifest', 'manifest.json', '--baseline-rows', '0', '--baseline-names-sha256', namesDigest(LEGACY_LEDGER)],
+    ['--manifest', 'manifest.json', '--baseline-rows', '4', '--baseline-names-sha256', 'NOT-HEX'],
+  ]) {
+    const d1 = await startD1({ seedLedger: LEGACY_LEDGER, seedSql: LEGACY_SQL });
+    const out = await run(makeArtifact(TRIO), d1, { args });
+    assert.equal(out.code, 2, `${args.join(' ')}: ${out.stdout}${out.stderr}`);
+    assert.equal(d1.requests.length, 0);
+  }
+});

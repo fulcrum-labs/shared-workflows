@@ -43,10 +43,10 @@ import { basename, isAbsolute, join, resolve, sep } from "node:path";
 // alongside --manifest.
 function manifestFlagFromArgv(argv) {
 	if (!argv.some((arg) => arg === "--manifest" || arg.startsWith("--manifest="))) return null;
-	const values = { manifest: null, "database-id": null };
+	const values = { manifest: null, "database-id": null, "baseline-rows": null, "baseline-names-sha256": null };
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
-		const match = /^--(manifest|database-id)(?:=(.*))?$/.exec(arg);
+		const match = /^--(manifest|database-id|baseline-rows|baseline-names-sha256)(?:=(.*))?$/.exec(arg);
 		if (!match) return { error: `unknown argument ${JSON.stringify(arg)}` };
 		const [, name, inline] = match;
 		if (values[name] !== null) return { error: `--${name} was supplied more than once` };
@@ -58,7 +58,22 @@ function manifestFlagFromArgv(argv) {
 		if (value === "") return { error: `--${name} requires a non-empty value` };
 		values[name] = value;
 	}
-	return { path: values.manifest, databaseId: values["database-id"] || "" };
+	const rows = values["baseline-rows"];
+	const digest = values["baseline-names-sha256"];
+	if ((rows === null) !== (digest === null)) return { error: "--baseline-rows and --baseline-names-sha256 are given together or not at all" };
+	let baseline = null;
+	if (rows !== null) {
+		if (!/^[1-9][0-9]{0,5}$/.test(rows)) return { error: "--baseline-rows must be a positive integer" };
+		if (!/^[0-9a-f]{64}$/.test(digest)) return { error: "--baseline-names-sha256 must be 64 lowercase hex characters" };
+		baseline = { rows: Number(rows), namesSha256: digest };
+	}
+	return { path: values.manifest, databaseId: values["database-id"] || "", baseline };
+}
+
+// The baseline's names digest: sha256 over each ledger row name, in id order,
+// exactly as stored, each followed by "\n". foundryd computes the same form.
+function baselineNamesDigest(names) {
+	return createHash("sha256").update(names.map((name) => `${name}\n`).join("")).digest("hex");
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +128,16 @@ function manifestFlagFromArgv(argv) {
 // so the sha256 of everything before the fixed suffix IS the manifest's
 // sha256 for that entry. Files must be valid UTF-8. The whole entry apply is a
 // single statement list that D1 runs as one batch: all of it or none of it.
+//
+// Declared baseline (`--baseline-rows N --baseline-names-sha256 X`, both or
+// neither): history no manifest can reproduce (rows applied out of order,
+// twice, or from files that no longer exist) is pinned by the digest of its
+// names instead of per-file bytes. The ledger's first N names must hash to X
+// (baselineNamesDigest), else a DIVERGENCE (kind baseline-mismatch). Manifest
+// entries the baseline names (".sql" ignored) are skipped; the rows after the
+// baseline must be an exact prefix of the remaining entries, and those apply
+// exactly as above. Which files may be pending at all (only those added after
+// the baseline) is the caller's plan (foundryd), checked before any grant.
 //
 // Not offered here, by design: reset-and-replay, the replay manifest and any
 // "skip"/"force" escape hatch. Combining --manifest with either is refused.
@@ -353,7 +378,7 @@ async function runManifestMode(flag) {
 		const base = (process.env.CLOUDFLARE_API_BASE_URL || "https://api.cloudflare.com/client/v4").replace(/\/+$/, "");
 		const timeoutMs = Number(process.env.D1_MIGRATIONS_REQUEST_TIMEOUT_MS || 120000);
 
-		const { entries, manifestSha256 } = readManifest(flag.path);
+		let { entries, manifestSha256 } = readManifest(flag.path);
 		result.manifestSha256 = manifestSha256;
 		mlog(`manifest ${flag.path}: ${entries.length} entries, sha256 ${manifestSha256}; every file digest verified`);
 
@@ -398,7 +423,29 @@ async function runManifestMode(flag) {
 			});
 		}
 		result.ledgerBefore = before.names;
-		const appliedCount = checkLedgerPrefix(entries, before.names);
+		// With a declared baseline, its rows are verified by digest and the
+		// manifest entries it names are set aside; everything below then runs on
+		// the rows after the baseline and the entries it does not name.
+		let baselineNames = [];
+		if (flag.baseline) {
+			if (before.names.length < flag.baseline.rows) {
+				throw new ManifestDivergence(`the ledger has ${before.names.length} rows, fewer than the declared baseline's ${flag.baseline.rows}`, {
+					kind: "baseline-mismatch", index: before.names.length, expected: flag.baseline.namesSha256, actual: null,
+				});
+			}
+			baselineNames = before.names.slice(0, flag.baseline.rows);
+			const actual = baselineNamesDigest(baselineNames);
+			if (actual !== flag.baseline.namesSha256) {
+				throw new ManifestDivergence(`the ledger's first ${flag.baseline.rows} row names hash to ${actual}, not the declared baseline ${flag.baseline.namesSha256}: history changed`, {
+					kind: "baseline-mismatch", index: 0, expected: flag.baseline.namesSha256, actual,
+				});
+			}
+			const inBaseline = new Set(baselineNames.map(ledgerKey));
+			entries = entries.filter((entry) => !inBaseline.has(ledgerKey(entry.id)));
+			mlog(`baseline: ${flag.baseline.rows} ledger rows verified by digest; ${entries.length} manifest entries after it`);
+		}
+		const baselineKeys = baselineNames.map(ledgerKey);
+		const appliedCount = checkLedgerPrefix(entries, before.names.slice(baselineNames.length));
 		const pending = entries.slice(appliedCount);
 		result.pending = pending.map((entry) => entry.id);
 		mlog(`${appliedCount} of ${entries.length} entries applied; ledger is an exact prefix of the manifest`);
@@ -449,7 +496,7 @@ async function runManifestMode(flag) {
 					mlog(`AMBIGUOUS: ${entry.id} was refused (HTTP ${reply.status}) but the ledger re-read failed: ${error?.message || error}`);
 					return finish("ambiguous", MANIFEST_EXIT.ambiguous, `${entry.id} was refused by the database (HTTP ${reply.status}) but the ledger could not be re-read to confirm it was not recorded: ${error?.message || error}`);
 				}
-				const expectedKeys = entries.slice(0, appliedCount + result.applied.length).map((e) => ledgerKey(e.id));
+				const expectedKeys = baselineKeys.concat(entries.slice(0, appliedCount + result.applied.length).map((e) => ledgerKey(e.id)));
 				const backKeys = back.names.map(ledgerKey);
 				if (back.missing || backKeys.length !== expectedKeys.length || backKeys.some((name, i) => name !== expectedKeys[i])) {
 					result.ambiguousAt = entry.id;
@@ -478,7 +525,7 @@ async function runManifestMode(flag) {
 			mlog(`AMBIGUOUS: applied ${result.applied.length} entries but the final ledger read failed: ${error?.message || error}`);
 			return finish("ambiguous", MANIFEST_EXIT.ambiguous, `final ledger read failed: ${error?.message || error}`);
 		}
-		const want = entries.map((entry) => ledgerKey(entry.id));
+		const want = baselineKeys.concat(entries.map((entry) => ledgerKey(entry.id)));
 		const got = after.names.map(ledgerKey);
 		if (after.missing || got.length !== want.length || got.some((name, i) => name !== want[i])) {
 			mlog("AMBIGUOUS: after applying, the ledger is not the manifest prefix it should be");
