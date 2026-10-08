@@ -29,18 +29,7 @@ on:
         type: string
         default: '2'
         description: 'Vitest worker cap for the check-command (VITEST_MAX_WORKERS, and VITEST_MAX_THREADS/VITEST_MAX_FORKS for Vitest < 4). The node job class envelope is 2 vCPU (olympus execution-substrate spec §3.1); Vitest otherwise starts os.availableParallelism() workers on a shared runner host and its 5 s test timeout fires under the contention.'
-      cf-worker-name:
-        type: string
-        default: ''
-        description: 'Optional. CF Worker script name. If set together with cf-account-id and the CF_BUILDS_TOKEN secret, the gate manually triggers a CF Build after passing on main/staging — bypasses CF Builds webhook dispatch latency.'
-      cf-account-id:
-        type: string
-        default: ''
-        description: 'Optional. CF account ID owning the worker (e.g. b8fd8daf73edd8fe6b6bd18eeaacf2bb for fulcrum).'
     secrets:
-      CF_BUILDS_TOKEN:
-        required: false
-        description: 'Optional user-scoped (cfut_*) Cloudflare API token with Workers Builds Configuration: Edit + Workers Scripts: Read permissions.'
       TURBO_CACHE_TOKEN:
         required: false
         description: 'Optional bearer credential for the signed Turbo remote cache.'
@@ -961,59 +950,3 @@ jobs:
           if [ "$inherited" -gt 0 ]; then
             echo "::warning::grype: $inherited finding(s) at or above $cutoff are inherited from $branch (listed above); they fail its pushes until fixed there"
           fi
-
-  trigger-cf-build:
-    # Optional: after the gate passes, POST to the Workers Builds manual-trigger
-    # endpoint to start the build immediately instead of waiting for CF Builds'
-    # webhook dispatch. Skipped if cf-worker-name / cf-account-id / CF_BUILDS_TOKEN
-    # aren't provided, and only runs on push to main or staging.
-    if: |
-      github.event_name == 'push' &&
-      (github.ref_name == 'main' || github.ref_name == 'staging') &&
-      inputs.cf-worker-name != '' &&
-      inputs.cf-account-id != ''
-    needs: [quality, gitleaks, semgrep, grype]
-    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 3
-    steps:
-      - name: Manually trigger Cloudflare Workers build
-        env:
-          CF_TOKEN: ${{ secrets.CF_BUILDS_TOKEN }}
-          ACCOUNT_ID: ${{ inputs.cf-account-id }}
-          WORKER_NAME: ${{ inputs.cf-worker-name }}
-          BRANCH: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CF_TOKEN:-}" ]; then
-            echo "::warning::CF_BUILDS_TOKEN secret not provided — skipping manual trigger; CF will deploy via webhook (slower)."
-            exit 0
-          fi
-
-          API="https://api.cloudflare.com/client/v4"
-          AUTH="Authorization: Bearer $CF_TOKEN"
-
-          worker_tag=$(curl -fsSL -H "$AUTH" "$API/accounts/$ACCOUNT_ID/workers/scripts/$WORKER_NAME" \
-            | jq -r '.result.tag // empty')
-          if [ -z "$worker_tag" ]; then
-            echo "::warning::Could not resolve worker tag for '$WORKER_NAME' in account $ACCOUNT_ID — skipping manual trigger."
-            exit 0
-          fi
-
-          trigger_uuid=$(curl -fsSL -H "$AUTH" "$API/accounts/$ACCOUNT_ID/builds/workers/$worker_tag/triggers" \
-            | jq -r --arg branch "$BRANCH" '[.result[] | select(.branch_includes | index($branch))] | first | .trigger_uuid // empty')
-          if [ -z "$trigger_uuid" ]; then
-            echo "::warning::No CF Builds trigger matches branch '$BRANCH' for worker '$WORKER_NAME' — skipping manual trigger."
-            exit 0
-          fi
-
-          echo "Triggering CF Build for worker '$WORKER_NAME' on branch '$BRANCH' (trigger $trigger_uuid)"
-          response=$(curl -fsSL -X POST -H "$AUTH" "$API/accounts/$ACCOUNT_ID/builds/triggers/$trigger_uuid/builds")
-          if ! echo "$response" | jq -e '.success == true' > /dev/null; then
-            echo "::error::CF Builds API rejected the trigger:"
-            echo "$response" | jq '.errors // .'
-            exit 1
-          fi
-
-          build_uuid=$(echo "$response" | jq -r '.result.build_uuid // .result.uuid // "unknown"')
-          echo "::notice::CF Build started: $build_uuid"
