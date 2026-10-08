@@ -973,23 +973,45 @@ jobs:
             || fail "the base commit $PR_BASE is not in the checkout, so it cannot be scanned; failing closed"
           base="$(git merge-base HEAD "$PR_BASE")" \
             || fail "HEAD and the base commit $PR_BASE have no merge base, so the pull request cannot be compared with its base; failing closed"
-          git worktree add --detach --quiet "$work/base" "$base" \
-            || fail "the merge base $base could not be checked out, so it cannot be scanned; failing closed"
+          # The merge base only has to be scanned when the pull request can change what grype finds: a dependency manifest or lock
+          # file, a vendored or binary artefact, grype's own configuration. When every changed file is plain source, content or an
+          # image, the head's package set is the base's, nothing can be introduced, and the head's report stands for both (the base
+          # report is the head's, so every finding at or above the cutoff reads as inherited, as before). Any other changed file,
+          # including one this list has never seen, takes the full comparison.
+          changed="$(git diff --name-only --no-renames "$base" HEAD)" \
+            || fail "the files changed since the merge base $base could not be listed, so the pull request cannot be compared with its base; failing closed"
+          needs_base=0
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            case "$file" in
+              *.md | *.mdx | *.txt | *.astro | *.ts | *.tsx | *.js | *.jsx | *.mjs | *.cjs | *.css | *.scss | *.html | *.svg \
+                | *.png | *.jpg | *.jpeg | *.gif | *.webp | *.avif | *.ico | *.woff | *.woff2 | *.ttf | *.otf | *.sql) ;;
+              *) needs_base=1; break ;;
+            esac
+          done <<< "$changed"
 
-          echo "grype: a pull request is judged on what it introduces; its head is compared with the merge base $base."
-          # The two scans read the same database and share nothing else (each writes its own report and log), so they run
-          # together: on a warm slot a scan is the whole of the job, and serial they cost twice the slower one.
-          scan . head table &
-          head_pid=$!
-          scan "$work/base" base "table=$work/base.table" &
-          base_pid=$!
-          head_status=0
-          base_status=0
-          wait "$head_pid" || head_status=$?
-          wait "$base_pid" || base_status=$?
-          [ "$head_status" = 0 ] || fail "the head could not be scanned"
-          [ "$base_status" = 0 ] \
-            || fail "the merge base $base could not be scanned, so the pull request cannot be compared with its base; failing closed"
+          if [ "$needs_base" = 0 ]; then
+            echo "grype: a pull request is judged on what it introduces; only source and content files changed since the merge base $base, so the head's package set is the base's and one scan serves both."
+            scan . head table || fail "the head could not be scanned"
+            cp "$work/head.json" "$work/base.json"
+          else
+            git worktree add --detach --quiet "$work/base" "$base" \
+              || fail "the merge base $base could not be checked out, so it cannot be scanned; failing closed"
+            echo "grype: a pull request is judged on what it introduces; its head is compared with the merge base $base."
+            # The two scans read the same database and share nothing else (each writes its own report and log), so they run
+            # together: on a warm slot a scan is the whole of the job, and serial they cost twice the slower one.
+            scan . head table &
+            head_pid=$!
+            scan "$work/base" base "table=$work/base.table" &
+            base_pid=$!
+            head_status=0
+            base_status=0
+            wait "$head_pid" || head_status=$?
+            wait "$base_pid" || base_status=$?
+            [ "$head_status" = 0 ] || fail "the head could not be scanned"
+            [ "$base_status" = 0 ] \
+              || fail "the merge base $base could not be scanned, so the pull request cannot be compared with its base; failing closed"
+          fi
 
           jq -rn --arg cutoff "$cutoff" --slurpfile head "$work/head.json" --slurpfile base "$work/base.json" "$defs"'
             def key: [.vulnerability.id, .artifact.name];
