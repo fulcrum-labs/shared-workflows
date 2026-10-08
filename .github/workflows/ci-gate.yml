@@ -143,8 +143,16 @@ jobs:
           # the runner unit's npm_config_store_dir (/var/cache/ci/pnpm) and their
           # installs raced one store (ERR_PNPM_ENOENT copyfile / READ_FROM_STORE,
           # 2026-09-25/26). Export both spellings pnpm actually reads.
-          echo "npm_config_store_dir=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
-          echo "pnpm_config_store_dir=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
+          # CI_PNPM_STORE_DIR is set only on a Forgejo slot, to that slot's own persistent store (infra ansible/roles/github-runners README
+          # "Slot stores"): one job at a time writes it, so it cannot race, and a warm slot reuses packages instead of fetching them. Unset
+          # (GitHub-hosted and GitHub self-hosted runners, where concurrent jobs share a host) the store stays per job, as before.
+          store="${CI_PNPM_STORE_DIR:-$RUNNER_TEMP/pnpm-store}"
+          case "$store" in
+            "$RUNNER_TEMP"/* | /var/cache/ci/slot/pnpm-store) ;;
+            *) echo "::error::CI_PNPM_STORE_DIR must be the slot store or under RUNNER_TEMP; got '$store'"; exit 1 ;;
+          esac
+          echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
+          echo "pnpm_config_store_dir=$store" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v5
         with:
@@ -526,8 +534,16 @@ jobs:
           # the runner unit's npm_config_store_dir (/var/cache/ci/pnpm) and their
           # installs raced one store (ERR_PNPM_ENOENT copyfile / READ_FROM_STORE,
           # 2026-09-25/26). Export both spellings pnpm actually reads.
-          echo "npm_config_store_dir=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
-          echo "pnpm_config_store_dir=$RUNNER_TEMP/pnpm-store" >> "$GITHUB_ENV"
+          # CI_PNPM_STORE_DIR is set only on a Forgejo slot, to that slot's own persistent store (infra ansible/roles/github-runners README
+          # "Slot stores"): one job at a time writes it, so it cannot race, and a warm slot reuses packages instead of fetching them. Unset
+          # (GitHub-hosted and GitHub self-hosted runners, where concurrent jobs share a host) the store stays per job, as before.
+          store="${CI_PNPM_STORE_DIR:-$RUNNER_TEMP/pnpm-store}"
+          case "$store" in
+            "$RUNNER_TEMP"/* | /var/cache/ci/slot/pnpm-store) ;;
+            *) echo "::error::CI_PNPM_STORE_DIR must be the slot store or under RUNNER_TEMP; got '$store'"; exit 1 ;;
+          esac
+          echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
+          echo "pnpm_config_store_dir=$store" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v5
         with:
@@ -881,7 +897,16 @@ jobs:
           # One fresh vulnerability DB for this job, pulled once and read by every scan below. Never the Actions
           # cache: a restored copy went stale on the self-hosted fleet and grype aborted on its max-age check
           # (invoice-portal run 32390381477, forge-7, 2026-08-20).
-          export GRYPE_DB_CACHE_DIR="$work/db" GRYPE_CHECK_FOR_APP_UPDATE=false
+          # CI_GRYPE_DB_DIR is set only on a Forgejo slot, to that slot's own persistent directory (infra github-runners README "Slot
+          # stores"): the database stays there between jobs, so `grype db update` below only reads the listing and downloads when the
+          # mirror has a newer one. Unset, the database is the job's own, fetched every time.
+          db_dir="$work/db"
+          if [ -n "${CI_GRYPE_DB_DIR:-}" ]; then
+            [ "$CI_GRYPE_DB_DIR" = /var/cache/ci/slot/grype-db ] || fail "CI_GRYPE_DB_DIR must be the slot's grype directory; got '$CI_GRYPE_DB_DIR'"
+            mkdir -p "$CI_GRYPE_DB_DIR" && [ -w "$CI_GRYPE_DB_DIR" ] && db_dir="$CI_GRYPE_DB_DIR" \
+              || echo "::warning::grype: $CI_GRYPE_DB_DIR is not writable; using a per-job database directory"
+          fi
+          export GRYPE_DB_CACHE_DIR="$db_dir" GRYPE_CHECK_FOR_APP_UPDATE=false
           # The database comes from the estate's mirror (infra ansible/roles/grype-db-mirror, refreshed hourly), not from upstream: the
           # upstream pull was 53 s of a 57 s job. grype keeps validating the database's age and refuses one built more than 48 hours
           # ago; the listing is read first so a stale mirror fails with its own name instead of grype's. A runner that cannot reach the
