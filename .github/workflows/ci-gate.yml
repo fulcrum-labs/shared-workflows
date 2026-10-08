@@ -977,8 +977,18 @@ jobs:
             || fail "the merge base $base could not be checked out, so it cannot be scanned; failing closed"
 
           echo "grype: a pull request is judged on what it introduces; its head is compared with the merge base $base."
-          scan . head table || fail "the head could not be scanned"
-          scan "$work/base" base "table=$work/base.table" \
+          # The two scans read the same database and share nothing else (each writes its own report and log), so they run
+          # together: on a warm slot a scan is the whole of the job, and serial they cost twice the slower one.
+          scan . head table &
+          head_pid=$!
+          scan "$work/base" base "table=$work/base.table" &
+          base_pid=$!
+          head_status=0
+          base_status=0
+          wait "$head_pid" || head_status=$?
+          wait "$base_pid" || base_status=$?
+          [ "$head_status" = 0 ] || fail "the head could not be scanned"
+          [ "$base_status" = 0 ] \
             || fail "the merge base $base could not be scanned, so the pull request cannot be compared with its base; failing closed"
 
           jq -rn --arg cutoff "$cutoff" --slurpfile head "$work/head.json" --slurpfile base "$work/base.json" "$defs"'
