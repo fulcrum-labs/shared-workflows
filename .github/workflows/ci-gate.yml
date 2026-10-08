@@ -712,13 +712,16 @@ jobs:
         run: |
           # The ci-executor image carries semgrep at this pin, installed from a hash-pinned closure (infra Containerfile); it is used when
           # the version found is exactly this pin, otherwise the pip install below runs.
-          if [ "$(semgrep --version 2>/dev/null | head -n 1 || true)" = "1.170.0" ]; then
-            echo "semgrep 1.170.0 is on PATH (the executor image's pinned copy); nothing to install."
+          if [ "$(semgrep --version 2>/dev/null | head -n 1 || true)" = "1.180.0" ]; then
+            echo "semgrep 1.180.0 is on PATH (the executor image's pinned copy); nothing to install."
             exit 0
           fi
           # Both runner fleets use PEP 668 externally-managed Python. --user
           # confines the pinned package to the ephemeral PYTHONUSERBASE.
-          python3 -m pip install --user --break-system-packages --quiet semgrep==1.170.0
+          # 1.180.0, not 1.170.0: 1.170.0 pins mcp==1.23.3, which grype reports at high severity (GHSA-jpw9-pfvf-9f58 and two more) in
+          # the executor image's hash-pinned closure; 1.180.0's closure (mcp 1.29.0, pyjwt 2.15.1) has no finding at or above high, and the
+          # same rule packs found the same on a site checkout (0 findings, 967 files, both versions; 2026-10-08).
+          python3 -m pip install --user --break-system-packages --quiet semgrep==1.180.0
           echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
 
       - name: Semgrep scan
