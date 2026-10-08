@@ -25,6 +25,10 @@ on:
         type: string
         default: ''
         description: 'Optional. Namespace used to isolate this repository family in the shared cache.'
+      grype-db-mirror-url:
+        type: string
+        default: 'https://colossus-objectstore.tail76e82f.ts.net:9000/grype-db'
+        description: 'Optional. Base URL of the mirror of grype''s vulnerability database (infra ansible/roles/grype-db-mirror: <url>/v6/latest.json). A mirror older than 48 hours fails the grype job; one this runner cannot reach falls back to the upstream pull with a warning. Empty: always upstream.'
       vitest-max-workers:
         type: string
         default: '2'
@@ -554,9 +558,15 @@ jobs:
           persist-credentials: false
 
       - name: Install gitleaks
-        # Its own directory under RUNNER_TEMP, and no move: on a runner whose RUNNER_TEMP is /tmp (Forgejo's),
-        # extracting to /tmp and then moving onto "$RUNNER_TEMP/gitleaks" moved the file onto itself and failed.
+        # The ci-executor image carries the pinned release (infra Containerfile, checksummed there); it is used when the version found is
+        # exactly this pin, otherwise the verified download below runs. Its own directory under RUNNER_TEMP, and no move: on a runner
+        # whose RUNNER_TEMP is /tmp (Forgejo's), extracting to /tmp and then moving onto "$RUNNER_TEMP/gitleaks" moved the file onto
+        # itself and failed.
         run: |
+          if [ "$(gitleaks version 2>/dev/null || true)" = "8.21.2" ]; then
+            echo "gitleaks 8.21.2 is on PATH (the executor image's pinned copy); nothing to download."
+            exit 0
+          fi
           dir="$(mktemp -d "$RUNNER_TEMP/gitleaks.XXXXXX")"
           # sha256 of gitleaks_8.21.2_linux_x64.tar.gz as listed in the v8.21.2 release's own gitleaks_8.21.2_checksums.txt
           # (and equal to the tarball downloaded from that release); bump it together with the version in the URL.
@@ -682,7 +692,14 @@ jobs:
       - name: Install semgrep
         env:
           PYTHONUSERBASE: ${{ runner.temp }}/semgrep-user
+          SEMGREP_ENABLE_VERSION_CHECK: '0'
         run: |
+          # The ci-executor image carries semgrep at this pin, installed from a hash-pinned closure (infra Containerfile); it is used when
+          # the version found is exactly this pin, otherwise the pip install below runs.
+          if [ "$(semgrep --version 2>/dev/null | head -n 1 || true)" = "1.170.0" ]; then
+            echo "semgrep 1.170.0 is on PATH (the executor image's pinned copy); nothing to install."
+            exit 0
+          fi
           # Both runner fleets use PEP 668 externally-managed Python. --user
           # confines the pinned package to the ephemeral PYTHONUSERBASE.
           python3 -m pip install --user --break-system-packages --quiet semgrep==1.170.0
@@ -695,6 +712,7 @@ jobs:
           # slots io_uring_queue_init fails with ENOMEM (memlock pressure) and the job dies with
           # "Cannot allocate memory" before scanning anything. The POSIX backend needs no io_uring.
           EIO_BACKEND: posix
+          SEMGREP_ENABLE_VERSION_CHECK: '0'
         run: |
           # platform-foundations#528 (platform-request): semgrep-core (OCaml/Eio) opens
           # one io_uring ring per parallel domain in Uring.create via
@@ -759,10 +777,14 @@ jobs:
           persist-credentials: false
 
       - name: Install grype
-        # The pinned grype release itself, verified before it is unpacked, like gitleaks above. The job ran this
-        # same version through anchore/scan-action@v7.4.0 until a pull request needed two scans over one DB, which
-        # the action (one install and one DB check per call) cannot share.
+        # The pinned grype release itself, verified before it is unpacked, like gitleaks above; the ci-executor image carries the same pin
+        # and it is used when the version found is exactly this one. The job ran this same version through anchore/scan-action@v7.4.0
+        # until a pull request needed two scans over one DB, which the action (one install and one DB check per call) cannot share.
         run: |
+          if grype version 2>/dev/null | grep -Eq '^Version:[[:space:]]+0\.117\.0$'; then
+            echo "grype 0.117.0 is on PATH (the executor image's pinned copy); nothing to download."
+            exit 0
+          fi
           dir="$(mktemp -d "$RUNNER_TEMP/grype.XXXXXX")"
           # sha256 of grype_0.117.0_linux_amd64.tar.gz as listed in the v0.117.0 release's own grype_0.117.0_checksums.txt
           # (and equal to the tarball downloaded from that release); bump it together with the version in the URL.
@@ -805,6 +827,7 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_AFTER: ${{ github.event.after }}
           BASE_REF: ${{ github.base_ref }}
+          GRYPE_DB_MIRROR_URL: ${{ inputs.grype-db-mirror-url }}
         run: |
           set -euo pipefail
           cutoff=high
@@ -859,6 +882,24 @@ jobs:
           # cache: a restored copy went stale on the self-hosted fleet and grype aborted on its max-age check
           # (invoice-portal run 32390381477, forge-7, 2026-08-20).
           export GRYPE_DB_CACHE_DIR="$work/db" GRYPE_CHECK_FOR_APP_UPDATE=false
+          # The database comes from the estate's mirror (infra ansible/roles/grype-db-mirror, refreshed hourly), not from upstream: the
+          # upstream pull was 53 s of a 57 s job. grype keeps validating the database's age and refuses one built more than 48 hours
+          # ago; the listing is read first so a stale mirror fails with its own name instead of grype's. A runner that cannot reach the
+          # mirror (another pool, a GitHub-hosted runner) pulls from upstream as before, and says so.
+          mirror="${GRYPE_DB_MIRROR_URL:-}"; mirror="${mirror%/}"
+          if [ -n "$mirror" ]; then
+            if listing="$(curl -fsS --max-time 10 "$mirror/v6/latest.json" 2> "$work/mirror.err")"; then
+              built="$(printf '%s' "$listing" | jq -er '.built')" || fail "the grype database mirror's listing at $mirror has no built time"
+              built_at="$(date -u -d "$built" +%s)" || fail "the grype database mirror's built time '$built' is not a date"
+              age=$(( $(date -u +%s) - built_at ))
+              [ "$age" -le $(( 48 * 3600 )) ] \
+                || fail "the grype database mirror at $mirror was built $built, more than 48 hours ago: its hourly refresh is stale (infra ansible/roles/grype-db-mirror README)"
+              export GRYPE_DB_UPDATE_URL="$mirror" GRYPE_DB_VALIDATE_AGE=true GRYPE_DB_MAX_ALLOWED_BUILT_AGE=48h
+              echo "grype: vulnerability database from the mirror $mirror (built $built, $(( age / 3600 )) h old)."
+            else
+              echo "::warning::grype: the database mirror $mirror is not reachable from this runner ($(head -c 200 "$work/mirror.err" | tr '\n' ' ')); pulling the database from upstream instead"
+            fi
+          fi
           grype db update
           export GRYPE_DB_AUTO_UPDATE=false
           grype db status
