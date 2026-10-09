@@ -903,34 +903,58 @@ jobs:
           # CI_GRYPE_DB_DIR is set only on a Forgejo slot, to that slot's own persistent directory (infra github-runners README "Slot
           # stores"): the database stays there between jobs, so `grype db update` below only reads the listing and downloads when the
           # mirror has a newer one. Unset, the database is the job's own, fetched every time.
-          db_dir="$work/db"
-          if [ -n "${CI_GRYPE_DB_DIR:-}" ]; then
-            [ "$CI_GRYPE_DB_DIR" = /var/cache/ci/slot/grype-db ] || fail "CI_GRYPE_DB_DIR must be the slot's grype directory; got '$CI_GRYPE_DB_DIR'"
-            mkdir -p "$CI_GRYPE_DB_DIR" && [ -w "$CI_GRYPE_DB_DIR" ] && db_dir="$CI_GRYPE_DB_DIR" \
-              || echo "::warning::grype: $CI_GRYPE_DB_DIR is not writable; using a per-job database directory"
-          fi
-          export GRYPE_DB_CACHE_DIR="$db_dir" GRYPE_CHECK_FOR_APP_UPDATE=false
-          # The database comes from the estate's mirror (infra ansible/roles/grype-db-mirror, refreshed hourly), not from upstream: the
-          # upstream pull was 53 s of a 57 s job. grype keeps validating the database's age and refuses one built more than 48 hours
-          # ago; the listing is read first so a stale mirror fails with its own name instead of grype's. A runner that cannot reach the
-          # mirror (another pool, a GitHub-hosted runner) pulls from upstream as before, and says so.
-          mirror="${GRYPE_DB_MIRROR_URL:-}"; mirror="${mirror%/}"
-          if [ -n "$mirror" ]; then
-            if listing="$(curl -fsS --max-time 10 "$mirror/v6/latest.json" 2> "$work/mirror.err")"; then
-              built="$(printf '%s' "$listing" | jq -er '.built')" || fail "the grype database mirror's listing at $mirror has no built time"
-              built_at="$(date -u -d "$built" +%s)" || fail "the grype database mirror's built time '$built' is not a date"
-              age=$(( $(date -u +%s) - built_at ))
-              [ "$age" -le $(( 48 * 3600 )) ] \
-                || fail "the grype database mirror at $mirror was built $built, more than 48 hours ago: its hourly refresh is stale (infra ansible/roles/grype-db-mirror README)"
-              export GRYPE_DB_UPDATE_URL="$mirror" GRYPE_DB_VALIDATE_AGE=true GRYPE_DB_MAX_ALLOWED_BUILT_AGE=48h
-              echo "grype: vulnerability database from the mirror $mirror (built $built, $(( age / 3600 )) h old)."
+          # CI_GRYPE_SHARED_DB_DIR is set only on a Forgejo runner host that keeps ONE read-only copy of the database in RAM for every job
+          # (infra github-runners README "Shared grype database"; forgejo-grype-shared.timer imports it from the mirror every 15 minutes).
+          # Opened from the slot's directory on the guest's ZFS grype needed 14 s to load the 3.2 GB database and 7.7 s for `db status`;
+          # from the tmpfs copy 1.4 s and 0.7 s. grype opens it read-only and never updates it; its own age rule (48 hours) still applies, and
+          # a copy that has gone stale fails the job by name. Where the variable is unset (GitHub runners), or the host has not published a
+          # copy yet (the first minutes after a reboot), the slot's own copy and the mirror below are used, as before.
+          shared_db=""
+          if [ -n "${CI_GRYPE_SHARED_DB_DIR:-}" ]; then
+            [ "$CI_GRYPE_SHARED_DB_DIR" = /var/cache/ci/grype-shared ] || fail "CI_GRYPE_SHARED_DB_DIR must be the host's shared grype directory; got '$CI_GRYPE_SHARED_DB_DIR'"
+            if [ -f "$CI_GRYPE_SHARED_DB_DIR/current/6/vulnerability.db" ]; then
+              shared_db="$CI_GRYPE_SHARED_DB_DIR/current"
             else
-              echo "::warning::grype: the database mirror $mirror is not reachable from this runner ($(head -c 200 "$work/mirror.err" | tr '\n' ' ')); pulling the database from upstream instead"
+              echo "::warning::grype: no shared database at $CI_GRYPE_SHARED_DB_DIR/current yet (the host's refresh has not published one); using the slot's own copy"
             fi
           fi
-          grype db update
-          export GRYPE_DB_AUTO_UPDATE=false
-          grype db status
+          if [ -n "$shared_db" ]; then
+            export GRYPE_DB_CACHE_DIR="$shared_db" GRYPE_CHECK_FOR_APP_UPDATE=false GRYPE_DB_AUTO_UPDATE=false
+            export GRYPE_DB_VALIDATE_AGE=true GRYPE_DB_MAX_ALLOWED_BUILT_AGE=48h
+            grype db status > "$work/db-status.txt" 2>&1 \
+              || { cat "$work/db-status.txt" >&2; fail "the host's shared grype database is older than 48 hours or invalid: its refresh (forgejo-grype-shared.timer on the runner host, infra github-runners README \"Shared grype database\") is failing"; }
+            cat "$work/db-status.txt"
+            echo "grype: vulnerability database from the host's shared copy $shared_db."
+          else
+            db_dir="$work/db"
+            if [ -n "${CI_GRYPE_DB_DIR:-}" ]; then
+              [ "$CI_GRYPE_DB_DIR" = /var/cache/ci/slot/grype-db ] || fail "CI_GRYPE_DB_DIR must be the slot's grype directory; got '$CI_GRYPE_DB_DIR'"
+              mkdir -p "$CI_GRYPE_DB_DIR" && [ -w "$CI_GRYPE_DB_DIR" ] && db_dir="$CI_GRYPE_DB_DIR" \
+                || echo "::warning::grype: $CI_GRYPE_DB_DIR is not writable; using a per-job database directory"
+            fi
+            export GRYPE_DB_CACHE_DIR="$db_dir" GRYPE_CHECK_FOR_APP_UPDATE=false
+            # The database comes from the estate's mirror (infra ansible/roles/grype-db-mirror, refreshed hourly), not from upstream: the
+            # upstream pull was 53 s of a 57 s job. grype keeps validating the database's age and refuses one built more than 48 hours
+            # ago; the listing is read first so a stale mirror fails with its own name instead of grype's. A runner that cannot reach the
+            # mirror (another pool, a GitHub-hosted runner) pulls from upstream as before, and says so.
+            mirror="${GRYPE_DB_MIRROR_URL:-}"; mirror="${mirror%/}"
+            if [ -n "$mirror" ]; then
+              if listing="$(curl -fsS --max-time 10 "$mirror/v6/latest.json" 2> "$work/mirror.err")"; then
+                built="$(printf '%s' "$listing" | jq -er '.built')" || fail "the grype database mirror's listing at $mirror has no built time"
+                built_at="$(date -u -d "$built" +%s)" || fail "the grype database mirror's built time '$built' is not a date"
+                age=$(( $(date -u +%s) - built_at ))
+                [ "$age" -le $(( 48 * 3600 )) ] \
+                  || fail "the grype database mirror at $mirror was built $built, more than 48 hours ago: its hourly refresh is stale (infra ansible/roles/grype-db-mirror README)"
+                export GRYPE_DB_UPDATE_URL="$mirror" GRYPE_DB_VALIDATE_AGE=true GRYPE_DB_MAX_ALLOWED_BUILT_AGE=48h
+                echo "grype: vulnerability database from the mirror $mirror (built $built, $(( age / 3600 )) h old)."
+              else
+                echo "::warning::grype: the database mirror $mirror is not reachable from this runner ($(head -c 200 "$work/mirror.err" | tr '\n' ' ')); pulling the database from upstream instead"
+              fi
+            fi
+            grype db update
+            export GRYPE_DB_AUTO_UPDATE=false
+            grype db status
+          fi
 
           if [ "$path" = strict ]; then
             echo "grype: a $event event is judged on the whole tree: any finding at or above $cutoff fails the job."
