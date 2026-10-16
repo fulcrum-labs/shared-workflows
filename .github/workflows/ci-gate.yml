@@ -7,6 +7,10 @@ on:
         type: string
         default: '["self-hosted","Linux","X64"]'
         description: 'Optional. The runner labels every gate job asks for, as a JSON array. The default is the generic set; the website repositories pass ["site"] so their jobs take the website floor first (website-four-minute-delivery, 2026-10-10).'
+      scan-runs-on:
+        type: string
+        default: ''
+        description: 'Optional. The runner labels the gitleaks and grype scans ask for, as a JSON array; empty means runs-on. The Forgejo copies pass ["fulcrum-light"], the light lane (platform-foundations config/runner-fleet.yaml, 2026-10-16): a scan runs for 6-18 s but waited a median 15-19 min behind builds on the shared labels.'
       node-version:
         type: string
         default: '24.18.0'
@@ -569,7 +573,7 @@ jobs:
 
   gitleaks:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
@@ -785,7 +789,7 @@ jobs:
 
   grype:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}
     # One fresh-DB pull, then one scan (two on a pull request, which also checks
     # out the whole history). 15m was set for a single scan; a timeout is a guard,
     # not a budget.
