@@ -57,23 +57,27 @@ test('cache eligibility is an event allowlist resolved in a single step', () => 
   assert.ok(gateStart > enforcementStart, 'the CI gate must run after eligibility + enforcement');
 
   const eligibilityStep = workflow.slice(eligibilityStart, enforcementStart);
+  const eligibilityScript = eligibilityStep.slice(eligibilityStep.indexOf('run: |'));
+  const decision = eligibilityScript.slice(eligibilityScript.indexOf('eligible=false'));
 
   // The guard must be an allowlist: default false, explicit trusted events,
   // and same-repository comparison for pull_request. A denylist here is the
   // exact bug this test exists to prevent (pull_request_target leakage).
   assert.match(eligibilityStep, /eligible=false/);
-  assert.match(eligibilityStep, /case "\$GITHUB_EVENT_NAME" in/);
-  assert.match(eligibilityStep, /push\|merge_group\)/);
+  assert.match(eligibilityScript, /pr_checkout "Turbo cache" \|\| exit 1/);
+  assert.match(decision, /case "\$kind" in/);
+  assert.match(decision, /case "\$EVENT_NAME" in/);
+  assert.match(decision, /push \| merge_group\) eligible=true/);
   assert.match(eligibilityStep, /\[ "\$HEAD_REPO" = "\$GITHUB_REPOSITORY" \]/);
   assert.equal(
-    /pull_request_target\s*\)/.test(eligibilityStep),
+    /pull_request_target\s*\)/.test(decision),
     false,
     'pull_request_target must never be a cache-eligible case label',
   );
   assert.equal(
-    /!=/.test(eligibilityStep),
+    /!=/.test(decision.replace('if [ "$TURBO_CACHE_ENABLED" != "true" ]; then', '')),
     false,
-    'the eligibility guard must not contain negated (denylist) comparisons',
+    'event eligibility must not be a negated denylist; the disabled-cache refusal is a separate input guard',
   );
 });
 
@@ -131,20 +135,51 @@ test('remote cache network timeouts are bounded', () => {
   assert.match(workflow, /^\s+TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: '10'$/m);
 });
 
-test('pnpm cache discovery uses a store owned by the current runner job', () => {
+test('pnpm cache discovery uses a store owned by the job or declared runner slot', () => {
   const guardStart = workflow.indexOf('      - name: Guard pnpm runner isolation');
   const setupNodeStart = workflow.indexOf('      - uses: actions/setup-node@v5', guardStart);
   const guardStep = workflow.slice(guardStart, setupNodeStart);
 
   assert.ok(guardStart >= 0 && setupNodeStart > guardStart, 'pnpm isolation guard must precede setup-node');
+  assert.match(guardStep, /store="\$\{CI_PNPM_STORE_DIR:-\$RUNNER_TEMP\/pnpm-store\}"/);
+  assert.match(guardStep, /"\$RUNNER_TEMP"\/\* \| \/var\/cache\/ci\/slot\/pnpm-store\) ;;/);
+  assert.match(guardStep, /CI_PNPM_STORE_DIR must be the slot store or under RUNNER_TEMP/);
   assert.match(
     guardStep,
-    /echo "npm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
+    /echo "npm_config_store_dir=\$store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$store" >> "\$GITHUB_ENV"/,
   );
+  // Execute only the store contract, leaving the unrelated home cleanup out
+  // of this fixture. Both pnpm versions must use the same isolated location.
+  const script = guardStep.slice(guardStep.indexOf('          store="')).split('\n').map(line => line.replace(/^ {10}/, '')).join('\n');
+  const runnerTemp = mkdtempSync(join(tmpdir(), 'pnpm-store-guard-'));
+  for (const store of ['', `${runnerTemp}/job-store`, '/var/cache/ci/slot/pnpm-store']) {
+    const exported = join(runnerTemp, `exported-${store.length}`);
+    writeFileSync(exported, '');
+    const result = spawnSync('bash', ['-ec', script], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, RUNNER_TEMP: runnerTemp, CI_PNPM_STORE_DIR: store, GITHUB_ENV: exported },
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const expected = store || `${runnerTemp}/pnpm-store`;
+    assert.equal(readFileSync(exported, 'utf8'), `npm_config_store_dir=${expected}\npnpm_config_store_dir=${expected}\n`);
+  }
+  for (const store of ['/var/cache/ci/pnpm', '/var/cache/ci/slot/pnpm-store-other']) {
+    const exported = join(runnerTemp, 'refused-exports');
+    writeFileSync(exported, '');
+    const result = spawnSync('bash', ['-ec', script], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, RUNNER_TEMP: runnerTemp, CI_PNPM_STORE_DIR: store, GITHUB_ENV: exported },
+    });
+    assert.notEqual(result.status, 0, `${store}: a shared or lookalike store must fail`);
+    assert.match(result.stdout, /CI_PNPM_STORE_DIR must be the slot store or under RUNNER_TEMP/);
+    assert.equal(readFileSync(exported, 'utf8'), '', 'a refused store must not be exported');
+  }
 });
 
 test('non-container scanner jobs use the self-hosted fleet safely', () => {
   const jobNames = ['docs-lint', 'gitleaks', 'grype'];
+  assert.match(workflow, /runs-on:\n        type: string\n        default: '\["self-hosted","Linux","X64"\]'/);
+  assert.match(workflow, /scan-runs-on:\n        type: string\n        default: ''/);
   const jobStarts = new Map(
     [...workflow.matchAll(/^  ([a-z][a-z0-9-]+):$/gm)]
       .map(match => [match[1], match.index]),
@@ -155,7 +190,10 @@ test('non-container scanner jobs use the self-hosted fleet safely', () => {
     assert.notEqual(start, undefined, `${jobName} job must exist`);
     const nextStart = [...jobStarts.values()].find(index => index > start) ?? workflow.length;
     const job = workflow.slice(start, nextStart);
-    assert.match(job, /^    runs-on: \[self-hosted, Linux, X64\]$/m, `${jobName} must be self-hosted`);
+    const expected = jobName === 'docs-lint'
+      ? '    runs-on: ${{ fromJSON(inputs.runs-on) }}'
+      : "    runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}";
+    assert.ok(job.split('\n').includes(expected), `${jobName} must use its JSON runner input and declared scan override`);
     assert.match(job, /break-glass: swap runs-on back to ubuntu-24\.04/);
   }
 
@@ -178,7 +216,7 @@ test('semgrep uses a pinned ephemeral pip install on the self-hosted fleet', () 
   const semgrep = workflow.slice(semgrepStart, grypeStart);
 
   assert.ok(semgrepStart >= 0 && grypeStart > semgrepStart, 'semgrep job must exist');
-  assert.match(semgrep, /^    runs-on: \[self-hosted, Linux, X64\]$/m);
+  assert.match(semgrep, /^    runs-on: \$\{\{ fromJSON\(inputs\.runs-on\) \}\}$/m);
   assert.match(semgrep, /break-glass: swap runs-on back to ubuntu-24\.04/);
   assert.equal(semgrep.includes('container:'), false, 'semgrep must not require Docker');
   assert.equal(semgrep.includes('returntocorp/semgrep'), false, 'legacy container image must be removed');
@@ -189,7 +227,7 @@ test('semgrep uses a pinned ephemeral pip install on the self-hosted fleet', () 
   );
   assert.match(
     semgrep,
-    /python3 -m pip install --user --break-system-packages --quiet semgrep==1\.170\.0/,
+    /python3 -m pip install --user --break-system-packages --quiet semgrep==1\.180\.0/,
   );
   assert.match(semgrep, /echo "\$PYTHONUSERBASE\/bin" >> "\$GITHUB_PATH"/);
   assert.equal(semgrep.includes('sudo '), false, 'semgrep install must not require privileged mutation');
@@ -379,7 +417,7 @@ test('gitleaks scans the commits of the event, not every branch of the checkout'
   const step = workflow.slice(start, workflow.indexOf('\n  semgrep:', start))
   const run = step.slice(step.indexOf('run: |'))
   assert.doesNotMatch(run, /\$\{\{/, 'no ${{ }} expression inside the scan script (run-shell-injection)')
-  for (const name of ['EVENT_NAME', 'PR_BASE', 'PR_HEAD', 'MG_BASE', 'MG_HEAD', 'PUSHED_SHA']) {
+  for (const name of ['EVENT_NAME', 'PR_BASE', 'PR_HEAD', 'PUSH_AFTER', 'MG_BASE', 'MG_HEAD', 'PUSHED_SHA']) {
     assert.match(step, new RegExp(`${name}: \\$\\{\\{ github\\.`), `${name} is passed through env`)
   }
 
@@ -399,16 +437,27 @@ test('gitleaks scans the commits of the event, not every branch of the checkout'
   const runScan = (event, vars) => spawnSync('bash', ['-c', script], {
     cwd: repo,
     encoding: 'utf8',
-    env: { PATH: `${dir}:${process.env.PATH}`, EVENT_NAME: event, ...vars },
+    env: { PATH: `${dir}:${process.env.PATH}`, EVENT_NAME: event, PR_BASE: '', PR_HEAD: '', PUSH_AFTER: '', MG_BASE: '', MG_HEAD: '', PUSHED_SHA: two, ...vars },
   })
-  const scan = (event, vars = { PR_BASE: one, PR_HEAD: two, MG_BASE: one, MG_HEAD: two, PUSHED_SHA: two }) => runScan(event, vars).stdout.trim()
-  const common = 'detect --source . --no-banner --redact --verbose'
-  assert.equal(scan('pull_request'), `ARGS: ${common} --log-opts=${one}..${two}`)
-  assert.equal(scan('pull_request_target'), `ARGS: ${common} --log-opts=${one}..${two}`)
-  assert.equal(scan('merge_group'), `ARGS: ${common} --log-opts=${one}..${two}`)
-  assert.equal(scan('push'), `ARGS: ${common} --log-opts=${two}`)
-  assert.equal(scan('schedule'), `ARGS: ${common}`, 'a scheduled run still scans every branch')
-  assert.equal(scan('workflow_dispatch'), `ARGS: ${common}`)
+  const scan = (event, vars, payload, scope, logOpts = '') => {
+    const result = runScan(event, vars);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const lines = result.stdout.trim().split('\n');
+    assert.equal(lines.length, 2, 'the scope diagnostic and scanner argv must both be retained');
+    assert.ok(lines[0].startsWith(`gitleaks: event ${event}, pull_request payload ${payload}, scanning ${scope}`), lines[0]);
+    assert.equal(lines[1], `ARGS: detect --source . --no-banner --redact --verbose${logOpts ? ` --log-opts=${logOpts}` : ''}`);
+  };
+  const pr = { PR_BASE: one, PR_HEAD: two };
+  scan('pull_request', pr, 'present', "the pull request's commits", `${one}..${two}`);
+  scan('workflow_call', pr, 'present', "the pull request's commits", `${one}..${two}`);
+  git('checkout', '-q', one); // pull_request_target checks out the base.
+  scan('pull_request_target', pr, 'present', "the pull request's commits", `${one}..${two}`);
+  git('checkout', '-q', two);
+  scan('merge_group', { MG_BASE: one, MG_HEAD: two }, 'absent', "the merge group's commits", `${one}..${two}`);
+  scan('push', { PUSH_AFTER: two }, 'absent', "the pushed commit's history", two);
+  scan('workflow_call', { PUSH_AFTER: two }, 'absent', "the pushed commit's history", two);
+  scan('schedule', {}, 'absent', 'every branch');
+  scan('workflow_dispatch', {}, 'absent', 'every branch');
 })
 
 test('gitleaks fails closed on a scan range it cannot read: gitleaks itself exits 0 on a missing commit', () => {
@@ -427,17 +476,17 @@ test('gitleaks fails closed on a scan range it cannot read: gitleaks itself exit
   const cases = [
     ['a missing head', { EVENT_NAME: 'pull_request', PR_BASE: sha, PR_HEAD: missing }],
     ['a missing base', { EVENT_NAME: 'pull_request_target', PR_BASE: missing, PR_HEAD: sha }],
-    ['an empty base', { EVENT_NAME: 'pull_request', PR_BASE: '', PR_HEAD: sha }],
-    ['a branch name for a SHA', { EVENT_NAME: 'pull_request', PR_BASE: 'main', PR_HEAD: sha }],
+    ['an empty base', { EVENT_NAME: 'pull_request', PR_BASE: '', PR_HEAD: sha }, /gitleaks: event pull_request: the pull request's base '' is not a commit SHA.*failing closed/],
+    ['a branch name for a SHA', { EVENT_NAME: 'pull_request', PR_BASE: 'main', PR_HEAD: sha }, /gitleaks: event pull_request: the pull request's base 'main' is not a commit SHA.*failing closed/],
     ['a missing merge-group head', { EVENT_NAME: 'merge_group', MG_BASE: sha, MG_HEAD: missing }],
-    ['a missing pushed commit', { EVENT_NAME: 'push', PUSHED_SHA: missing }],
-    ['an empty pushed commit', { EVENT_NAME: 'push', PUSHED_SHA: '' }],
+    ['a missing pushed commit', { EVENT_NAME: 'push', PUSH_AFTER: missing, PUSHED_SHA: missing }],
+    ['an empty pushed commit', { EVENT_NAME: 'push', PUSH_AFTER: sha, PUSHED_SHA: '' }],
   ]
-  for (const [why, vars] of cases) {
+  for (const [why, vars, diagnostic = /gitleaks scan range/] of cases) {
     const result = run(vars)
     assert.notEqual(result.status, 0, `${why}: the job must fail`)
     assert.doesNotMatch(result.stdout, /GITLEAKS RAN/, `${why}: gitleaks must not run on a range it cannot read`)
-    assert.match(result.stderr, /gitleaks scan range/, why)
+    assert.match(result.stderr, diagnostic, why)
   }
   // The same step still runs for a readable range.
   const good = run({ EVENT_NAME: 'pull_request', PR_BASE: sha, PR_HEAD: sha })
