@@ -144,6 +144,83 @@ jobs:
                       and stop >= start and run.get("duration", 0) >= 0)
 
 
+          def draft_execution(read, root, run, required):
+              # Forgejo 17 returns an array of current jobs; IDs survive reruns,
+              # while attempt and task_id change. Bind detail/steps to both.
+              jobs = pages(read, f"{root}/actions/runs/{run['id']}/jobs")
+              snapshot = json.dumps(jobs, sort_keys=True)
+              by_name = {}
+              ids = set()
+              for job in jobs:
+                  if (type(job["id"]) is not int or job["id"] <= 0 or job["id"] in ids
+                          or type(job["run_id"]) is not int or job["run_id"] != run["id"]):
+                      raise ValueError("job identity")
+                  ids.add(job["id"])
+                  if job["name"] in required:
+                      if job["name"] in by_name:
+                          raise ValueError("duplicate job")
+                      by_name[job["name"]] = job
+              if set(by_name) != required:
+                  raise ValueError("missing job")
+              for job in by_name.values():
+                  if (type(job["attempt"]) is not int or job["attempt"] <= 0
+                          or type(job["task_id"]) is not int or job["task_id"] < 0):
+                      raise ValueError("job attempt")
+              # Only positive skipped/task-less evidence may be ignored in favour
+              # of an earlier real verdict. Unknown or partially executed CI blocks.
+              if all(j["status"] == "skipped" and j["task_id"] == 0 for j in by_name.values()):
+                  return {}, snapshot
+              if not completed(run):
+                  raise ValueError("unfinished draft")
+              work = {
+                  "quality": "CI gate (typecheck + lint + test + build)",
+                  "gitleaks": "Gitleaks scan", "grype": "Grype vulnerability scan",
+                  "semgrep": "Semgrep scan", "docs-lint": "Docs convention lint",
+              }
+              run_url = urllib.parse.urlsplit(run["html_url"])
+              begin = datetime.datetime.fromisoformat(run["started"].replace("Z", "+00:00"))
+              end = datetime.datetime.fromisoformat(run["stopped"].replace("Z", "+00:00"))
+              paths = {}
+              for name, job in by_name.items():
+                  if job["status"] != "success" or job["task_id"] <= 0:
+                      raise ValueError("unexecuted job")
+                  target = urllib.parse.urlsplit(job["html_url"])
+                  if (target.scheme != "https" or target.netloc != run_url.netloc
+                          or target.query or target.fragment
+                          or not re.fullmatch(re.escape(run_url.path) + r"/jobs/[0-9]+/attempt/"
+                                              + str(job["attempt"]), target.path)):
+                      raise ValueError("job URL")
+                  detail = read(f"{root}/actions/jobs/{job['id']}")
+                  for key in ("id", "run_id", "attempt", "task_id", "name", "status", "html_url"):
+                      if type(detail[key]) is not type(job[key]) or detail[key] != job[key]:
+                          raise ValueError("job changed")
+                  steps = detail["steps"]
+                  if not isinstance(steps, list) or not 1 <= len(steps) <= 100:
+                      raise ValueError("steps")
+                  numbers = set()
+                  matches = []
+                  for step in steps:
+                      if (type(step["number"]) is not int or step["number"] < 0
+                              or step["number"] in numbers or not isinstance(step["name"], str)
+                              or not step["name"] or step["status"] not in
+                              {"success", "failure", "cancelled", "skipped"}):
+                          raise ValueError("step identity")
+                      numbers.add(step["number"])
+                      if step["name"] == work[name]:
+                          matches.append(step)
+                  if len(matches) != 1 or not completed(matches[0]):
+                      raise ValueError("work not executed")
+                  start = datetime.datetime.fromisoformat(matches[0]["started"].replace("Z", "+00:00"))
+                  stop = datetime.datetime.fromisoformat(matches[0]["stopped"].replace("Z", "+00:00"))
+                  if start.tzinfo is None or stop.tzinfo is None or not begin <= start <= stop <= end:
+                      raise ValueError("step times")
+                  path = target.path.rsplit("/attempt/", 1)[0]
+                  if path in paths.values():
+                      raise ValueError("duplicate job URL")
+                  paths[name] = path
+              return paths, snapshot
+
+
           def reusable(read, repository, run_id, docs_lint):
               root = "/repos/" + "/".join(urllib.parse.quote(p, safe="") for p in repository.split("/"))
               current = read(f"{root}/actions/runs/{run_id}")
@@ -159,6 +236,9 @@ jobs:
 
               query = urllib.parse.urlencode({"head_sha": head, "workflow_id": workflow})
               history = pages(read, f"{root}/actions/runs?{query}", "workflow_runs")
+              required = {"quality", "gitleaks", "grype", "semgrep"}
+              if docs_lint:
+                  required.add("docs-lint")
               candidates = []
               ids = set()
               for run in history:
@@ -171,22 +251,34 @@ jobs:
                       continue
                   if run["workflow_id"] != workflow or run["commit_sha"] != head:
                       raise ValueError("history filter")
-                  # A draft-skipped run is never a verdict. Do not mistake Forgejo's
-                  # success mapping for skipped jobs for evidence that the gate ran.
                   provenance(run, repository)
-                  if payload(run)["pull_request"]["draft"] is False:
-                      candidates.append(run)
-              if run_id not in ids or not candidates:
+                  candidates.append(run)
+              if run_id not in ids:
                   return False
-              prior = max(candidates, key=lambda run: run["id"])
+              prior = None
+              execution = None
+              for run in sorted(candidates, key=lambda run: run["id"], reverse=True):
+                  if payload(run)["pull_request"]["draft"] is False:
+                      prior = run
+                      break
+                  # A later failed/cancelled/incomplete Draft is a barrier too.
+                  if run["status"] not in {"success", "skipped"}:
+                      return False
+                  paths, snapshot = draft_execution(read, root, run, required)
+                  if not paths:
+                      if json.dumps(pages(read, f"{root}/actions/runs/{run['id']}/jobs"), sort_keys=True) != snapshot:
+                          return False
+                      continue
+                  prior = run
+                  execution = (paths, snapshot)
+                  break
+              if prior is None:
+                  return False
               # A later real failure/cancellation must not be hidden by older green CI.
               if provenance(prior, repository) != proof or not completed(prior):
                   return False
 
               statuses = pages(read, f"{root}/commits/{head}/statuses")
-              required = {"quality", "gitleaks", "grype", "semgrep"}
-              if docs_lint:
-                  required.add("docs-lint")
               latest = {}
               run_url = urllib.parse.urlsplit(prior["html_url"])
               current_url = urllib.parse.urlsplit(current["html_url"])
@@ -211,9 +303,14 @@ jobs:
                   prefix, job = context.rsplit(" / ", 1)
                   job = job.removesuffix(" (pull_request)")
                   if (status["status"] == "success"
-                          and status.get("description", "").startswith("Successful in ")):
+                          and status.get("description", "").startswith("Successful in ")
+                          and (execution is None or urllib.parse.urlsplit(urllib.parse.urljoin(
+                              prior["html_url"], status["target_url"])).path == execution[0].get(job))):
                       groups.setdefault(prefix, set()).add(job)
               if not any(required <= jobs for jobs in groups.values()):
+                  return False
+              if execution is not None and json.dumps(pages(
+                      read, f"{root}/actions/runs/{prior['id']}/jobs"), sort_keys=True) != execution[1]:
                   return False
 
               # Check the live PR and base branch last. The triggering payload is immutable;

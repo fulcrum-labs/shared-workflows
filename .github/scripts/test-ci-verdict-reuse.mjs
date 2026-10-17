@@ -66,6 +66,8 @@ def read(path):
         assert query["workflow_id"] == [str(data["current"]["workflow_id"])]
         return {"workflow_runs": data["history"][start:start+50],
                 "total_count": data.get("total", len(data["history"]))}
+    if url.path == root + "/actions/runs/109/jobs" and "skippedJobs" in data:
+        return data["skippedJobs"][start:start+50]
     if url.path.endswith("/statuses"):
         return data["statuses"][start:start+50]
     if url.path == root + "/pulls/42":
@@ -146,6 +148,11 @@ test('draft-skipped green never qualifies, but a draft event does not erase an e
   editPayload(data.history[1], p => { p.pull_request.draft = true; });
   assert.equal(evaluate(data).reuse, false);
   data.history.push(run(108));
+  // Positive skipped evidence, not a Draft flag standing in for unknown execution.
+  // The negative assertion above still has no execution/skip proof at all.
+  data.skippedJobs = ['quality', 'gitleaks', 'grype', 'semgrep'].map((name, i) => ({
+    id: 211361 + i, run_id: 109, attempt: 1, name, status: 'skipped', task_id: 0,
+  }));
   data.statuses = data.statuses.map(s => ({ ...s, target_url: s.target_url.replace('/runs/9/', '/runs/8/') }));
   assert.equal(evaluate(data).reuse, true);
 });
