@@ -57,7 +57,8 @@ permissions:
 # must not be evicted from the group's single pending slot by a newer main push.
 concurrency:
   group: ci-gate-${{ github.repository }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Metadata transitions keep an in-flight verdict; synchronize still cancels an older head.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event.action != 'edited' && github.event.action != 'ready_for_review' && github.event.action != 'converted_to_draft' }}
 
 jobs:
   quality:
@@ -67,12 +68,218 @@ jobs:
     # minutes three times with no failing test and was cancelled each time; a timeout is a guard, not a budget.
     timeout-minutes: 45
     steps:
+      # Reuse only the existing gate's complete success verdict at an immutable
+      # head/base pair. No new status, cache or credential is created. Unsupported
+      # APIs and missing evidence execute every normal gate step below.
+      - &prior-verdict
+        name: Reuse completed CI for unchanged head and base
+        id: prior-verdict
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          VERDICT_API: ${{ github.api_url }}
+          VERDICT_REPOSITORY: ${{ github.repository }}
+          VERDICT_RUN_ID: ${{ github.run_id }}
+          VERDICT_TOKEN: ${{ github.token }}
+          VERDICT_DOCS_LINT: ${{ inputs.docs-lint-enabled }}
+        run: |
+          python3 - <<'PRIOR_VERDICT'
+          import datetime
+          import json
+          import os
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+
+
+          def payload(run):
+              value = json.loads(run["event_payload"])
+              if not isinstance(value, dict):
+                  raise ValueError("payload")
+              return value
+
+
+          def provenance(run, repository):
+              event = payload(run)
+              pr = event["pull_request"]
+              head, base = pr["head"], pr["base"]
+              if (run["trigger_event"] != "pull_request"
+                      or run["repository"]["full_name"] != repository
+                      or run["is_fork_pull_request"] is not False
+                      or run["need_approval"] is not False
+                      or head["repo"]["full_name"] != repository
+                      or base["repo"]["full_name"] != repository
+                      or not re.fullmatch(r"[0-9a-f]{40}", head["sha"])
+                      or not re.fullmatch(r"[0-9a-f]{40}", base["sha"])
+                      or run["commit_sha"] != head["sha"]
+                      or type(pr["number"]) is not int or pr["number"] <= 0
+                      or not isinstance(base["ref"], str) or not base["ref"]
+                      or type(pr["draft"]) is not bool):
+                  raise ValueError("provenance")
+              return (pr["number"], head["sha"], base["sha"], base["ref"])
+
+
+          def pages(read, path, key=None):
+              entries = []
+              # A bounded, complete census: reaching the cap or an inconsistent response
+              # runs full CI, even if an earlier page happened to contain green statuses.
+              for page in range(1, 5):
+                  result = read(path + ("&" if "?" in path else "?") + f"limit=50&page={page}")
+                  batch = result[key] if key else result
+                  if not isinstance(batch, list) or len(batch) > 50:
+                      raise ValueError("page")
+                  entries.extend(batch)
+                  if len(batch) < 50:
+                      if key and result["total_count"] != len(entries):
+                          raise ValueError("incomplete history")
+                      return entries
+              raise ValueError("page bound")
+
+
+          def completed(run):
+              start = datetime.datetime.fromisoformat(run["started"].replace("Z", "+00:00"))
+              stop = datetime.datetime.fromisoformat(run["stopped"].replace("Z", "+00:00"))
+              return (run["status"] == "success" and start.timestamp() > 0
+                      and stop >= start and run.get("duration", 0) >= 0)
+
+
+          def reusable(read, repository, run_id, docs_lint):
+              root = "/repos/" + "/".join(urllib.parse.quote(p, safe="") for p in repository.split("/"))
+              current = read(f"{root}/actions/runs/{run_id}")
+              workflow = current.get("workflow_id")
+              if not isinstance(workflow, str) or not workflow.strip():
+                  return False
+              proof = provenance(current, repository)
+              number, head, base, branch = proof
+              if (current["id"] != run_id or payload(current).get("action") not in
+                      {"edited", "ready_for_review", "converted_to_draft"}
+                      or payload(current)["pull_request"]["draft"] is not False):
+                  return False
+
+              query = urllib.parse.urlencode({"head_sha": head, "workflow_id": workflow})
+              history = pages(read, f"{root}/actions/runs?{query}", "workflow_runs")
+              candidates = []
+              ids = set()
+              for run in history:
+                  if type(run["id"]) is not int or run["id"] in ids:
+                      raise ValueError("run id")
+                  ids.add(run["id"])
+                  if run["id"] > run_id:
+                      return False
+                  if run["id"] == run_id:
+                      continue
+                  if run["workflow_id"] != workflow or run["commit_sha"] != head:
+                      raise ValueError("history filter")
+                  # A draft-skipped run is never a verdict. Do not mistake Forgejo's
+                  # success mapping for skipped jobs for evidence that the gate ran.
+                  provenance(run, repository)
+                  if payload(run)["pull_request"]["draft"] is False:
+                      candidates.append(run)
+              if run_id not in ids or not candidates:
+                  return False
+              prior = max(candidates, key=lambda run: run["id"])
+              # A later real failure/cancellation must not be hidden by older green CI.
+              if provenance(prior, repository) != proof or not completed(prior):
+                  return False
+
+              statuses = pages(read, f"{root}/commits/{head}/statuses")
+              required = {"quality", "gitleaks", "grype", "semgrep"}
+              if docs_lint:
+                  required.add("docs-lint")
+              latest = {}
+              run_url = urllib.parse.urlsplit(prior["html_url"])
+              current_url = urllib.parse.urlsplit(current["html_url"])
+              if (run_url.scheme != "https" or run_url.query or run_url.fragment
+                      or run_url.netloc != current_url.netloc
+                      or run_url.path != f"/{repository}/actions/runs/{prior['index_in_repo']}"):
+                  return False
+              for status in statuses:
+                  target = urllib.parse.urlsplit(urllib.parse.urljoin(prior["html_url"], status["target_url"]))
+                  if (target.scheme != run_url.scheme or target.netloc != run_url.netloc
+                          or not re.fullmatch(re.escape(run_url.path) + r"/jobs/[0-9]+", target.path)
+                          or target.query or target.fragment):
+                      continue
+                  context = status["context"]
+                  match = re.fullmatch(r"(.+) / (quality|gitleaks|grype|semgrep|docs-lint) \(pull_request\)", context)
+                  if not match or type(status["id"]) is not int:
+                      continue
+                  if context not in latest or status["id"] > latest[context]["id"]:
+                      latest[context] = status
+              groups = {}
+              for context, status in latest.items():
+                  prefix, job = context.rsplit(" / ", 1)
+                  job = job.removesuffix(" (pull_request)")
+                  if (status["status"] == "success"
+                          and status.get("description", "").startswith("Successful in ")):
+                      groups.setdefault(prefix, set()).add(job)
+              if not any(required <= jobs for jobs in groups.values()):
+                  return False
+
+              # Check the live PR and base branch last. The triggering payload is immutable;
+              # it cannot tell us that main advanced while this metadata run was queued.
+              live = read(f"{root}/pulls/{number}")
+              tip = read(f"{root}/branches/{urllib.parse.quote(branch, safe='')}")
+              return (live["state"] == "open" and live["draft"] is False
+                      and live["head"]["sha"] == head and live["base"]["sha"] == base
+                      and live["base"]["ref"] == branch and tip["commit"]["id"] == base)
+
+
+          def main():
+              reuse = False
+              try:
+                  api = os.environ["VERDICT_API"].rstrip("/")
+                  parsed = urllib.parse.urlsplit(api)
+                  repository = os.environ["VERDICT_REPOSITORY"]
+                  run_id = int(os.environ["VERDICT_RUN_ID"])
+                  if (parsed.scheme != "https" or parsed.path != "/api/v1" or parsed.query
+                          or parsed.fragment or parsed.username or parsed.password
+                          or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)):
+                      raise ValueError("unsupported API")
+                  # This is the existing job credential, never an operator/admin token.
+                  token = os.environ["VERDICT_TOKEN"]
+                  deadline = time.monotonic() + 25
+
+                  class NoRedirect(urllib.request.HTTPRedirectHandler):
+                      def redirect_request(self, *args, **kwargs):
+                          return None
+
+                  opener = urllib.request.build_opener(NoRedirect)
+
+                  def read(path):
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0 or not path.startswith("/repos/"):
+                          raise ValueError("read bound")
+                      request = urllib.request.Request(api + path, headers={
+                          "Authorization": "token " + token, "Accept": "application/json"})
+                      with opener.open(request, timeout=min(5, remaining)) as response:
+                          body = response.read(2 * 1024 * 1024 + 1)
+                          if len(body) > 2 * 1024 * 1024:
+                              raise ValueError("response bound")
+                          return json.loads(body)
+
+                  reuse = reusable(read, repository, run_id, os.environ.get("VERDICT_DOCS_LINT") == "true")
+              except Exception:
+                  # Never echo response bodies, PR text, credentials or raw exception text.
+                  print("::notice::No complete current-head/base CI verdict; running the full gate.")
+              if reuse:
+                  print("::notice::Reusing completed required CI at this head and current base.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write("reuse=" + str(reuse).lower() + "\n")
+
+
+          if __name__ == "__main__":
+              main()
+          PRIOR_VERDICT
+
       - uses: actions/checkout@v5
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Refuse a tracked node_modules
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         # A node_modules entry in the commit (a directory, a file, or a symlink to someone's installed tree) ships a
         # whole dependency tree, or a pointer into another checkout's, to everyone who clones. `node_modules/` in a
         # .gitignore hides a real directory but not a symlink, so this reads the index itself. It fails closed: a git
@@ -93,6 +300,7 @@ jobs:
           fi
 
       - name: Resolve pnpm version
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         id: pnpm-version
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -117,11 +325,13 @@ jobs:
           PY
 
       - uses: pnpm/action-setup@v6.0.8
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           version: ${{ steps.pnpm-version.outputs.version }}
           dest: ${{ runner.temp }}/setup-pnpm
 
       - name: Guard pnpm runner isolation
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         run: |
           case "${PNPM_HOME:-}" in
             "$RUNNER_TEMP"/*) ;;
@@ -163,6 +373,7 @@ jobs:
           echo "pnpm_config_store_dir=$store" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v5
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           node-version: ${{ inputs.node-version }}
           # v5 caches the pnpm store by default whenever package.json names a packageManager.
@@ -171,8 +382,10 @@ jobs:
           package-manager-cache: false
 
       - run: pnpm install --frozen-lockfile
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
 
       - name: Resolve Turbo cache eligibility
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         id: turbo-cache
         env:
           TURBO_CACHE_ENABLED: ${{ inputs.turbo-cache-enabled }}
@@ -254,7 +467,7 @@ jobs:
           echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
 
       - name: Enforce signed-cache consumer contract
-        if: ${{ steps.turbo-cache.outputs.eligible == 'true' }}
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' && (steps.turbo-cache.outputs.eligible == 'true') }}
         run: |
           # Fail closed: never inject cache credentials into a consumer that
           # does not verify artifact signatures (remoteCache.signature).
@@ -274,6 +487,7 @@ jobs:
           JS
 
       - name: Cap Vitest workers to the job class envelope
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         id: vitest-cap
         env:
           VITEST_CAP: ${{ inputs.vitest-max-workers }}
@@ -285,6 +499,7 @@ jobs:
           echo "vitest workers capped at $VITEST_CAP (VITEST_MAX_WORKERS, VITEST_MAX_THREADS, VITEST_MAX_FORKS)"
 
       - name: Refuse a Turbo strict env that would strip the Vitest cap
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         # Turbo 2 runs tasks in strict env mode (the default, and declared by
         # growth-labs/packages and publishing): a variable not in
         # globalPassThroughEnv never reaches the task, so VITEST_MAX_* would
@@ -323,6 +538,7 @@ jobs:
           VITEST_PASSTHROUGH
 
       - name: CI gate (typecheck + lint + test + build)
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         # The cap line above is what was asked for; the observer here is what
         # happened: it samples the fork-pool workers every second and prints
         # the most that ran at once (per vitest process, and in total), so the
@@ -386,6 +602,7 @@ jobs:
           TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: '10'
 
       - name: Lockfile integrity
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         run: |
           if [ ! -f pnpm-lock.yaml ]; then
             echo "::error::pnpm-lock.yaml missing"
@@ -415,6 +632,7 @@ jobs:
       # was later rebuilt may opt out with the comment
       # `-- d1-like-pattern-limit: superseded` on its own line.
       - name: D1 LIKE/GLOB pattern length
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         run: |
           node - <<'D1_PATTERN_SCAN'
           const fs = require('node:fs')
@@ -451,6 +669,7 @@ jobs:
           D1_PATTERN_SCAN
 
       - name: Accessibility (axe-core)
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         run: |
           if grep -q '"test:a11y"' package.json 2>/dev/null; then
             pnpm run test:a11y
@@ -459,6 +678,7 @@ jobs:
           fi
 
       - name: Performance (Lighthouse)
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         continue-on-error: true
         run: |
           if grep -q '"test:perf"' package.json 2>/dev/null; then
@@ -468,6 +688,7 @@ jobs:
           fi
 
       - name: Dead code (Knip)
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         continue-on-error: true
         run: |
           if grep -q '"knip"' package.json 2>/dev/null; then
@@ -482,11 +703,15 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
     steps:
+      - *prior-verdict
+
       - uses: actions/checkout@v5
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           persist-credentials: false
 
       - name: Resolve pnpm version
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         id: pnpm-version
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -511,11 +736,13 @@ jobs:
           PY
 
       - uses: pnpm/action-setup@v6.0.8
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           version: ${{ steps.pnpm-version.outputs.version }}
           dest: ${{ runner.temp }}/setup-pnpm
 
       - name: Guard pnpm runner isolation
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         run: |
           case "${PNPM_HOME:-}" in
             "$RUNNER_TEMP"/*) ;;
@@ -554,6 +781,7 @@ jobs:
           echo "pnpm_config_store_dir=$store" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v5
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           node-version: ${{ inputs.node-version }}
           # v5 caches the pnpm store by default whenever package.json names a packageManager.
@@ -562,8 +790,10 @@ jobs:
           package-manager-cache: false
 
       - run: pnpm install --frozen-lockfile
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
 
       - name: Docs convention lint
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         run: |
           if grep -q '"docs-lint"' package.json 2>/dev/null; then
             pnpm run docs-lint -- --json
@@ -576,12 +806,16 @@ jobs:
     runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}
     timeout-minutes: 5
     steps:
+      - *prior-verdict
+
       - uses: actions/checkout@v5
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install gitleaks
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         # The ci-executor image carries the pinned release (infra Containerfile, checksummed there); it is used when the version found is
         # exactly this pin, otherwise the verified download below runs. Its own directory under RUNNER_TEMP, and no move: on a runner
         # whose RUNNER_TEMP is /tmp (Forgejo's), extracting to /tmp and then moving onto "$RUNNER_TEMP/gitleaks" moved the file onto
@@ -601,6 +835,7 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: Gitleaks scan
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         # --verbose prints each finding (file, line, rule, redacted value) so a red job is actionable
         # without reproducing the scan locally; secrets stay redacted.
         #
@@ -709,11 +944,15 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 10
     steps:
+      - *prior-verdict
+
       - uses: actions/checkout@v5
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           persist-credentials: false
 
       - name: Install semgrep
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         env:
           PYTHONUSERBASE: ${{ runner.temp }}/semgrep-user
           SEMGREP_ENABLE_VERSION_CHECK: '0'
@@ -733,6 +972,7 @@ jobs:
           echo "$PYTHONUSERBASE/bin" >> "$GITHUB_PATH"
 
       - name: Semgrep scan
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         env:
           PYTHONUSERBASE: ${{ runner.temp }}/semgrep-user
           # semgrep-core (OCaml/Eio) defaults to the io_uring backend; on some self-hosted runner
@@ -795,7 +1035,10 @@ jobs:
     # not a budget.
     timeout-minutes: 20
     steps:
+      - *prior-verdict
+
       - uses: actions/checkout@v5
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         with:
           # Every commit, so a pull request's merge base with its base branch is
           # in the checkout: the base is scanned from it, and nothing can be
@@ -804,6 +1047,7 @@ jobs:
           persist-credentials: false
 
       - name: Install grype
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         # The pinned grype release itself, verified before it is unpacked, like gitleaks above; the ci-executor image carries the same pin
         # and it is used when the version found is exactly this one. The job ran this same version through anchore/scan-action@v7.4.0
         # until a pull request needed two scans over one DB, which the action (one install and one DB check per call) cannot share.
@@ -822,6 +1066,7 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: Grype vulnerability scan
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
         # What fails the job depends on what was checked out (DEP-01). A pull request's head fails only on the
         # findings it introduces: the head and its merge base with the base branch are both scanned, over one DB
         # and each with its own .grype.yaml, and a finding at or above the cutoff is introduced when its

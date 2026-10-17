@@ -25,7 +25,7 @@ test('main push reruns keep a SHA-isolated concurrency group', () => {
   );
   assert.match(
     workflow,
-    /cancel-in-progress: \$\{\{ github\.ref != 'refs\/heads\/main' \}\}/,
+    /cancel-in-progress: \$\{\{ github\.ref != 'refs\/heads\/main' && github\.event\.action != 'edited' && github\.event\.action != 'ready_for_review' && github\.event\.action != 'converted_to_draft' \}\}/,
   );
   assert.doesNotMatch(workflow, /group: ci-gate-\$\{\{ github\.repository \}\}-\$\{\{ github\.ref \}\}/);
 });
@@ -123,7 +123,7 @@ test('eligible callers must verify artifact signatures (fail closed)', () => {
   assert.ok(enforcementStart >= 0, 'signature enforcement step must be present');
   assert.match(
     enforcementStep,
-    /if: \$\{\{ steps\.turbo-cache\.outputs\.eligible == 'true' \}\}/,
+    /if: \$\{\{ steps\.prior-verdict\.outputs\.reuse != 'true' && \(steps\.turbo-cache\.outputs\.eligible == 'true'\) \}\}/,
     'enforcement must run exactly when credentials would be injected',
   );
   assert.match(enforcementStep, /remoteCache\?\.signature !== true/);
