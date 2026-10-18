@@ -366,8 +366,11 @@ jobs:
                       remaining = deadline - time.monotonic()
                       if remaining <= 0 or not path.startswith("/repos/"):
                           raise ValueError("read bound")
+                      # Cloudflare answers Python-urllib's default User-Agent with Error 1010; a runner that reaches the
+                      # forge through it (Atlas) would always fall back to the full gate. Name the reader instead.
                       request = urllib.request.Request(api + path, headers={
-                          "Authorization": "token " + token, "Accept": "application/json"})
+                          "Authorization": "token " + token, "Accept": "application/json",
+                          "User-Agent": "platform-foundations-ci-verdict/1"})
                       with opener.open(request, timeout=min(5, remaining)) as response:
                           body = response.read(2 * 1024 * 1024 + 1)
                           if len(body) > 2 * 1024 * 1024:

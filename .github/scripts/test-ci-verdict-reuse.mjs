@@ -306,6 +306,33 @@ with tempfile.TemporaryDirectory(prefix="ci-verdict-fixture-") as folder:
   assert.doesNotMatch(data.log, /PRIVATE-FIXTURE-DETAIL|fixture-only/);
 });
 
+test("the shipped reader names itself, because Cloudflare refuses Python-urllib's default User-Agent (Error 1010)", () => {
+  const result = spawnSync('python3', ['-c', `
+import json, os, sys, tempfile
+namespace = {"__name__": "fixture"}
+exec(compile(json.load(sys.stdin), "ci-gate.yml", "exec"), namespace)
+seen = []
+class Recorder:
+    def open(self, request, **kwargs):
+        seen.append(request.get_header("User-agent"))
+        raise PermissionError("fixture refusal")
+namespace["urllib"].request.build_opener = lambda *args: Recorder()
+with tempfile.TemporaryDirectory(prefix="ci-verdict-fixture-") as folder:
+    os.environ.update({"VERDICT_API": "https://forge.example/api/v1",
+        "VERDICT_REPOSITORY": "fulcrum-labs/fixture", "VERDICT_RUN_ID": "110",
+        "VERDICT_TOKEN": "fixture-only", "GITHUB_OUTPUT": folder + "/output"})
+    namespace["main"]()
+print(json.dumps(seen))
+`], { input: JSON.stringify(source), encoding: 'utf8', timeout: 5000 });
+  assert.equal(result.status, 0, result.stderr);
+  const agents = JSON.parse(result.stdout.trim().split('\n').pop());
+  assert.ok(agents.length > 0, 'the reader made at least one request');
+  for (const agent of agents) {
+    assert.equal(agent, 'platform-foundations-ci-verdict/1');
+    assert.doesNotMatch(agent, /urllib/i);
+  }
+});
+
 test('all original steps retain their conditions and run when reuse is absent', () => {
   const steps = workflow.split(/^      - /m).slice(1);
   assert.equal(steps.filter(s => s.startsWith('*prior-verdict')).length, 4);
