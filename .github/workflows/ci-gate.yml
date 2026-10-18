@@ -275,6 +275,12 @@ jobs:
                   # A later failed/cancelled/incomplete Draft is a barrier too.
                   if run["status"] not in {"success", "skipped"}:
                       return False
+                  # Forgejo aggregates a run as skipped only when every job skipped, so it ran
+                  # nothing. Forgejo 15 serves no per-run jobs API (its repository actions routes
+                  # are /tasks, /runs and /runs/{id}) and hands a skipped job to a runner, so the
+                  # job evidence below cannot be read there; the run status is that evidence.
+                  if run["status"] == "skipped":
+                      continue
                   paths, snapshot = draft_execution(read, root, run, required)
                   if not paths:
                       if json.dumps(pages(read, f"{root}/actions/runs/{run['id']}/jobs"), sort_keys=True) != snapshot:

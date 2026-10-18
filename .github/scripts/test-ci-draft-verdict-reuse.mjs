@@ -221,6 +221,18 @@ test('a positively skipped Draft transition still preserves an earlier non-Draft
   assert.equal(evaluate(data).reuse, false, 'unknown execution cannot be labelled skipped');
 });
 
+test('a Draft run Forgejo aggregates as skipped is passed over without the per-run jobs API (Forgejo 15)', () => {
+  // Forgejo 15 routes no /actions/runs/{id}/jobs or /actions/jobs/{id}, and hands a skipped job to a runner.
+  const data = fixture(); olderGreen(data); data.history[1].status = 'skipped'; data.failPath = '/jobs';
+  const result = evaluate(data);
+  assert.equal(result.reuse, true);
+  assert.ok(!result.reads.some(path => path.includes('/jobs')), 'no job read for a skipped run');
+  const executed = fixture(); olderGreen(executed); executed.failPath = '/jobs';
+  assert.equal(evaluate(executed).reuse, false, 'a successful Draft run still needs job evidence');
+  const only = fixture(); only.history[1].status = 'skipped'; only.failPath = '/jobs';
+  assert.equal(evaluate(only).reuse, false, 'a skipped Draft run is no verdict of its own');
+});
+
 test('newer failed, cancelled, incomplete or unknown Draft work cannot expose older non-Draft green', () => {
   for (const state of ['failure', 'cancelled', 'waiting', 'running', 'blocked']) {
     const data = fixture(); olderGreen(data); data.history[1].status = state;
