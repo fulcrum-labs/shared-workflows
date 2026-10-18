@@ -85,10 +85,11 @@ except Exception as e:
   return JSON.parse(result.stdout);
 }
 
-test('a metadata edit reuses all required successes at the same immutable head and current base', () => {
+test('a metadata edit reuses all required successes at the same immutable head', () => {
   const result = evaluate();
   assert.equal(result.reuse, true, JSON.stringify(result));
-  assert.deepEqual(result.reads.slice(-2), [`${root}/pulls/42`, `${root}/branches/main`]);
+  assert.equal(result.reads.at(-1), `${root}/pulls/42`);
+  assert.ok(!result.reads.some(path => path.includes('/branches/')), 'the base tip is not read');
 });
 
 test('ready uses the same verdict and a still-draft event cannot use it', () => {
@@ -131,13 +132,22 @@ test('nonempty workflow filenames, paths and id strings preserve compatibility',
   }
 });
 
-test('main/base changes while queued, or a prior verdict against another base, run full CI', () => {
+test('main moving on does not void a verdict for the same head; another base branch or head does', () => {
+  // Forgejo checks out the head itself and records the base tip at event time, so an edit
+  // after main advanced carries a new base sha for the same tested head.
   for (const change of [
     d => { d.tip.commit.id = 'c'.repeat(40); },
     d => { d.live.base.sha = 'c'.repeat(40); },
-    d => { d.live.base.ref = 'release'; },
     d => editPayload(d.history[1], p => { p.pull_request.base.sha = 'c'.repeat(40); }),
     d => editPayload(d.current, p => { p.pull_request.base.sha = 'c'.repeat(40); }),
+  ]) {
+    const data = fixture(); change(data); assert.equal(evaluate(data).reuse, true);
+  }
+  for (const change of [
+    d => { d.live.base.ref = 'release'; },
+    d => editPayload(d.history[1], p => { p.pull_request.base.ref = 'release'; }),
+    d => { d.live.head.sha = 'c'.repeat(40); },
+    d => editPayload(d.history[1], p => { p.pull_request.number = 43; }),
   ]) {
     const data = fixture(); change(data); assert.equal(evaluate(data).reuse, false);
   }
