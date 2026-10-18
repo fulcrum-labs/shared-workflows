@@ -292,7 +292,11 @@ jobs:
               if prior is None:
                   return False
               # A later real failure/cancellation must not be hidden by older green CI.
-              if provenance(prior, repository) != proof or not completed(prior):
+              # Bound to the PR, head and base branch, not the base tip: Forgejo checks out
+              # the head itself, and an edit or readiness change does not change what was
+              # tested when main moves on (a PR is not re-run for that without an edit).
+              prior_number, prior_head, _prior_base, prior_branch = provenance(prior, repository)
+              if (prior_number, prior_head, prior_branch) != (number, head, branch) or not completed(prior):
                   return False
 
               statuses = pages(read, f"{root}/commits/{head}/statuses")
@@ -330,13 +334,11 @@ jobs:
                       read, f"{root}/actions/runs/{prior['id']}/jobs"), sort_keys=True) != execution[1]:
                   return False
 
-              # Check the live PR and base branch last. The triggering payload is immutable;
-              # it cannot tell us that main advanced while this metadata run was queued.
+              # Check the live PR last. The triggering payload is immutable; it cannot tell us
+              # that the PR got a new head, was closed or went back to draft while queued.
               live = read(f"{root}/pulls/{number}")
-              tip = read(f"{root}/branches/{urllib.parse.quote(branch, safe='')}")
               return (live["state"] == "open" and live["draft"] is False
-                      and live["head"]["sha"] == head and live["base"]["sha"] == base
-                      and live["base"]["ref"] == branch and tip["commit"]["id"] == base)
+                      and live["head"]["sha"] == head and live["base"]["ref"] == branch)
 
 
           def main():

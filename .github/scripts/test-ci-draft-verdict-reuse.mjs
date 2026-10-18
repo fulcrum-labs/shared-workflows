@@ -120,7 +120,7 @@ test('a truly executed successful Draft verdict qualifies with all current job a
   for (const docsLint of [false, true]) {
     const result = evaluate(fixture(docsLint));
     assert.equal(result.reuse, true, JSON.stringify(result));
-    assert.deepEqual(result.reads.slice(-2), [`${root}/pulls/42`, `${root}/branches/main`]);
+    assert.equal(result.reads.at(-1), `${root}/pulls/42`);
     assert.equal(result.reads.filter(path => path.includes('/actions/jobs/')).length, docsLint ? 5 : 4);
     assert.equal(result.reads.filter(path => path.includes('/actions/runs/109/jobs')).length, 2,
       'recheck the current job/attempt snapshot after status proof');
@@ -249,9 +249,9 @@ test('newer failed, cancelled, incomplete or unknown Draft work cannot expose ol
 
 test('Draft execution proof does not relax immutable base/head/workflow/fork/live/status refusals', () => {
   for (const change of [
-    d => { d.tip.commit.id = 'c'.repeat(40); }, d => { d.live.draft = true; },
+    d => { d.live.draft = true; },
     d => { d.live.head.sha = 'c'.repeat(40); }, d => { d.current.workflow_id = ''; },
-    d => editPayload(d.history[1], p => { p.pull_request.base.sha = 'c'.repeat(40); }),
+    d => editPayload(d.history[1], p => { p.pull_request.base.ref = 'release'; }),
     d => editPayload(d.history[1], p => { p.pull_request.head.repo.full_name = 'other/fork'; }),
     d => { d.history[1].need_approval = true; }, d => { d.history[1].is_fork_pull_request = true; },
     d => { d.statuses[0].description = 'Has been skipped'; },
