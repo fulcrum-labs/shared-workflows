@@ -144,6 +144,11 @@ jobs:
                       and stop >= start and run.get("duration", 0) >= 0)
 
 
+          def unstarted(run):
+              start = datetime.datetime.fromisoformat(run["started"].replace("Z", "+00:00"))
+              return start.timestamp() <= 0
+
+
           def draft_execution(read, root, run, required):
               # Forgejo 17 returns an array of current jobs; IDs survive reruns,
               # while attempt and task_id change. Bind detail/steps to both.
@@ -246,6 +251,12 @@ jobs:
                       raise ValueError("run id")
                   ids.add(run["id"])
                   if run["id"] > run_id:
+                      # A newer run still queued behind this one in the caller's concurrency group
+                      # (Forgejo's queue-behind keeps every pending run) has not started, so it
+                      # reports after this run and is no evidence either way. Started or finished
+                      # newer work is a barrier.
+                      if run["status"] in {"waiting", "blocked"} and unstarted(run):
+                          continue
                       return False
                   if run["id"] == run_id:
                       continue

@@ -166,6 +166,24 @@ test('a later failed, cancelled, waiting or running real run prevents reuse of o
   assert.equal(evaluate(newer).reuse, false, 'a newer event cannot be bypassed by an older queued lookup');
 });
 
+test('a newer run still queued behind this one is no barrier; started or finished newer work is', () => {
+  for (const state of ['waiting', 'blocked']) {
+    for (const started of ['1970-01-01T00:00:00Z', '0001-01-01T00:00:00Z']) {
+      const data = fixture(); const queued = run(111);
+      queued.status = state; queued.started = started; queued.stopped = started;
+      data.history.unshift(queued);
+      assert.equal(evaluate(data).reuse, true, `a queued ${state} edit waits behind this verdict`);
+    }
+  }
+  for (const [state, started] of [['running', '2026-10-16T12:02:00Z'], ['waiting', '2026-10-16T12:02:00Z'],
+    ['success', '2026-10-16T12:02:00Z'], ['failure', '2026-10-16T12:02:00Z'], ['cancelled', '1970-01-01T00:00:00Z']]) {
+    const data = fixture(); const later = run(111);
+    later.status = state; later.started = started;
+    data.history.unshift(later);
+    assert.equal(evaluate(data).reuse, false, `newer ${state} work remains a barrier`);
+  }
+});
+
 test('a completed quick reuse run may have zero duration at Forgejo second precision', () => {
   const data = fixture();
   data.history[1].stopped = data.history[1].started;
