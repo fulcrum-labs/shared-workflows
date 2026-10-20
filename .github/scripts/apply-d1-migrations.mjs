@@ -28,6 +28,9 @@
 // exact prefix of that list; a gap, reorder, unknown applied id, duplicate or
 // digest mismatch is a divergence (exit 3) that never replays anything. See
 // the MANIFEST MODE section below for the contract, exit codes and result file.
+// `--ledger-table <name>` (manifest mode only) names the ledger the mode reads
+// and writes instead of `d1_migrations` -- identity-platform keeps its
+// realm-only data migrations in their own `d1_realm_migrations` ledger.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -43,10 +46,10 @@ import { basename, isAbsolute, join, resolve, sep } from "node:path";
 // alongside --manifest.
 function manifestFlagFromArgv(argv) {
 	if (!argv.some((arg) => arg === "--manifest" || arg.startsWith("--manifest="))) return null;
-	const values = { manifest: null, "database-id": null, "baseline-rows": null, "baseline-names-sha256": null };
+	const values = { manifest: null, "database-id": null, "baseline-rows": null, "baseline-names-sha256": null, "ledger-table": null };
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
-		const match = /^--(manifest|database-id|baseline-rows|baseline-names-sha256)(?:=(.*))?$/.exec(arg);
+		const match = /^--(manifest|database-id|baseline-rows|baseline-names-sha256|ledger-table)(?:=(.*))?$/.exec(arg);
 		if (!match) return { error: `unknown argument ${JSON.stringify(arg)}` };
 		const [, name, inline] = match;
 		if (values[name] !== null) return { error: `--${name} was supplied more than once` };
@@ -67,7 +70,14 @@ function manifestFlagFromArgv(argv) {
 		if (!/^[0-9a-f]{64}$/.test(digest)) return { error: "--baseline-names-sha256 must be 64 lowercase hex characters" };
 		baseline = { rows: Number(rows), namesSha256: digest };
 	}
-	return { path: values.manifest, databaseId: values["database-id"] || "", baseline };
+	// The ledger table is interpolated into SQL as a bare identifier, so it is
+	// validated here, before anything is contacted: lower-case snake_case with
+	// the d1_ prefix every Fulcrum migration ledger carries, nothing else.
+	const ledgerTable = values["ledger-table"] ?? DEFAULT_LEDGER_TABLE;
+	if (!LEDGER_TABLE_PATTERN.test(ledgerTable)) {
+		return { error: `--ledger-table must match ${LEDGER_TABLE_PATTERN} (got ${JSON.stringify(ledgerTable)})` };
+	}
+	return { path: values.manifest, databaseId: values["database-id"] || "", baseline, ledgerTable };
 }
 
 // The baseline's names digest: sha256 over each ledger row name, in id order,
@@ -128,6 +138,8 @@ function baselineNamesDigest(names) {
 // so the sha256 of everything before the fixed suffix IS the manifest's
 // sha256 for that entry. Files must be valid UTF-8. The whole entry apply is a
 // single statement list that D1 runs as one batch: all of it or none of it.
+// `d1_migrations` is the default ledger; with --ledger-table <t> the same two
+// shapes are sent with <t> in its place, and nothing else changes.
 //
 // Declared baseline (`--baseline-rows N --baseline-names-sha256 X`, both or
 // neither): history no manifest can reproduce (rows applied out of order,
@@ -161,9 +173,11 @@ function baselineNamesDigest(names) {
 const MANIFEST_EXIT = { ok: 0, failed: 1, invalid: 2, divergence: 3, ambiguous: 4 };
 const MANIFEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const MANIFEST_SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const MANIFEST_LEDGER_READ_SQL = "SELECT id, name FROM d1_migrations ORDER BY id";
-const manifestLedgerInsertSuffix = (id) =>
-	`\n;\nINSERT INTO d1_migrations (name, applied_at) VALUES ('${id}', CURRENT_TIMESTAMP);`;
+const DEFAULT_LEDGER_TABLE = "d1_migrations";
+const LEDGER_TABLE_PATTERN = /^d1_[a-z][a-z0-9_]{0,58}$/;
+const manifestLedgerReadSql = (table) => `SELECT id, name FROM ${table} ORDER BY id`;
+const manifestLedgerInsertSuffix = (table, id) =>
+	`\n;\nINSERT INTO ${table} (name, applied_at) VALUES ('${id}', CURRENT_TIMESTAMP);`;
 const MANIFEST_ENTRY_KEYS = new Set(["id", "file", "sha256"]);
 const MANIFEST_DOC_KEYS = new Set(["schemaVersion", "entries"]);
 
@@ -337,6 +351,9 @@ async function runManifestMode(flag) {
 		divergence: null,
 		error: "",
 	};
+	// Named only when it is not the default, so a default run's result document
+	// is byte-for-byte what it was before the option existed.
+	if (flag.ledgerTable && flag.ledgerTable !== DEFAULT_LEDGER_TABLE) result.ledgerTable = flag.ledgerTable;
 	const finish = (status, exitCode, error = "") => {
 		result.status = status;
 		result.exitCode = exitCode;
@@ -403,12 +420,13 @@ async function runManifestMode(flag) {
 			return { status: response.status, json, text };
 		};
 
+		const ledgerTable = flag.ledgerTable;
 		const queryPath = `/accounts/${ACCOUNT_ID}/d1/database/${databaseId}/query`;
 		const readLedger = async () => {
-			const reply = await call("POST", queryPath, { sql: MANIFEST_LEDGER_READ_SQL });
+			const reply = await call("POST", queryPath, { sql: manifestLedgerReadSql(ledgerTable) });
 			const errors = JSON.stringify(reply.json?.errors ?? reply.text ?? "");
 			if (reply.status !== 200 || reply.json?.success !== true) {
-				if (/no such table:?\s*d1_migrations/i.test(errors)) return { missing: true, names: [] };
+				if (new RegExp(`no such table:?\\s*${ledgerTable}\\b`, "i").test(errors)) return { missing: true, names: [] };
 				throw new Error(`ledger read failed: HTTP ${reply.status} ${errors.slice(0, 300)}`);
 			}
 			const rows = reply.json?.result?.[0]?.results;
@@ -418,7 +436,7 @@ async function runManifestMode(flag) {
 
 		const before = await readLedger();
 		if (before.missing) {
-			throw new ManifestDivergence("the d1_migrations ledger table does not exist: refusing to guess where this database is", {
+			throw new ManifestDivergence(`the ${ledgerTable} ledger table does not exist: refusing to guess where this database is`, {
 				kind: "ledger-missing", index: 0, expected: entries[0].id, actual: null,
 			});
 		}
@@ -464,7 +482,7 @@ async function runManifestMode(flag) {
 		for (const entry of pending) {
 			mlog(`applying ${entry.id}…`);
 			// exactly the verified bytes, then the fixed ledger suffix: nothing trimmed
-			const batch = `${entry.sql}${manifestLedgerInsertSuffix(entry.id)}`;
+			const batch = `${entry.sql}${manifestLedgerInsertSuffix(ledgerTable, entry.id)}`;
 			let reply;
 			try {
 				reply = await call("POST", queryPath, { sql: batch });
@@ -599,6 +617,12 @@ const MANIFEST_FLAG = manifestFlagFromArgv(process.argv.slice(2));
 // untouched by it.
 if (MANIFEST_FLAG) {
 	process.exit(await runManifestMode(MANIFEST_FLAG));
+}
+// The legacy path reads and writes d1_migrations only. A caller that asked for
+// another ledger without --manifest must not be silently pointed at this one.
+if (process.argv.slice(2).some((arg) => arg === "--ledger-table" || arg.startsWith("--ledger-table="))) {
+	console.error("[d1-migrations] INVALID: --ledger-table is only meaningful with --manifest; the legacy apply-missing path uses d1_migrations only");
+	process.exit(MANIFEST_EXIT.invalid);
 }
 
 if (!DB_NAME) throw new Error("D1_DATABASE_NAME is required");

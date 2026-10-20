@@ -36,12 +36,17 @@ const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 
 // ---- fixture D1 ------------------------------------------------------------
 
-async function startD1({ ledger = 'create', seedLedger = [], seedSql = '', hooks = {} } = {}) {
+// ledgerTable is the ledger `ledger`/`seedLedger` concern; extraLedgers is
+// { table: [names] } for further ledger tables created beside it (the realm
+// ledger next to the shared one).
+async function startD1({ ledger = 'create', ledgerTable = 'd1_migrations', seedLedger = [], extraLedgers = {}, seedSql = '', hooks = {} } = {}) {
   const db = new DatabaseSync(':memory:');
-  if (ledger === 'create') {
-    db.exec('CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)');
-    for (const name of seedLedger) db.prepare('INSERT INTO d1_migrations (name) VALUES (?)').run(name);
-  }
+  const createLedger = (table, names) => {
+    db.exec(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+    for (const name of names) db.prepare(`INSERT INTO ${table} (name) VALUES (?)`).run(name);
+  };
+  if (ledger === 'create') createLedger(ledgerTable, seedLedger);
+  for (const [table, names] of Object.entries(extraLedgers)) createLedger(table, names);
   if (seedSql) db.exec(seedSql);
   const requests = [];
   let writes = 0;
@@ -121,7 +126,7 @@ async function startD1({ ledger = 'create', seedLedger = [], seedSql = '', hooks
     db,
     requests,
     writeRequests: () => requests.filter((r) => r.method === 'POST' && r.sql && !/^\s*SELECT\b/i.test(r.sql)),
-    ledger: () => db.prepare('SELECT name FROM d1_migrations ORDER BY id').all().map((r) => r.name),
+    ledger: (table = ledgerTable) => db.prepare(`SELECT name FROM ${table} ORDER BY id`).all().map((r) => r.name),
     tables: () => db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((r) => r.name),
     columns: (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name),
     close: () => server.close(),
@@ -709,4 +714,130 @@ test('baseline: the two flags come together and well-formed, or nothing is conta
     assert.equal(out.code, 2, `${args.join(' ')}: ${out.stdout}${out.stderr}`);
     assert.equal(d1.requests.length, 0);
   }
+});
+
+// ---- --ledger-table: the realm ledger -----------------------------------------
+
+const REALM_TABLE = 'd1_realm_migrations';
+const realmReadSql = `SELECT id, name FROM ${REALM_TABLE} ORDER BY id`;
+const realmInsertSuffix = (id) => `\n;\nINSERT INTO ${REALM_TABLE} (name, applied_at) VALUES ('${id}', CURRENT_TIMESTAMP);`;
+const REALM_ARGS = ['--manifest', 'manifest.json', '--ledger-table', REALM_TABLE];
+// realm files are numbered from 0001 in their OWN ledger, so they reuse ids the shared ledger also holds
+const REALM = [
+  E('0001_realm_seed', 'CREATE TABLE realm_seed (id INTEGER PRIMARY KEY);', 'migrations/realms/fulcrum-labs'),
+  E('0002_realm_flag', 'ALTER TABLE realm_seed ADD COLUMN flag TEXT;', 'migrations/realms/fulcrum-labs'),
+  E('0003_realm_row', "INSERT INTO realm_seed (id, flag) VALUES (1, 'x');", 'migrations/realms/fulcrum-labs'),
+];
+
+test('--ledger-table: the realm ledger is read and written, and the shared d1_migrations ledger is never touched', async () => {
+  const shared = ['0001_posts', '0002_posts_author', '0003_comments'];
+  const d1 = await startD1({ seedLedger: shared, extraLedgers: { [REALM_TABLE]: [] } });
+  const out = await run(makeArtifact(REALM), d1, { args: REALM_ARGS });
+  assert.equal(out.code, 0, out.stdout + out.stderr);
+  assert.deepEqual(d1.ledger(REALM_TABLE), REALM.map((e) => e.id));
+  assert.deepEqual(d1.ledger('d1_migrations'), shared, 'the shared ledger is exactly as it was');
+  assert.equal(out.result.status, 'applied');
+  assert.equal(out.result.ledgerTable, REALM_TABLE);
+  assert.deepEqual(out.result.applied, REALM.map((e) => e.id));
+  // the wire: the same two shapes with the realm table in place of d1_migrations
+  const writes = d1.writeRequests();
+  assert.equal(writes.length, REALM.length);
+  REALM.forEach((entry, i) => assert.equal(writes[i].sql, entry.sql + realmInsertSuffix(entry.id)));
+  const reads = d1.requests.filter((r) => r.sql && /^\s*SELECT\b/i.test(r.sql));
+  assert.equal(reads.length, 2);
+  assert.ok(reads.every((r) => r.sql === realmReadSql));
+  assert.deepEqual(ALL_PATHS(d1), [`POST /accounts/${ACCOUNT}/d1/database/${DB_ID}/query`]);
+});
+
+test('--ledger-table: the realm ledger is its own exact-prefix ledger (resume, and a divergence writes nothing)', async () => {
+  const resume = await startD1({ ledger: 'none', extraLedgers: { [REALM_TABLE]: ['0001_realm_seed', '0002_realm_flag.sql'] }, seedSql: 'CREATE TABLE realm_seed (id INTEGER PRIMARY KEY); ALTER TABLE realm_seed ADD COLUMN flag TEXT;' });
+  const ok = await run(makeArtifact(REALM), resume, { args: REALM_ARGS });
+  assert.equal(ok.code, 0, ok.stdout + ok.stderr);
+  assert.deepEqual(ok.result.ledgerBefore, ['0001_realm_seed', '0002_realm_flag.sql']);
+  assert.deepEqual(ok.result.applied, ['0003_realm_row']);
+  assert.equal(resume.writeRequests().length, 1);
+
+  const gap = await startD1({ ledger: 'none', extraLedgers: { [REALM_TABLE]: ['0001_realm_seed', '0003_realm_row'] } });
+  const bad = await run(makeArtifact(REALM), gap, { args: REALM_ARGS });
+  assert.equal(bad.code, 3, bad.stdout + bad.stderr);
+  assert.equal(bad.result.divergence.kind, 'gap');
+  assert.equal(gap.writeRequests().length, 0);
+});
+
+test('--ledger-table: a ledger of the shared table does not satisfy the realm read, and a missing realm ledger is a divergence', async () => {
+  // the shared ledger holds the realm ids; the realm ledger table does not exist
+  const d1 = await startD1({ seedLedger: REALM.map((e) => e.id) });
+  const out = await run(makeArtifact(REALM), d1, { args: REALM_ARGS });
+  assert.equal(out.code, 3, out.stdout + out.stderr);
+  assert.equal(out.result.divergence.kind, 'ledger-missing');
+  assert.match(out.result.error, /d1_realm_migrations ledger table does not exist/);
+  assert.equal(d1.writeRequests().length, 0);
+});
+
+test('--ledger-table: dry run reads the realm ledger and lists what is pending, writing nothing', async () => {
+  const d1 = await startD1({ seedLedger: ['0001_posts'], extraLedgers: { [REALM_TABLE]: ['0001_realm_seed'] }, seedSql: 'CREATE TABLE realm_seed (id INTEGER PRIMARY KEY);' });
+  const out = await run(makeArtifact(REALM), d1, { args: REALM_ARGS, env: { D1_MIGRATIONS_DRY_RUN: '1' } });
+  assert.equal(out.code, 0, out.stdout + out.stderr);
+  assert.equal(out.result.status, 'dry-run');
+  assert.deepEqual(out.result.ledgerBefore, ['0001_realm_seed']);
+  assert.deepEqual(out.result.pending, ['0002_realm_flag', '0003_realm_row']);
+  assert.equal(d1.writeRequests().length, 0);
+});
+
+test('--ledger-table: the baseline flags verify the realm ledger rows, not the shared ones', async () => {
+  const held = ['0001_realm_seed'];
+  const d1 = await startD1({ seedLedger: ['unrelated_shared_row'], extraLedgers: { [REALM_TABLE]: held }, seedSql: 'CREATE TABLE realm_seed (id INTEGER PRIMARY KEY);' });
+  const out = await run(makeArtifact(REALM), d1, { args: [...REALM_ARGS, '--baseline-rows', '1', '--baseline-names-sha256', namesDigest(held)] });
+  assert.equal(out.code, 0, out.stdout + out.stderr);
+  assert.deepEqual(out.result.applied, ['0002_realm_flag', '0003_realm_row']);
+});
+
+test('--ledger-table: the default is unchanged -- naming d1_migrations explicitly is byte-for-byte the flagless run', async () => {
+  const bare = await startD1();
+  const bareDir = makeArtifact(TRIO);
+  const a = await run(bareDir, bare);
+  const named = await startD1();
+  const namedDir = makeArtifact(TRIO);
+  const b = await run(namedDir, named, { args: ['--manifest', 'manifest.json', '--ledger-table', 'd1_migrations'] });
+  assert.equal(a.code, 0, a.stdout + a.stderr);
+  assert.equal(b.code, 0, b.stdout + b.stderr);
+  assert.deepEqual(named.requests.map((r) => r.sql), bare.requests.map((r) => r.sql));
+  assert.deepEqual(b.result, a.result);
+  assert.ok(!('ledgerTable' in a.result), 'a default run names no ledgerTable in its result');
+  assert.ok(!('ledgerTable' in b.result));
+  assert.equal(named.requests[0].sql, LEDGER_READ_SQL);
+});
+
+test('--ledger-table: only a strictly shaped table name is accepted, and nothing is contacted otherwise', async () => {
+  const d1 = await startD1();
+  const dir = makeArtifact(TRIO);
+  const bad = [
+    'migrations', 'D1_migrations', 'd1_', 'd1_Realm', 'd1-realm', 'd1_realm migrations',
+    'd1_x; DROP TABLE posts', "d1_x'--", 'd1_x"', '"d1_migrations"', 'main.d1_migrations', 'd1_' + 'a'.repeat(60), '',
+  ];
+  for (const name of bad) {
+    const out = await run(dir, d1, { args: ['--manifest', 'manifest.json', `--ledger-table=${name}`] });
+    assert.equal(out.code, 2, `${JSON.stringify(name)}: ${out.stdout}${out.stderr}`);
+  }
+  for (const args of [
+    ['--manifest', 'manifest.json', '--ledger-table'],
+    ['--manifest', 'manifest.json', '--ledger-table', '--force'],
+    ['--manifest', 'manifest.json', '--ledger-table', REALM_TABLE, '--ledger-table', REALM_TABLE],
+  ]) {
+    const out = await run(dir, d1, { args });
+    assert.equal(out.code, 2, `${args.join(' ')}: ${out.stdout}${out.stderr}`);
+  }
+  assert.equal(d1.requests.length, 0);
+  assert.equal(d1.ledger().length, 0);
+});
+
+test('--ledger-table without --manifest is refused: the legacy path never silently uses another ledger', async () => {
+  const d1 = await startD1();
+  const dir = makeArtifact(TRIO);
+  for (const args of [['--ledger-table', REALM_TABLE], [`--ledger-table=${REALM_TABLE}`]]) {
+    const out = await run(dir, d1, { args });
+    assert.equal(out.code, 2, out.stdout + out.stderr);
+    assert.match(out.stderr, /only meaningful with --manifest/);
+  }
+  assert.equal(d1.requests.length, 0);
 });
