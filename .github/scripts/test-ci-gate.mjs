@@ -176,6 +176,8 @@ test('pnpm cache discovery uses a store owned by the job or declared runner slot
   }
 });
 
+const draft = "(github.event_name == 'pull_request' && github.event.pull_request.draft)";
+
 test('non-container scanner jobs use the self-hosted fleet safely', () => {
   const jobNames = ['docs-lint', 'gitleaks', 'grype'];
   assert.match(workflow, /runs-on:\n        type: string\n        default: '\["self-hosted","Linux","X64"\]'/);
@@ -191,8 +193,8 @@ test('non-container scanner jobs use the self-hosted fleet safely', () => {
     const nextStart = [...jobStarts.values()].find(index => index > start) ?? workflow.length;
     const job = workflow.slice(start, nextStart);
     const expected = jobName === 'docs-lint'
-      ? '    runs-on: ${{ fromJSON(inputs.runs-on) }}'
-      : "    runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}";
+      ? `    runs-on: \${{ fromJSON(${draft} && '["fulcrum-light"]' || inputs.runs-on) }}`
+      : `    runs-on: \${{ fromJSON(${draft} && '["fulcrum-light"]' || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}`;
     assert.ok(job.split('\n').includes(expected), `${jobName} must use its JSON runner input and declared scan override`);
     assert.match(job, /break-glass: swap runs-on back to ubuntu-24\.04/);
   }
@@ -216,7 +218,7 @@ test('semgrep uses a pinned ephemeral pip install on the self-hosted fleet', () 
   const semgrep = workflow.slice(semgrepStart, grypeStart);
 
   assert.ok(semgrepStart >= 0 && grypeStart > semgrepStart, 'semgrep job must exist');
-  assert.match(semgrep, /^    runs-on: \$\{\{ fromJSON\(inputs\.runs-on\) \}\}$/m);
+  assert.match(semgrep, /^    runs-on: \$\{\{ fromJSON\(\(github\.event_name == 'pull_request' && github\.event\.pull_request\.draft\) && '\["fulcrum-light"\]' \|\| inputs\.runs-on\) \}\}$/m);
   assert.match(semgrep, /break-glass: swap runs-on back to ubuntu-24\.04/);
   assert.equal(semgrep.includes('container:'), false, 'semgrep must not require Docker');
   assert.equal(semgrep.includes('returntocorp/semgrep'), false, 'legacy container image must be removed');
@@ -584,3 +586,22 @@ test('the quality job refuses any tracked node_modules entry, symlinks included'
   assert.notEqual(grepErrors, script)
   assert.notEqual(verdict(clean, grepErrors).status, 0, 'a grep that errors fails the job')
 })
+
+// PF #691 (2026-10-22): a Draft run's skipped required job posted success and auto-merge fired before
+// the Ready run started. No job may skip on a Draft; each fails in its first step on the light lane.
+test('every gate job fails a Draft pull request in its first step and runs it on the light lane', () => {
+  const starts = [...workflow.matchAll(/^  (quality|docs-lint|gitleaks|semgrep|grype):$/gm)];
+  assert.deepEqual(starts.map(m => m[1]), ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype']);
+  for (const [i, m] of starts.entries()) {
+    const job = workflow.slice(m.index, starts[i + 1]?.index ?? workflow.length);
+    assert.match(job, /runs-on: \$\{\{ fromJSON\(\(github\.event_name == 'pull_request' && github\.event\.pull_request\.draft\) && '\["fulcrum-light"\]'/, `${m[1]} lane`);
+    const steps = job.slice(job.indexOf('    steps:\n') + '    steps:\n'.length);
+    const first = steps.slice(steps.indexOf('      - name:'));
+    assert.match(first, /^      - name: Draft runs are never green\n        if: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.draft \}\}\n/, `${m[1]} first step`);
+    assert.doesNotMatch(job.split('\n    steps:')[0], /\n    if: .*draft/, `${m[1]} must not skip on a draft`);
+  }
+  const step = workflow.match(/- name: Draft runs are never green\n        if: [^\n]+\n        run: \|\n((?:          [^\n]*\n)+)/)[1].replace(/^ {10}/gm, '');
+  const r = spawnSync('bash', ['-c', step], { encoding: 'utf8' });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /Draft runs are never green; the Ready run decides\./);
+});

@@ -63,11 +63,21 @@ concurrency:
 jobs:
   quality:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || inputs.runs-on) }}
     # 45, not 25: under a saturated self-hosted pool (2026-09-30 Forgejo flip day) infra's quality ran past 25
     # minutes three times with no failing test and was cancelled each time; a timeout is a guard, not a budget.
     timeout-minutes: 45
     steps:
+      # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
+      # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
+      # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
+      # before any checkout or API call; the Ready run decides.
+      - name: Draft runs are never green
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo "::error::Draft runs are never green; the Ready run decides." >&2
+          exit 1
+
       # Reuse only the existing gate's complete success verdict at an immutable
       # head/base pair. No new status, cache or credential is created. Unsupported
       # APIs and missing evidence execute every normal gate step below.
@@ -819,9 +829,19 @@ jobs:
   docs-lint:
     if: ${{ inputs.docs-lint-enabled }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || inputs.runs-on) }}
     timeout-minutes: 5
     steps:
+      # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
+      # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
+      # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
+      # before any checkout or API call; the Ready run decides.
+      - name: Draft runs are never green
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo "::error::Draft runs are never green; the Ready run decides." >&2
+          exit 1
+
       - *prior-verdict
 
       - uses: actions/checkout@v5
@@ -922,9 +942,19 @@ jobs:
 
   gitleaks:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}
     timeout-minutes: 5
     steps:
+      # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
+      # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
+      # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
+      # before any checkout or API call; the Ready run decides.
+      - name: Draft runs are never green
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo "::error::Draft runs are never green; the Ready run decides." >&2
+          exit 1
+
       - *prior-verdict
 
       - uses: actions/checkout@v5
@@ -1060,9 +1090,19 @@ jobs:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     # S10/D3: pip installation removes the runner's Docker dependency. Keep the
     # user base in RUNNER_TEMP so self-hosted jobs cannot leak packages across runs.
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || inputs.runs-on) }}
     timeout-minutes: 10
     steps:
+      # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
+      # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
+      # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
+      # before any checkout or API call; the Ready run decides.
+      - name: Draft runs are never green
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo "::error::Draft runs are never green; the Ready run decides." >&2
+          exit 1
+
       - *prior-verdict
 
       - uses: actions/checkout@v5
@@ -1148,12 +1188,22 @@ jobs:
 
   grype:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}
     # One fresh-DB pull, then one scan (two on a pull request, which also checks
     # out the whole history). 15m was set for a single scan; a timeout is a guard,
     # not a budget.
     timeout-minutes: 20
     steps:
+      # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
+      # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
+      # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
+      # before any checkout or API call; the Ready run decides.
+      - name: Draft runs are never green
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo "::error::Draft runs are never green; the Ready run decides." >&2
+          exit 1
+
       - *prior-verdict
 
       - uses: actions/checkout@v5
