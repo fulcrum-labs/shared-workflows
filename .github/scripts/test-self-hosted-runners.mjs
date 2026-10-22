@@ -8,7 +8,7 @@ const workflowsDir = fileURLToPath(new URL('../workflows/', import.meta.url));
 
 const workflows = new Map(
   [
-    ['ci-gate.yml', ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype', 'trigger-cf-build']],
+    ['ci-gate.yml', ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype']],
     ['d1-migrations-apply.yml', ['apply']],
     ['preview-gate.yml', ['build']],
     ['deploy-gate.yml', ['deploy']],
@@ -67,13 +67,39 @@ function runsOnValues(source) {
   return [...source.matchAll(/^\s*runs-on:\s*(.+)$/gm)].map(match => match[1].trim());
 }
 
+// ci-gate.yml takes its runner labels from the `runs-on` input (#11), whose
+// default is the self-hosted fleet; the gitleaks and grype scans may take the
+// `scan-runs-on` input instead (#12). A Draft pull request runs every job on
+// the light lane, so it fails fast without queueing behind builds (ed073e2).
+// The other reusable workflows still pin the self-hosted fleet literally.
+const draftLane = `(github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]'`;
+const ciGateRunsOn = {
+  default: `\${{ fromJSON(${draftLane} || inputs.runs-on) }}`,
+  scan: `\${{ fromJSON(${draftLane} || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}`,
+};
+const expectedRunsOn = jobName =>
+  ['gitleaks', 'grype'].includes(jobName) ? ciGateRunsOn.scan : ciGateRunsOn.default;
+
 test('all shared-workflow compute defaults to the self-hosted runner fleet', () => {
+  const ciGate = workflows.get('ci-gate.yml').source;
+  assert.match(
+    ciGate,
+    /^      runs-on:\n        type: string\n        default: '\["self-hosted","Linux","X64"\]'$/m,
+    'ci-gate.yml runs-on input must default to the self-hosted fleet',
+  );
+  assert.match(
+    ciGate,
+    /^      scan-runs-on:\n        type: string\n        default: ''$/m,
+    'ci-gate.yml scan-runs-on input must default to empty, meaning the runs-on input',
+  );
+
   for (const [file, { jobs, source }] of workflows) {
     for (const jobName of jobs) {
       const job = jobSource(source, jobName);
-      assert.match(
-        job,
-        /^    runs-on: \[self-hosted, Linux, X64\]$/m,
+      const expected = file === 'ci-gate.yml' ? `    runs-on: ${expectedRunsOn(jobName)}` : '    runs-on: [self-hosted, Linux, X64]';
+      assert.deepEqual(
+        job.split('\n').filter(line => /^    runs-on:/.test(line)),
+        [expected],
         `${file}:${jobName} must default to the self-hosted fleet`,
       );
       assert.match(
@@ -176,6 +202,18 @@ test('every setup-node step turns its package manager cache off explicitly', () 
   assert.ok(setupNodeStepCount > 0, 'expected at least one setup-node step under .github/workflows/');
 });
 
+// ci-gate.yml keeps the per-job store only when the runner offers no slot
+// store: a Forgejo slot exports CI_PNPM_STORE_DIR, its own persistent store
+// that one job at a time writes (#7), and the guard refuses any other path.
+// preview-gate.yml and deploy-gate.yml still pin $RUNNER_TEMP/pnpm-store.
+const perJobStoreExports =
+  /echo "npm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/;
+const slotStoreExports = [
+  /^\s*store="\$\{CI_PNPM_STORE_DIR:-\$RUNNER_TEMP\/pnpm-store\}"$/m,
+  /^\s*"\$RUNNER_TEMP"\/\* \| \/var\/cache\/ci\/slot\/pnpm-store\) ;;$/m,
+  /echo "npm_config_store_dir=\$store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$store" >> "\$GITHUB_ENV"/,
+];
+
 test('every setup-node job still isolates pnpm to a store owned by the current runner job', () => {
   let setupNodeJobCount = 0;
   for (const [file, { jobs, source }] of workflows) {
@@ -185,12 +223,14 @@ test('every setup-node job still isolates pnpm to a store owned by the current r
       if (setupNodeStart === -1) continue;
       setupNodeJobCount += 1;
       const beforeSetupNode = job.slice(0, setupNodeStart);
-      assert.match(
-        beforeSetupNode,
-        /echo "npm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"\s*\n\s*echo "pnpm_config_store_dir=\$RUNNER_TEMP\/pnpm-store" >> "\$GITHUB_ENV"/,
+      const message =
         `${file}:${jobName} must isolate pnpm's store before setup-node runs, ` +
-          'so concurrent jobs on the same self-hosted runner never share a pnpm store dir',
-      );
+        'so concurrent jobs on the same self-hosted runner never share a pnpm store dir';
+      if (file === 'ci-gate.yml') {
+        for (const shape of slotStoreExports) assert.match(beforeSetupNode, shape, message);
+      } else {
+        assert.match(beforeSetupNode, perJobStoreExports, message);
+      }
     }
   }
   assert.equal(setupNodeJobCount, 4, 'contract must cover every setup-node reusable job');
