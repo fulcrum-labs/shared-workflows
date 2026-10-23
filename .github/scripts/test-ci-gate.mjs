@@ -176,7 +176,8 @@ test('pnpm cache discovery uses a store owned by the job or declared runner slot
   }
 });
 
-const draft = "(github.event_name == 'pull_request' && github.event.pull_request.draft)";
+const routedRunsOn = "${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}";
+const routedScanRunsOn = "${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}";
 
 test('non-container scanner jobs use the self-hosted fleet safely', () => {
   const jobNames = ['docs-lint', 'gitleaks', 'grype'];
@@ -193,8 +194,8 @@ test('non-container scanner jobs use the self-hosted fleet safely', () => {
     const nextStart = [...jobStarts.values()].find(index => index > start) ?? workflow.length;
     const job = workflow.slice(start, nextStart);
     const expected = jobName === 'docs-lint'
-      ? `    runs-on: \${{ fromJSON(${draft} && '["fulcrum-light"]' || inputs.runs-on) }}`
-      : `    runs-on: \${{ fromJSON(${draft} && '["fulcrum-light"]' || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}`;
+      ? `    runs-on: ${routedRunsOn}`
+      : `    runs-on: ${routedScanRunsOn}`;
     assert.ok(job.split('\n').includes(expected), `${jobName} must use its JSON runner input and declared scan override`);
     assert.match(job, /break-glass: swap runs-on back to ubuntu-24\.04/);
   }
@@ -218,7 +219,7 @@ test('semgrep uses a pinned ephemeral pip install on the self-hosted fleet', () 
   const semgrep = workflow.slice(semgrepStart, grypeStart);
 
   assert.ok(semgrepStart >= 0 && grypeStart > semgrepStart, 'semgrep job must exist');
-  assert.match(semgrep, /^    runs-on: \$\{\{ fromJSON\(\(github\.event_name == 'pull_request' && github\.event\.pull_request\.draft\) && '\["fulcrum-light"\]' \|\| inputs\.runs-on\) \}\}$/m);
+  assert.ok(semgrep.split('\n').includes(`    runs-on: ${routedRunsOn}`));
   assert.match(semgrep, /break-glass: swap runs-on back to ubuntu-24\.04/);
   assert.equal(semgrep.includes('container:'), false, 'semgrep must not require Docker');
   assert.equal(semgrep.includes('returntocorp/semgrep'), false, 'legacy container image must be removed');
@@ -591,10 +592,20 @@ test('the quality job refuses any tracked node_modules entry, symlinks included'
 // the Ready run started. No job may skip on a Draft; each fails in its first step on the light lane.
 test('every gate job fails a Draft pull request in its first step and runs it on the light lane', () => {
   const starts = [...workflow.matchAll(/^  (quality|docs-lint|gitleaks|semgrep|grype):$/gm)];
+  assert.match(workflow, /^  docs-lint:\n    if: \$\{\{ !cancelled\(\) && inputs\.docs-lint-enabled \}\}$/m);
   assert.deepEqual(starts.map(m => m[1]), ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype']);
   for (const [i, m] of starts.entries()) {
     const job = workflow.slice(m.index, starts[i + 1]?.index ?? workflow.length);
-    assert.match(job, /runs-on: \$\{\{ fromJSON\(\(github\.event_name == 'pull_request' && github\.event\.pull_request\.draft\) && '\["fulcrum-light"\]'/, `${m[1]} lane`);
+    // Forgejo evaluates runs-on at run creation with no github context, so the lane comes from the route job's output.
+    const head = job.split('\n    steps:')[0];
+    assert.match(head, /^    needs: \[route\]$/m, `${m[1]} needs route`);
+    assert.doesNotMatch(head, /runs-on:.*github\./, `${m[1]} runs-on must not read the github context`);
+    assert.ok(
+      head.split('\n').includes(`    runs-on: ${['gitleaks', 'grype'].includes(m[1]) ? routedScanRunsOn : routedRunsOn}`),
+      `${m[1]} lane`,
+    );
+    // PF #691: a failed route must not skip a required job.
+    assert.match(head, /^    if: \$\{\{ !cancelled\(\)( && inputs\.docs-lint-enabled)? \}\}$/m, `${m[1]} must survive a failed route`);
     const steps = job.slice(job.indexOf('    steps:\n') + '    steps:\n'.length);
     const first = steps.slice(steps.indexOf('      - name:'));
     assert.match(first, /^      - name: Draft runs are never green\n        if: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.draft \}\}\n/, `${m[1]} first step`);
@@ -604,4 +615,51 @@ test('every gate job fails a Draft pull request in its first step and runs it on
   const r = spawnSync('bash', ['-c', step], { encoding: 'utf8' });
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /Draft runs are never green; the Ready run decides\./);
+});
+
+// Forgejo evaluates runs-on at run creation, without github context; only a needs.<job>.outputs.* is
+// re-evaluated after that job finishes. The route job therefore picks the labels at run time.
+test('the route job picks the runner labels at run time: Draft light lane, optional main lane, else the inputs', () => {
+  const routeStart = workflow.indexOf('\n  route:\n');
+  assert.ok(routeStart > workflow.indexOf('\njobs:\n'), 'route must be a job');
+  const next = workflow.indexOf('\n  quality:\n');
+  assert.ok(next > routeStart, 'route must come before quality');
+  const route = workflow.slice(routeStart, next);
+  assert.match(route, /^    runs-on: \$\{\{ fromJSON\(inputs\.scan-runs-on != '' && inputs\.scan-runs-on \|\| inputs\.runs-on\) \}\}$/m, 'route runs on inputs only');
+  assert.match(route, /^    timeout-minutes: 2$/m);
+  assert.match(route, /^      runner: \$\{\{ steps\.route\.outputs\.runner \}\}$/m);
+  assert.match(route, /^      scan-runner: \$\{\{ steps\.route\.outputs\.scan-runner \}\}$/m);
+  assert.doesNotMatch(route, /actions\/checkout|secrets\./, 'route has no checkout and no secrets');
+  assert.doesNotMatch(route, /^    needs:/m);
+  assert.match(workflow, /main-runs-on:\n        type: string\n        default: ''/);
+
+  const script = route.match(/        run: \|\n((?:          [^\n]*\n)+)/)[1].replace(/^ {10}/gm, '');
+  const run = env => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-gate-route-'));
+    const out = join(dir, 'out');
+    writeFileSync(out, '');
+    const r = spawnSync('bash', ['-c', script], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, EVENT_NAME: '', IS_DRAFT: '', REF: '', RUNS_ON: '["go-heavy"]', SCAN_RUNS_ON: '', MAIN_RUNS_ON: '', ...env, GITHUB_OUTPUT: out },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    return Object.fromEntries(readFileSync(out, 'utf8').trim().split('\n').map(l => l.split(/=(.*)/s).slice(0, 2)));
+  };
+  const light = '["fulcrum-light"]';
+  const heavy = '["go-heavy"]';
+  const main = '["main-heavy"]';
+  const scans = '["scan-lane"]';
+  const draftPr = { EVENT_NAME: 'pull_request', IS_DRAFT: 'true', REF: 'refs/pull/7/merge' };
+  const readyPr = { EVENT_NAME: 'pull_request', IS_DRAFT: 'false', REF: 'refs/pull/7/merge' };
+  const pushMain = { EVENT_NAME: 'push', REF: 'refs/heads/main' };
+
+  assert.deepEqual(run(draftPr), { runner: light, 'scan-runner': light }, 'a Draft runs on the light lane');
+  assert.deepEqual(run({ ...draftPr, MAIN_RUNS_ON: main, SCAN_RUNS_ON: scans }), { runner: light, 'scan-runner': light }, 'a Draft ignores both overrides');
+  assert.deepEqual(run(readyPr), { runner: heavy, 'scan-runner': heavy }, 'a Ready PR uses runs-on');
+  assert.deepEqual(run({ ...readyPr, MAIN_RUNS_ON: main }), { runner: heavy, 'scan-runner': heavy }, 'a PR never takes the main lane');
+  assert.deepEqual(run({ ...pushMain, MAIN_RUNS_ON: main }), { runner: main, 'scan-runner': heavy }, 'a push to main takes main-runs-on, scans stay');
+  assert.deepEqual(run({ ...pushMain, MAIN_RUNS_ON: main, SCAN_RUNS_ON: scans }), { runner: main, 'scan-runner': scans }, 'main scans stay on scan-runs-on');
+  assert.deepEqual(run(pushMain), { runner: heavy, 'scan-runner': heavy }, 'main-runs-on empty means runs-on');
+  assert.deepEqual(run({ EVENT_NAME: 'push', REF: 'refs/heads/other', MAIN_RUNS_ON: main }), { runner: heavy, 'scan-runner': heavy }, 'a push elsewhere uses runs-on');
+  assert.deepEqual(run({ EVENT_NAME: 'workflow_dispatch', REF: 'refs/heads/main', MAIN_RUNS_ON: main, SCAN_RUNS_ON: scans }), { runner: heavy, 'scan-runner': scans }, 'only a push takes the main lane');
 });

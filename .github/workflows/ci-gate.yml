@@ -11,6 +11,10 @@ on:
         type: string
         default: ''
         description: 'Optional. The runner labels the gitleaks and grype scans ask for, as a JSON array; empty means runs-on. The Forgejo copies pass ["fulcrum-light"], the light lane (platform-foundations config/runner-fleet.yaml, 2026-10-16): a scan runs for 6-18 s but waited a median 15-19 min behind builds on the shared labels.'
+      main-runs-on:
+        type: string
+        default: ''
+        description: 'Optional. The runner labels a push to refs/heads/main asks for instead of runs-on, as a JSON array; empty means runs-on. The Forgejo copies of foundry, infra, platform-foundations and cockpit pass ["main-heavy"], a reserved lane in platform-foundations config/runner-fleet.yaml (fleet saturation ruling, 2026-10-23). Scans stay on scan-runs-on.'
       node-version:
         type: string
         default: '24.18.0'
@@ -61,9 +65,47 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event.action != 'edited' && github.event.action != 'ready_for_review' && github.event.action != 'converted_to_draft' }}
 
 jobs:
-  quality:
+  # Picks the runner labels at run time. Forgejo evaluates a job's runs-on when the run is CREATED,
+  # with no github context (only inputs.* of the called workflow exist), so a draft test written in
+  # runs-on never fired: Forgejo's database held 120+ infra Draft gate jobs in 3 days stored as
+  # ["go-heavy"], holding heavy slots only to fail fast. A runs-on that reads needs.<job>.outputs.* is
+  # re-evaluated once that job has finished, so every gate job reads its labels from this one. It also
+  # carries the optional main lane (main-runs-on) for pushes to refs/heads/main. No checkout, no secrets.
+  route:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || inputs.runs-on) }}
+    runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}
+    timeout-minutes: 2
+    outputs:
+      runner: ${{ steps.route.outputs.runner }}
+      scan-runner: ${{ steps.route.outputs.scan-runner }}
+    steps:
+      - name: Choose runner labels
+        id: route
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          REF: ${{ github.ref }}
+          RUNS_ON: ${{ inputs.runs-on }}
+          SCAN_RUNS_ON: ${{ inputs.scan-runs-on }}
+          MAIN_RUNS_ON: ${{ inputs.main-runs-on }}
+        run: |
+          set -euo pipefail
+          runner="$RUNS_ON"
+          scan="${SCAN_RUNS_ON:-$RUNS_ON}"
+          if [ "$EVENT_NAME" = pull_request ] && [ "$IS_DRAFT" = true ]; then
+            runner='["fulcrum-light"]'
+            scan='["fulcrum-light"]'
+          elif [ "$EVENT_NAME" = push ] && [ "$REF" = refs/heads/main ] && [ -n "$MAIN_RUNS_ON" ]; then
+            runner="$MAIN_RUNS_ON"
+          fi
+          echo "runner=$runner" >> "$GITHUB_OUTPUT"
+          echo "scan-runner=$scan" >> "$GITHUB_OUTPUT"
+
+  quality:
+    if: ${{ !cancelled() }}
+    # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}
     # 45, not 25: under a saturated self-hosted pool (2026-09-30 Forgejo flip day) infra's quality ran past 25
     # minutes three times with no failing test and was cancelled each time; a timeout is a guard, not a budget.
     timeout-minutes: 45
@@ -827,9 +869,10 @@ jobs:
           fi
 
   docs-lint:
-    if: ${{ inputs.docs-lint-enabled }}
+    if: ${{ !cancelled() && inputs.docs-lint-enabled }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || inputs.runs-on) }}
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}
     timeout-minutes: 5
     steps:
       # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
@@ -941,8 +984,10 @@ jobs:
           fi
 
   gitleaks:
+    if: ${{ !cancelled() }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}
     timeout-minutes: 5
     steps:
       # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
@@ -1087,10 +1132,12 @@ jobs:
           fi
 
   semgrep:
+    if: ${{ !cancelled() }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     # S10/D3: pip installation removes the runner's Docker dependency. Keep the
     # user base in RUNNER_TEMP so self-hosted jobs cannot leak packages across runs.
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || inputs.runs-on) }}
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}
     timeout-minutes: 10
     steps:
       # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
@@ -1187,8 +1234,10 @@ jobs:
           fi
 
   grype:
+    if: ${{ !cancelled() }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]' || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}
     # One fresh-DB pull, then one scan (two on a pull request, which also checks
     # out the whole history). 15m was set for a single scan; a timeout is a guard,
     # not a budget.
