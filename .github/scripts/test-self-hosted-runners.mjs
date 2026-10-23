@@ -72,10 +72,11 @@ function runsOnValues(source) {
 // `scan-runs-on` input instead (#12). A Draft pull request runs every job on
 // the light lane, so it fails fast without queueing behind builds (ed073e2).
 // The other reusable workflows still pin the self-hosted fleet literally.
-const draftLane = `(github.event_name == 'pull_request' && github.event.pull_request.draft) && '["fulcrum-light"]'`;
+// Forgejo evaluates runs-on at run creation with no github context, so the Draft
+// (and main-lane) choice is made by the route job and read from its outputs.
 const ciGateRunsOn = {
-  default: `\${{ fromJSON(${draftLane} || inputs.runs-on) }}`,
-  scan: `\${{ fromJSON(${draftLane} || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}`,
+  default: '${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}',
+  scan: "${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}",
 };
 const expectedRunsOn = jobName =>
   ['gitleaks', 'grype'].includes(jobName) ? ciGateRunsOn.scan : ciGateRunsOn.default;
