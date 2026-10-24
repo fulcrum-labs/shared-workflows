@@ -592,7 +592,7 @@ test('the quality job refuses any tracked node_modules entry, symlinks included'
 // the Ready run started. No job may skip on a Draft; each fails in its first step on the light lane.
 test('every gate job fails a Draft pull request in its first step and runs it on the light lane', () => {
   const starts = [...workflow.matchAll(/^  (quality|docs-lint|gitleaks|semgrep|grype):$/gm)];
-  assert.match(workflow, /^  docs-lint:\n    if: \$\{\{ !cancelled\(\) && inputs\.docs-lint-enabled \}\}$/m);
+  assert.match(workflow, /^  docs-lint:\n    if: \$\{\{ !cancelled\(\) && inputs\.enabled && inputs\.docs-lint-enabled \}\}$/m);
   assert.deepEqual(starts.map(m => m[1]), ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype']);
   for (const [i, m] of starts.entries()) {
     const job = workflow.slice(m.index, starts[i + 1]?.index ?? workflow.length);
@@ -605,7 +605,7 @@ test('every gate job fails a Draft pull request in its first step and runs it on
       `${m[1]} lane`,
     );
     // PF #691: a failed route must not skip a required job.
-    assert.match(head, /^    if: \$\{\{ !cancelled\(\)( && inputs\.docs-lint-enabled)? \}\}$/m, `${m[1]} must survive a failed route`);
+    assert.match(head, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled( && inputs\.docs-lint-enabled)? \}\}$/m, `${m[1]} must survive a failed route`);
     const steps = job.slice(job.indexOf('    steps:\n') + '    steps:\n'.length);
     const first = steps.slice(steps.indexOf('      - name:'));
     assert.match(first, /^      - name: Draft runs are never green\n        if: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.draft \}\}\n/, `${m[1]} first step`);
@@ -640,7 +640,7 @@ test('the route job picks the runner labels at run time: Draft light lane, optio
     writeFileSync(out, '');
     const r = spawnSync('bash', ['-c', script], {
       encoding: 'utf8',
-      env: { PATH: process.env.PATH, EVENT_NAME: '', IS_DRAFT: '', REF: '', RUNS_ON: '["go-heavy"]', SCAN_RUNS_ON: '', MAIN_RUNS_ON: '', ...env, GITHUB_OUTPUT: out },
+      env: { PATH: process.env.PATH, EVENT_NAME: '', IS_DRAFT: '', REF: '', RUNS_ON: '["go-heavy"]', SCAN_RUNS_ON: '', MAIN_RUNS_ON: '', ENABLED: 'true', ...env, GITHUB_OUTPUT: out },
     });
     assert.equal(r.status, 0, r.stderr);
     return Object.fromEntries(readFileSync(out, 'utf8').trim().split('\n').map(l => l.split(/=(.*)/s).slice(0, 2)));
@@ -662,4 +662,28 @@ test('the route job picks the runner labels at run time: Draft light lane, optio
   assert.deepEqual(run(pushMain), { runner: heavy, 'scan-runner': heavy }, 'main-runs-on empty means runs-on');
   assert.deepEqual(run({ EVENT_NAME: 'push', REF: 'refs/heads/other', MAIN_RUNS_ON: main }), { runner: heavy, 'scan-runner': heavy }, 'a push elsewhere uses runs-on');
   assert.deepEqual(run({ EVENT_NAME: 'workflow_dispatch', REF: 'refs/heads/main', MAIN_RUNS_ON: main, SCAN_RUNS_ON: scans }), { runner: heavy, 'scan-runner': scans }, 'only a push takes the main lane');
+  for (const event of [readyPr, draftPr, pushMain]) {
+    assert.deepEqual(run({ ...event, ENABLED: 'false', MAIN_RUNS_ON: main, SCAN_RUNS_ON: scans }), { runner: light, 'scan-runner': light }, 'a disabled gate skips on the light lane');
+  }
+});
+
+// Forgejo copies a caller's if: onto every job of the called workflow (runner v12.10.2 act/jobparser
+// expandReusableWorkflow). A false one skips route, and a gate job with an if: of its own is still moved
+// to waiting (services/actions/job_emitter.go Resolve), where its runs-on is re-read with route's missing
+// outputs and the whole run fails (pre-execution error 8, publishing run 79705, 2026-10-24). So route
+// carries no if:, and a caller turns the gate off with enabled: false.
+test('the gate turns off with enabled: false, never by skipping route', () => {
+  assert.match(workflow, /^      enabled:\n        type: boolean\n        default: true\n/m);
+  const route = workflow.slice(workflow.indexOf('\n  route:\n'), workflow.indexOf('\n  quality:\n'));
+  assert.doesNotMatch(route, /^    if:/m, 'route must never skip');
+  assert.match(route, /^          ENABLED: \$\{\{ inputs\.enabled \}\}$/m);
+  const jobs = [...workflow.matchAll(/^  ([a-z][a-z0-9-]*):\n/gm)];
+  const routed = [];
+  for (const [i, m] of jobs.entries()) {
+    const head = workflow.slice(m.index, jobs[i + 1]?.index ?? workflow.length).split('\n    steps:')[0];
+    if (!/^    runs-on:.*needs\.route\.outputs/m.test(head)) continue;
+    routed.push(m[1]);
+    assert.match(head, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled[ }&]/m, `${m[1]} must skip on enabled: false`);
+  }
+  assert.deepEqual(routed, ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype']);
 });

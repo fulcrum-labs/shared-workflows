@@ -25,6 +25,10 @@ on:
         type: boolean
         default: false
         description: 'Optional. Run the docs-convention lint job (@fulcrum-labs/docs-lint). Repos opt in via platform-foundations maintenance.docs_lint.'
+      enabled:
+        type: boolean
+        default: true
+        description: 'Optional. false skips every gate job; route still runs and sends their skipped pickups to the light lane. Only for a caller whose own aggregate is the required check and already fails a Draft (publishing code-quality). Pass this instead of an if: on the call. Forgejo copies a caller''s if onto every gate job, so a false one skips route, and a gate job whose runs-on reads route''s outputs then fails the whole run (pre-execution error 8, publishing run 79705, 2026-10-24).'
       turbo-cache-enabled:
         type: boolean
         default: false
@@ -71,6 +75,8 @@ jobs:
   # ["go-heavy"], holding heavy slots only to fail fast. A runs-on that reads needs.<job>.outputs.* is
   # re-evaluated once that job has finished, so every gate job reads its labels from this one. It also
   # carries the optional main lane (main-runs-on) for pushes to refs/heads/main. No checkout, no secrets.
+  # It has no if: of its own and must never skip, since a job that needs it reads its outputs. A caller
+  # turns the gate off with enabled: false, never an if on the call, and route sends the skipped gate jobs to the light lane.
   route:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     runs-on: ${{ fromJSON(inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on) }}
@@ -88,11 +94,12 @@ jobs:
           RUNS_ON: ${{ inputs.runs-on }}
           SCAN_RUNS_ON: ${{ inputs.scan-runs-on }}
           MAIN_RUNS_ON: ${{ inputs.main-runs-on }}
+          ENABLED: ${{ inputs.enabled }}
         run: |
           set -euo pipefail
           runner="$RUNS_ON"
           scan="${SCAN_RUNS_ON:-$RUNS_ON}"
-          if [ "$EVENT_NAME" = pull_request ] && [ "$IS_DRAFT" = true ]; then
+          if [ "$ENABLED" != true ] || { [ "$EVENT_NAME" = pull_request ] && [ "$IS_DRAFT" = true ]; }; then
             runner='["fulcrum-light"]'
             scan='["fulcrum-light"]'
           elif [ "$EVENT_NAME" = push ] && [ "$REF" = refs/heads/main ] && [ -n "$MAIN_RUNS_ON" ]; then
@@ -102,7 +109,7 @@ jobs:
           echo "scan-runner=$scan" >> "$GITHUB_OUTPUT"
 
   quality:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && inputs.enabled }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}
@@ -869,7 +876,7 @@ jobs:
           fi
 
   docs-lint:
-    if: ${{ !cancelled() && inputs.docs-lint-enabled }}
+    if: ${{ !cancelled() && inputs.enabled && inputs.docs-lint-enabled }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}
@@ -984,7 +991,7 @@ jobs:
           fi
 
   gitleaks:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && inputs.enabled }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}
@@ -1132,7 +1139,7 @@ jobs:
           fi
 
   semgrep:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && inputs.enabled }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     # S10/D3: pip installation removes the runner's Docker dependency. Keep the
     # user base in RUNNER_TEMP so self-hosted jobs cannot leak packages across runs.
@@ -1234,7 +1241,7 @@ jobs:
           fi
 
   grype:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && inputs.enabled }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}

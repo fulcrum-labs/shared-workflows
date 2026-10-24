@@ -340,7 +340,7 @@ test('all original steps retain their conditions and run when reuse is absent', 
   assert.equal(guarded.length, 33, 'all normal gate steps remain present');
   for (const step of guarded) assert.match(step, /^ {8}if: \$\{\{ steps\.prior-verdict\.outputs\.reuse != 'true'/m);
   assert.match(workflow, /if: \$\{\{ steps\.prior-verdict\.outputs\.reuse != 'true' && \(steps\.turbo-cache\.outputs\.eligible == 'true'\) \}\}/);
-  assert.match(workflow, /^    if: \$\{\{ !cancelled\(\) && inputs\.docs-lint-enabled \}\}/m);
+  assert.match(workflow, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled && inputs\.docs-lint-enabled \}\}/m);
 });
 
 test('metadata lifecycle preserves active CI while new heads still cancel stale work', () => {
