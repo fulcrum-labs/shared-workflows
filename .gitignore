@@ -1,0 +1,2 @@
+# Task worktrees (worktree-first): finish-pr refuses to clean up while they show as untracked in the root.
+.worktrees/
