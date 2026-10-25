@@ -255,9 +255,29 @@ test('API refusal, incomplete histories and bounded pagination run full CI', () 
   }
 });
 
-test('closed, draft, or moved live PRs run full CI', () => {
+test('a closed or merged PR skips the gate on any event, without prior CI evidence', () => {
   for (const change of [
     d => { d.live.state = 'closed'; },
+    d => { d.live.state = 'closed'; editPayload(d.current, p => { p.action = 'synchronize'; }); },
+    d => { d.live.state = 'closed'; d.history = [d.current]; d.statuses = []; },
+  ]) {
+    const data = fixture(); change(data);
+    const result = evaluate(data);
+    assert.equal(result.reuse, true, JSON.stringify(result));
+    assert.equal(result.reads.at(-1), `${root}/pulls/42`);
+  }
+});
+
+test('an open PR never takes the closed shortcut', () => {
+  const data = fixture(); data.history = [data.current]; data.statuses = [];
+  editPayload(data.current, p => { p.action = 'synchronize'; });
+  assert.equal(evaluate(data).reuse, false);
+  const unreadable = fixture(); unreadable.failPath = '/pulls/42';
+  assert.equal(evaluate(unreadable).reuse, false);
+});
+
+test('draft or moved live PRs run full CI', () => {
+  for (const change of [
     d => { d.live.draft = true; },
     d => { d.live.head.sha = 'c'.repeat(40); },
   ]) {

@@ -147,6 +147,7 @@ jobs:
           import json
           import os
           import re
+          import sys
           import time
           import urllib.parse
           import urllib.request
@@ -293,7 +294,19 @@ jobs:
                   return False
               proof = provenance(current, repository)
               number, head, base, branch = proof
-              if (current["id"] != run_id or payload(current).get("action") not in
+              if current["id"] != run_id:
+                  return False
+              # A run whose PR is already merged or closed has nothing left to gate: a merge
+              # needs the required contexts green at the head first, and a reopen starts a fresh
+              # run that cancels this one's group. Without this, a metadata event queued behind
+              # the verdict (infra 6870/6872 behind 6860, 2026-10-25) started after the merge,
+              # failed the open-PR check below and ran a full 20+ minute gate on a saturated
+              # heavy lane. Only a live "closed" state counts; any read error, or an open PR,
+              # keeps the normal path and verdict.
+              if read(f"{root}/pulls/{number}")["state"] == "closed":
+                  print("::notice::The pull request is closed or merged; skipping the gate.", file=sys.stderr)
+                  return True
+              if (payload(current).get("action") not in
                       {"edited", "ready_for_review", "converted_to_draft"}
                       or payload(current)["pull_request"]["draft"] is not False):
                   return False
