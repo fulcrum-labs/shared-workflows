@@ -144,10 +144,10 @@ jobs:
           import sys
           import urllib.request
 
-          EXACT = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".platform/generated-manifest.json"}
+          # docs/ is inert only for the one file platform-foundations writes there: tests and tools in foundry, publishing, invoice-portal,
+          # warfronts and fronts read other docs/ files (docs/agent/*, docs/benchmarks, production-deployment-policy.md ...).
+          EXACT = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".platform/generated-manifest.json", "docs/agent/shared-capabilities.md"}
           PREFIXES = (".claude/", ".agents/", ".gemini/", ".codex/")
-          # Only prose under the root docs/: data, images and config there can be read by a test or a tool. Content markdown (src/content, content/, publications/, packages) is never inert.
-          DOC_EXTENSIONS = (".md", ".mdx")
           # Never inert, wherever they sit: a dependency manifest or lockfile, or a scanner's configuration.
           SCAN_INPUT_NAMES = {
               "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "package-lock.json", "yarn.lock", "go.mod", "go.sum",
@@ -171,8 +171,6 @@ jobs:
                   return True
               if path.startswith(PREFIXES):
                   return True
-              if path.startswith("docs/"):
-                  return path.endswith(DOC_EXTENSIONS)
               return "/" not in path and path.endswith(".md")
 
 

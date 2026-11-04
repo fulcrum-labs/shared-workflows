@@ -704,7 +704,7 @@ test('the agent-instruction, settings and docs files are inert', () => {
   const inert = [
     'CLAUDE.md', 'AGENTS.md', 'GEMINI.md', 'README.md', 'PROJECT-NOTES.md', '.platform/generated-manifest.json',
     '.claude/hooks/manifest.json', '.claude/rules/scope-control.md', '.claude/skills/x/SKILL.md', '.agents/skills/x/SKILL.md',
-    '.gemini/settings.json', '.codex/hooks.json', 'docs/agent/mechanisms.md', 'docs/specs/a.mdx',
+    '.gemini/settings.json', '.codex/hooks.json', 'docs/agent/shared-capabilities.md',
   ];
   assert.deepEqual(classify(inert), { inert: 'true', 'code-free': 'true', 'docs-changed': 'true' });
   assert.deepEqual(classify(['.codex/hooks.json']), { inert: 'true', 'code-free': 'true', 'docs-changed': 'false' });
@@ -719,7 +719,7 @@ test('anything else runs the full gate', () => {
     '.forgejo/workflows/ci.yml', '.github/workflows/ci.yml', 'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'biome.json',
     'tsconfig.json', '.gitleaksignore', '.grype.yaml', 'src/pages/index.astro', 'src/content/post.md', 'packages/a/README.md',
     'apps/web/docs/x.md', 'scripts/ci/forge.mjs', '.claude/package.json', '.claude/pnpm-lock.yaml', 'docs/package.json',
-    'docs/build.mjs', 'docs/site/index.ts', 'docs/img/a.png', 'docs/agent/package-catalog.yaml', 'docs/log/receipt.json', 'docs/evidence/q.sql', '.platform/other.json', '.publication/cloudflare-security.mjs', '../AGENTS.md', 'docs/../src/a.ts',
+    'docs/agent/mechanisms.md', 'docs/specs/a.mdx', 'docs/reference/a.md', 'docs/benchmarks/b.md', 'docs/production-deployment-policy.md', 'docs/agent/other/shared-capabilities.md', 'docs/build.mjs', 'docs/site/index.ts', 'docs/img/a.png', 'docs/agent/package-catalog.yaml', 'docs/log/receipt.json', 'docs/evidence/q.sql', '.platform/other.json', '.publication/cloudflare-security.mjs', '../AGENTS.md', 'docs/../src/a.ts',
   ]) {
     assert.equal(classify([file]).inert, 'false', file);
     assert.equal(classify(['AGENTS.md', file]).inert, 'false', `${file} beside an inert file`);
@@ -728,7 +728,7 @@ test('anything else runs the full gate', () => {
 });
 
 test('a doc change keeps docs-lint on, an inert change without one does not', () => {
-  assert.equal(classify(['docs/a.md']).inert === 'true' && classify(['docs/a.md'])['docs-changed'], 'true');
+  assert.equal(classify(['docs/agent/shared-capabilities.md']).inert === 'true' && classify(['docs/agent/shared-capabilities.md'])['docs-changed'], 'true');
   assert.equal(classify(['.codex/hooks.json'])['docs-changed'], 'false');
 });
 
