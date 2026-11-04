@@ -144,9 +144,10 @@ jobs:
           import sys
           import urllib.request
 
+          # scripts/ci/finish-pr.mjs is operator tooling that platform-foundations writes; no consumer workflow, script or test runs it.
           # docs/ is inert only for the one file platform-foundations writes there: tests and tools in foundry, publishing, invoice-portal,
           # warfronts and fronts read other docs/ files (docs/agent/*, docs/benchmarks, production-deployment-policy.md ...).
-          EXACT = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".platform/generated-manifest.json", "docs/agent/shared-capabilities.md"}
+          EXACT = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".platform/generated-manifest.json", "docs/agent/shared-capabilities.md", "scripts/ci/finish-pr.mjs"}
           PREFIXES = (".claude/", ".agents/", ".gemini/", ".codex/")
           # Never inert, wherever they sit: a dependency manifest or lockfile, or a scanner's configuration.
           SCAN_INPUT_NAMES = {

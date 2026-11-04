@@ -711,7 +711,7 @@ test('the agent-instruction, settings and docs files are inert', () => {
 });
 
 test('a hook script is inert but not code-free, so semgrep still scans it', () => {
-  assert.deepEqual(classify(['.claude/hooks/shared/pr-completion.mjs', 'AGENTS.md']), { inert: 'true', 'code-free': 'false', 'docs-changed': 'true' });
+  assert.deepEqual(classify(['.claude/hooks/shared/pr-completion.mjs', 'scripts/ci/finish-pr.mjs', 'AGENTS.md']), { inert: 'true', 'code-free': 'false', 'docs-changed': 'true' });
 });
 
 test('anything else runs the full gate', () => {
