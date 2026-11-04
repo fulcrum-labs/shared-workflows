@@ -218,7 +218,8 @@ jobs:
                   number = int(os.environ["PR_NUMBER"])
                   files = []
                   for page in range(1, 21):
-                      batch = get(f"/repos/{repo}/pulls/{number}/files?limit=50&page={page}")
+                      # Forgejo pages by limit, GitHub by per_page; both are sent so a page is 50 on either forge.
+                      batch = get(f"/repos/{repo}/pulls/{number}/files?limit=50&per_page=50&page={page}")
                       if not isinstance(batch, list) or len(batch) > 50:
                           raise ValueError("page")
                       files.extend(names(batch))
@@ -231,7 +232,8 @@ jobs:
                       return None
                   result = get(f"/repos/{repo}/compare/{before}...{after}")
                   entries = result["files"]
-                  if not isinstance(entries, list) or len(entries) >= 1000:
+                  # GitHub caps a compare listing at 300 files, Forgejo at its diff-file limit; a listing that reaches 300 may be cut short.
+                  if not isinstance(entries, list) or len(entries) >= 300:
                       raise ValueError("compare listing")
                   return names(entries)
               return None

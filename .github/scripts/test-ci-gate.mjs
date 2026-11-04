@@ -751,3 +751,8 @@ test('a draft is never classified, so its run still fails by design', () => {
   const push = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', env: { EVENT_NAME: 'push', BEFORE: '0'.repeat(40), AFTER: 'a'.repeat(40), REPOSITORY: 'o/r', API: 'http://127.0.0.1:9', TOKEN: 'x' } });
   assert.equal(push.stdout.trim(), 'None', 'a new branch has no before: full gate');
 });
+
+test('the file listing pages by both Forgejo limit and GitHub per_page, and a compare of 300 files runs the full gate', () => {
+  assert.match(workflow, /pulls\/\{number\}\/files\?limit=50&per_page=50&page=\{page\}/);
+  assert.match(workflow, /len\(entries\) >= 300/);
+});
