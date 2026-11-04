@@ -29,6 +29,10 @@ on:
         type: boolean
         default: true
         description: 'Optional. false skips every gate job; route still runs and sends their skipped pickups to the light lane. Only for a caller whose own aggregate is the required check and already fails a Draft (publishing code-quality). Pass this instead of an if: on the call. Forgejo copies a caller''s if onto every gate job, so a false one skips route, and a gate job whose runs-on reads route''s outputs then fails the whole run (pre-execution error 8, publishing run 79705, 2026-10-24).'
+      skip-inert-changes:
+        type: boolean
+        default: true
+        description: 'Optional. Skip the build, test and dependency-scan jobs (quality, grype, and semgrep when no code file changed) for a change whose every file is inert: agent-instruction and settings files and docs that no build, test or deploy reads (route, step "Classify changed files"). gitleaks always runs, and docs-lint when a doc changed. A listing that cannot be read, a draft, or any other file runs the full gate. false is the rollback lever: every change runs the full gate.'
       turbo-cache-enabled:
         type: boolean
         default: false
@@ -84,6 +88,9 @@ jobs:
     outputs:
       runner: ${{ steps.route.outputs.runner }}
       scan-runner: ${{ steps.route.outputs.scan-runner }}
+      inert: ${{ steps.inert.outputs.inert }}
+      code-free: ${{ steps.inert.outputs.code-free }}
+      docs-changed: ${{ steps.inert.outputs.docs-changed }}
     steps:
       - name: Choose runner labels
         id: route
@@ -108,8 +115,156 @@ jobs:
           echo "runner=$runner" >> "$GITHUB_OUTPUT"
           echo "scan-runner=$scan" >> "$GITHUB_OUTPUT"
 
+      # A change whose every file is inert -- agent-instruction and settings files and docs that no build, test or
+      # deploy reads -- needs no build, test or dependency scan. Platform-foundations' conventions sync opens such a
+      # PR in every repo several times a day. The allowlist below is strict: a file not named here is not inert, so
+      # a workflow file, package.json, a lockfile, a lint or tsconfig, .gitleaksignore or any source runs the full
+      # gate; so does one inert file beside one other. Fail open: a listing that cannot be read, a draft, a push with
+      # no usable "before", or a truncated listing leaves every output empty and the full gate runs. The same
+      # allowlist is in fulcrum-labs/deploy-jobs bin/converge.sh (inert_path); change both together.
+      - name: Classify changed files
+        id: inert
+        continue-on-error: true
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          ENABLED: ${{ inputs.enabled }}
+          SKIP_INERT: ${{ inputs.skip-inert-changes }}
+          API: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          python3 - <<'INERT_CLASSIFIER'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          EXACT = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".platform/generated-manifest.json"}
+          PREFIXES = (".claude/", ".agents/", ".gemini/", ".codex/")
+          DOC_EXTENSIONS = (".md", ".mdx", ".txt", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".json", ".yaml", ".yml", ".csv")
+          # Never inert, wherever they sit: a dependency manifest or lockfile, or a scanner's configuration.
+          SCAN_INPUT_NAMES = {
+              "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "package-lock.json", "yarn.lock", "go.mod", "go.sum",
+              "Cargo.toml", "Cargo.lock", "Gemfile", "Gemfile.lock", "Pipfile", "Pipfile.lock", "poetry.lock", "pyproject.toml",
+              "composer.json", "composer.lock", "Package.swift", "Package.resolved", "Podfile", "Podfile.lock",
+          }
+          CODE_EXTENSIONS = (
+              ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".py", ".sh", ".bash", ".zsh", ".go", ".rb", ".php",
+              ".rs", ".java", ".kt", ".swift", ".c", ".h", ".cc", ".cpp", ".cs", ".astro", ".vue", ".svelte", ".sql", ".wasm", ".yml", ".yaml",
+          )
+
+
+          def is_inert(path):
+              parts = path.split("/")
+              name = parts[-1]
+              if not path or path.startswith("/") or ".." in parts:
+                  return False
+              if name in SCAN_INPUT_NAMES or name.startswith((".gitleaks", ".grype", "requirements")):
+                  return False
+              if path in EXACT:
+                  return True
+              if path.startswith(PREFIXES):
+                  return True
+              if path.startswith("docs/"):
+                  return path.endswith(DOC_EXTENSIONS)
+              return "/" not in path and path.endswith(".md")
+
+
+          def is_docs(path):
+              return path.startswith("docs/") or path.endswith((".md", ".mdx"))
+
+
+          def is_code(path):
+              return path.endswith(CODE_EXTENSIONS)
+
+
+          def classify(files):
+              if not files:
+                  return {"inert": "false", "code-free": "false", "docs-changed": "false"}
+              everything = all(is_inert(p) for p in files)
+              return {
+                  "inert": "true" if everything else "false",
+                  "code-free": "true" if everything and not any(is_code(p) for p in files) else "false",
+                  "docs-changed": "true" if any(is_docs(p) for p in files) else "false",
+              }
+
+
+          def get(path):
+              request = urllib.request.Request(os.environ["API"] + path, headers={"Authorization": "token " + os.environ["TOKEN"]})
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  return json.load(response)
+
+
+          def names(entries):
+              out = []
+              for entry in entries:
+                  out.append(entry["filename"])
+                  # A rename touches both paths; the old one counts too.
+                  if entry.get("previous_filename"):
+                      out.append(entry["previous_filename"])
+              return out
+
+
+          def changed_files():
+              repo = os.environ["REPOSITORY"]
+              if os.environ["EVENT_NAME"] == "pull_request":
+                  if os.environ.get("IS_DRAFT") == "true":
+                      return None
+                  number = int(os.environ["PR_NUMBER"])
+                  files = []
+                  for page in range(1, 21):
+                      batch = get(f"/repos/{repo}/pulls/{number}/files?limit=50&page={page}")
+                      if not isinstance(batch, list) or len(batch) > 50:
+                          raise ValueError("page")
+                      files.extend(names(batch))
+                      if len(batch) < 50:
+                          return files
+                  raise ValueError("listing too long")
+              if os.environ["EVENT_NAME"] == "push":
+                  before, after = os.environ["BEFORE"], os.environ["AFTER"]
+                  if not (re.fullmatch(r"[0-9a-f]{40}", before) and re.fullmatch(r"[0-9a-f]{40}", after)) or set(before) == {"0"}:
+                      return None
+                  result = get(f"/repos/{repo}/compare/{before}...{after}")
+                  entries = result["files"]
+                  if not isinstance(entries, list) or len(entries) >= 1000:
+                      raise ValueError("compare listing")
+                  return names(entries)
+              return None
+
+
+          def main():
+              out = {"inert": "false", "code-free": "false", "docs-changed": "false"}
+              try:
+                  if os.environ["ENABLED"] == "true" and os.environ["SKIP_INERT"] == "true":
+                      files = changed_files()
+                      if files:
+                          out = classify(files)
+                          print(f"{len(files)} changed file(s): inert={out['inert']} code-free={out['code-free']} docs-changed={out['docs-changed']}")
+                          if out["inert"] != "true":
+                              print("not inert: " + ", ".join(sorted(p for p in set(files) if not is_inert(p))[:20]))
+                      else:
+                          print("no usable change listing; the full gate runs")
+                  else:
+                      print("skip-inert-changes is off; the full gate runs")
+              except Exception as error:
+                  print(f"::warning::could not classify the changed files ({type(error).__name__}: {error}); the full gate runs", file=sys.stderr)
+                  out = {"inert": "false", "code-free": "false", "docs-changed": "false"}
+              with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+                  for key, value in out.items():
+                      handle.write(f"{key}={value}\n")
+
+
+          if __name__ == "__main__":
+              main()
+          INERT_CLASSIFIER
+
   quality:
-    if: ${{ !cancelled() && inputs.enabled }}
+    if: ${{ !cancelled() && inputs.enabled && needs.route.outputs.inert != 'true' }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}
@@ -889,7 +1044,7 @@ jobs:
           fi
 
   docs-lint:
-    if: ${{ !cancelled() && inputs.enabled && inputs.docs-lint-enabled }}
+    if: ${{ !cancelled() && inputs.enabled && inputs.docs-lint-enabled && (needs.route.outputs.inert != 'true' || needs.route.outputs.docs-changed == 'true') }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}
@@ -1152,7 +1307,7 @@ jobs:
           fi
 
   semgrep:
-    if: ${{ !cancelled() && inputs.enabled }}
+    if: ${{ !cancelled() && inputs.enabled && needs.route.outputs.code-free != 'true' }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     # S10/D3: pip installation removes the runner's Docker dependency. Keep the
     # user base in RUNNER_TEMP so self-hosted jobs cannot leak packages across runs.
@@ -1254,7 +1409,7 @@ jobs:
           fi
 
   grype:
-    if: ${{ !cancelled() && inputs.enabled }}
+    if: ${{ !cancelled() && inputs.enabled && needs.route.outputs.inert != 'true' }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}

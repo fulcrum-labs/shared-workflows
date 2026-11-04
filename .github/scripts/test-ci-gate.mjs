@@ -592,7 +592,7 @@ test('the quality job refuses any tracked node_modules entry, symlinks included'
 // the Ready run started. No job may skip on a Draft; each fails in its first step on the light lane.
 test('every gate job fails a Draft pull request in its first step and runs it on the light lane', () => {
   const starts = [...workflow.matchAll(/^  (quality|docs-lint|gitleaks|semgrep|grype):$/gm)];
-  assert.match(workflow, /^  docs-lint:\n    if: \$\{\{ !cancelled\(\) && inputs\.enabled && inputs\.docs-lint-enabled \}\}$/m);
+  assert.match(workflow, /^  docs-lint:\n    if: \$\{\{ !cancelled\(\) && inputs\.enabled && inputs\.docs-lint-enabled && \(needs\.route\.outputs\.inert != 'true' \|\| needs\.route\.outputs\.docs-changed == 'true'\) \}\}$/m);
   assert.deepEqual(starts.map(m => m[1]), ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype']);
   for (const [i, m] of starts.entries()) {
     const job = workflow.slice(m.index, starts[i + 1]?.index ?? workflow.length);
@@ -605,7 +605,7 @@ test('every gate job fails a Draft pull request in its first step and runs it on
       `${m[1]} lane`,
     );
     // PF #691: a failed route must not skip a required job.
-    assert.match(head, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled( && inputs\.docs-lint-enabled)? \}\}$/m, `${m[1]} must survive a failed route`);
+    assert.match(head, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled( && inputs\.docs-lint-enabled)?( && needs\.route\.outputs\.(inert|code-free) != 'true')?( && \(needs\.route\.outputs\.inert != 'true' \|\| needs\.route\.outputs\.docs-changed == 'true'\))? \}\}$/m, `${m[1]} must survive a failed route`);
     const steps = job.slice(job.indexOf('    steps:\n') + '    steps:\n'.length);
     const first = steps.slice(steps.indexOf('      - name:'));
     assert.match(first, /^      - name: Draft runs are never green\n        if: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.draft \}\}\n/, `${m[1]} first step`);
@@ -686,4 +686,68 @@ test('the gate turns off with enabled: false, never by skipping route', () => {
     assert.match(head, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled[ }&]/m, `${m[1]} must skip on enabled: false`);
   }
   assert.deepEqual(routed, ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype']);
+});
+
+// Inert changes: route classifies the changed files and the heavy gate jobs skip when every file is inert.
+// The classifier is the python heredoc in route's "Classify changed files" step; it is run here as shipped.
+const classifier = workflow.match(/python3 - <<'INERT_CLASSIFIER'\n([\s\S]*?)\n\s*INERT_CLASSIFIER\n/)[1]
+  .split('\n').map((line) => line.replace(/^          /, '')).join('\n');
+
+function classify(files) {
+  const script = `import json\nns = {'__name__': 'test'}\nexec(${JSON.stringify(classifier)}, ns)\nprint(json.dumps(ns['classify'](json.loads(${JSON.stringify(JSON.stringify(files))}))))`;
+  const result = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test('the agent-instruction, settings and docs files are inert', () => {
+  const inert = [
+    'CLAUDE.md', 'AGENTS.md', 'GEMINI.md', 'README.md', 'PROJECT-NOTES.md', '.platform/generated-manifest.json',
+    '.claude/hooks/manifest.json', '.claude/rules/scope-control.md', '.claude/skills/x/SKILL.md', '.agents/skills/x/SKILL.md',
+    '.gemini/settings.json', '.codex/hooks.json', 'docs/agent/mechanisms.md', 'docs/img/a.png',
+  ];
+  assert.deepEqual(classify(inert), { inert: 'true', 'code-free': 'true', 'docs-changed': 'true' });
+  assert.deepEqual(classify(['.codex/hooks.json']), { inert: 'true', 'code-free': 'true', 'docs-changed': 'false' });
+});
+
+test('a hook script is inert but not code-free, so semgrep still scans it', () => {
+  assert.deepEqual(classify(['.claude/hooks/shared/pr-completion.mjs', 'AGENTS.md']), { inert: 'true', 'code-free': 'false', 'docs-changed': 'true' });
+});
+
+test('anything else runs the full gate', () => {
+  for (const file of [
+    '.forgejo/workflows/ci.yml', '.github/workflows/ci.yml', 'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'biome.json',
+    'tsconfig.json', '.gitleaksignore', '.grype.yaml', 'src/pages/index.astro', 'src/content/post.md', 'packages/a/README.md',
+    'apps/web/docs/x.md', 'scripts/ci/forge.mjs', '.claude/package.json', '.claude/pnpm-lock.yaml', 'docs/package.json',
+    'docs/build.mjs', 'docs/site/index.ts', '.platform/other.json', '.publication/cloudflare-security.mjs', '../AGENTS.md', 'docs/../src/a.ts',
+  ]) {
+    assert.equal(classify([file]).inert, 'false', file);
+    assert.equal(classify(['AGENTS.md', file]).inert, 'false', `${file} beside an inert file`);
+  }
+  assert.equal(classify([]).inert, 'false', 'an empty listing is not inert');
+});
+
+test('a doc change keeps docs-lint on, an inert change without one does not', () => {
+  assert.equal(classify(['docs/a.md']).inert === 'true' && classify(['docs/a.md'])['docs-changed'], 'true');
+  assert.equal(classify(['.codex/hooks.json'])['docs-changed'], 'false');
+});
+
+test('only the heavy jobs skip on an inert change; gitleaks always runs', () => {
+  const job = (name) => workflow.slice(workflow.indexOf(`\n  ${name}:\n`)).split('\n    steps:')[0];
+  assert.match(job('quality'), /needs\.route\.outputs\.inert != 'true'/);
+  assert.match(job('grype'), /needs\.route\.outputs\.inert != 'true'/);
+  assert.match(job('semgrep'), /needs\.route\.outputs\.code-free != 'true'/);
+  assert.match(job('docs-lint'), /needs\.route\.outputs\.docs-changed == 'true'/);
+  assert.doesNotMatch(job('gitleaks'), /needs\.route\.outputs\.(inert|code-free)/);
+  assert.match(workflow, /^      skip-inert-changes:\n        type: boolean\n        default: true\n/m);
+  assert.match(workflow, /SKIP_INERT: \$\{\{ inputs\.skip-inert-changes \}\}/);
+});
+
+test('a draft is never classified, so its run still fails by design', () => {
+  const script = `import os\nns = {'__name__': 'test'}\nexec(${JSON.stringify(classifier)}, ns)\nprint(ns['changed_files']())`;
+  const result = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', env: { EVENT_NAME: 'pull_request', IS_DRAFT: 'true', REPOSITORY: 'o/r', PR_NUMBER: '1', API: 'http://127.0.0.1:9', TOKEN: 'x' } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), 'None');
+  const push = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', env: { EVENT_NAME: 'push', BEFORE: '0'.repeat(40), AFTER: 'a'.repeat(40), REPOSITORY: 'o/r', API: 'http://127.0.0.1:9', TOKEN: 'x' } });
+  assert.equal(push.stdout.trim(), 'None', 'a new branch has no before: full gate');
 });

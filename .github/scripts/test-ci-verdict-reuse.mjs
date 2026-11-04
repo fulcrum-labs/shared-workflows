@@ -356,11 +356,11 @@ print(json.dumps(seen))
 test('all original steps retain their conditions and run when reuse is absent', () => {
   const steps = workflow.split(/^      - /m).slice(1);
   assert.equal(steps.filter(s => s.startsWith('*prior-verdict')).length, 4);
-  const guarded = steps.filter(s => !s.startsWith('*prior-verdict') && !s.startsWith('&prior-verdict') && !s.startsWith('name: Draft runs are never green') && !s.startsWith('name: Choose runner labels'));
+  const guarded = steps.filter(s => !s.startsWith('*prior-verdict') && !s.startsWith('&prior-verdict') && !s.startsWith('name: Draft runs are never green') && !s.startsWith('name: Choose runner labels') && !s.startsWith('name: Classify changed files'));
   assert.equal(guarded.length, 33, 'all normal gate steps remain present');
   for (const step of guarded) assert.match(step, /^ {8}if: \$\{\{ steps\.prior-verdict\.outputs\.reuse != 'true'/m);
   assert.match(workflow, /if: \$\{\{ steps\.prior-verdict\.outputs\.reuse != 'true' && \(steps\.turbo-cache\.outputs\.eligible == 'true'\) \}\}/);
-  assert.match(workflow, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled && inputs\.docs-lint-enabled \}\}/m);
+  assert.match(workflow, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled && inputs\.docs-lint-enabled && /m);
 });
 
 test('metadata lifecycle preserves active CI while new heads still cancel stale work', () => {
