@@ -704,7 +704,7 @@ test('the agent-instruction, settings and docs files are inert', () => {
   const inert = [
     'CLAUDE.md', 'AGENTS.md', 'GEMINI.md', 'README.md', 'PROJECT-NOTES.md', '.platform/generated-manifest.json',
     '.claude/hooks/manifest.json', '.claude/rules/scope-control.md', '.claude/skills/x/SKILL.md', '.agents/skills/x/SKILL.md',
-    '.gemini/settings.json', '.codex/hooks.json', 'docs/agent/mechanisms.md', 'docs/img/a.png',
+    '.gemini/settings.json', '.codex/hooks.json', 'docs/agent/mechanisms.md', 'docs/specs/a.mdx',
   ];
   assert.deepEqual(classify(inert), { inert: 'true', 'code-free': 'true', 'docs-changed': 'true' });
   assert.deepEqual(classify(['.codex/hooks.json']), { inert: 'true', 'code-free': 'true', 'docs-changed': 'false' });
@@ -719,7 +719,7 @@ test('anything else runs the full gate', () => {
     '.forgejo/workflows/ci.yml', '.github/workflows/ci.yml', 'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'biome.json',
     'tsconfig.json', '.gitleaksignore', '.grype.yaml', 'src/pages/index.astro', 'src/content/post.md', 'packages/a/README.md',
     'apps/web/docs/x.md', 'scripts/ci/forge.mjs', '.claude/package.json', '.claude/pnpm-lock.yaml', 'docs/package.json',
-    'docs/build.mjs', 'docs/site/index.ts', '.platform/other.json', '.publication/cloudflare-security.mjs', '../AGENTS.md', 'docs/../src/a.ts',
+    'docs/build.mjs', 'docs/site/index.ts', 'docs/img/a.png', 'docs/agent/package-catalog.yaml', 'docs/log/receipt.json', 'docs/evidence/q.sql', '.platform/other.json', '.publication/cloudflare-security.mjs', '../AGENTS.md', 'docs/../src/a.ts',
   ]) {
     assert.equal(classify([file]).inert, 'false', file);
     assert.equal(classify(['AGENTS.md', file]).inert, 'false', `${file} beside an inert file`);
@@ -755,4 +755,15 @@ test('a draft is never classified, so its run still fails by design', () => {
 test('the file listing pages by both Forgejo limit and GitHub per_page, and a compare of 300 files runs the full gate', () => {
   assert.match(workflow, /pulls\/\{number\}\/files\?limit=50&per_page=50&page=\{page\}/);
   assert.match(workflow, /len\(entries\) >= 300/);
+});
+
+test('content markdown anywhere is never inert, so a content change runs the full gate', () => {
+  for (const file of [
+    'src/content/articles/a.md', 'src/content/pages/b.mdx', 'content/a.md', 'publications/fronts/content/a.md',
+    'publications/fronts/src/content/b.mdx', 'apps/web/src/content/c.md', 'apps/web/README.md', 'packages/cms/docs/a.md',
+    'public/llms.txt', 'src/pages/about.md', 'pages/index.mdx', 'articles/2026/a.md', 'a/docs/b.md',
+  ]) {
+    assert.equal(classify([file]).inert, 'false', file);
+    assert.equal(classify(['AGENTS.md', file]).inert, 'false', `${file} beside an inert file`);
+  }
 });

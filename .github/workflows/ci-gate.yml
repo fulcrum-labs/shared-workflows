@@ -146,7 +146,8 @@ jobs:
 
           EXACT = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".platform/generated-manifest.json"}
           PREFIXES = (".claude/", ".agents/", ".gemini/", ".codex/")
-          DOC_EXTENSIONS = (".md", ".mdx", ".txt", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".json", ".yaml", ".yml", ".csv")
+          # Only prose under the root docs/: data, images and config there can be read by a test or a tool. Content markdown (src/content, content/, publications/, packages) is never inert.
+          DOC_EXTENSIONS = (".md", ".mdx")
           # Never inert, wherever they sit: a dependency manifest or lockfile, or a scanner's configuration.
           SCAN_INPUT_NAMES = {
               "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "package-lock.json", "yarn.lock", "go.mod", "go.sum",
