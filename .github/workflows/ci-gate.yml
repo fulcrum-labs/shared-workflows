@@ -299,17 +299,42 @@ jobs:
           import os
           import re
           import time
+          import urllib.error
           import urllib.parse
           import urllib.request
 
           SHA = re.compile(r"[0-9a-f]{40}")
           WORK = "CI gate (typecheck + lint + test + build)"
+          # The statuses a refusal may name; any other answer is named "not success".
+          STATUSES = {"failure", "cancelled", "running", "waiting", "blocked", "skipped", "unknown"}
+          # The reads this step makes, by their fixed shape (ids and shas stand as {id} and {sha}).
+          ENDPOINTS = {"actions/runs/{id}", "commits/{sha}/pull", "git/commits/{sha}", "actions/runs",
+                       "actions/runs/{id}/jobs", "actions/jobs/{id}"}
+          # Why the last verdict() returned None, for the step's one reason line.
+          REFUSED = []
+
+
+          class Refusal(ValueError):
+              """A refusal whose text is a literal of this step (or an HTTP code and a fixed read shape): never response
+              data, a URL, a header or a credential, so the reason line may print it."""
+
+
+          def refuse(reason):
+              REFUSED.append(reason)
+              return None
+
+
+          def endpoint(path):
+              # The read's fixed shape: the repository, ids, shas and the query never reach the log.
+              parts = urllib.parse.urlsplit(path).path.split("/")[4:]
+              shape = "/".join("{id}" if part.isdigit() else "{sha}" if SHA.fullmatch(part) else part for part in parts)
+              return shape if shape in ENDPOINTS else "another read"
 
 
           def payload(run):
               value = json.loads(run["event_payload"])
               if not isinstance(value, dict):
-                  raise ValueError("payload")
+                  raise Refusal("payload")
               return value
 
 
@@ -319,20 +344,20 @@ jobs:
                   result = read(path + ("&" if "?" in path else "?") + f"limit=50&page={page}")
                   batch = result[key] if key else result
                   if not isinstance(batch, list) or len(batch) > 50:
-                      raise ValueError("page")
+                      raise Refusal("page")
                   entries.extend(batch)
                   if len(batch) < 50:
                       if key and result["total_count"] != len(entries):
-                          raise ValueError("incomplete history")
+                          raise Refusal("incomplete history")
                       return entries
-              raise ValueError("page bound")
+              raise Refusal("page bound")
 
 
           def tree(read, root, sha):
               commit = read(f"{root}/git/commits/{sha}")
               value = commit["commit"]["tree"]["sha"]
               if commit["sha"] != sha or not isinstance(value, str) or not SHA.fullmatch(value):
-                  raise ValueError("commit")
+                  raise Refusal("commit")
               return value
 
 
@@ -347,21 +372,21 @@ jobs:
               # event). Anything else raises.
               jobs = [job for job in pages(read, f"{root}/actions/runs/{run['id']}/jobs") if job["name"] == "quality"]
               if len(jobs) != 1:
-                  raise ValueError("quality job")
+                  raise Refusal("quality job")
               job = jobs[0]
               if (type(job["id"]) is not int or job["id"] <= 0 or job["run_id"] != run["id"] or job["status"] != "success"
                       or type(job["task_id"]) is not int or job["task_id"] <= 0):
-                  raise ValueError("unexecuted quality")
+                  raise Refusal("unexecuted quality")
               detail = read(f"{root}/actions/jobs/{job['id']}")
               for key in ("id", "run_id", "task_id", "name", "status"):
                   if type(detail[key]) is not type(job[key]) or detail[key] != job[key]:
-                      raise ValueError("job changed")
+                      raise Refusal("job changed")
               steps = detail["steps"]
               if not isinstance(steps, list) or not 1 <= len(steps) <= 100:
-                  raise ValueError("steps")
+                  raise Refusal("steps")
               work = [step for step in steps if isinstance(step, dict) and step.get("name") == WORK]
               if len(work) != 1 or work[0]["status"] not in {"success", "skipped"}:
-                  raise ValueError("work")
+                  raise Refusal("work")
               return work[0]["status"] == "success"
 
 
@@ -374,24 +399,24 @@ jobs:
                       or current["repository"]["full_name"] != repository or "pull_request" in event
                       or event.get("ref") != "refs/heads/main" or event.get("after") != sha
                       or not isinstance(workflow, str) or not workflow.strip()):
-                  return None
+                  return refuse("this run is not the push of this commit to main")
               pull = read(f"{root}/commits/{sha}/pull")
               number, head = pull["number"], pull["head"]["sha"]
               if (type(number) is not int or number <= 0 or pull["merged"] is not True or pull["merge_commit_sha"] != sha
                       or pull["base"]["ref"] != "main" or pull["base"]["repo"]["full_name"] != repository
                       or pull["head"]["repo"]["full_name"] != repository or not isinstance(head, str) or not SHA.fullmatch(head)):
-                  return None
+                  return refuse("this commit is not a same-repository pull request merged into main")
               candidate = tree(read, root, sha)
               if tree(read, root, head) != candidate:
-                  return None
+                  return refuse("the merged pull request's head has another tree")
               query = urllib.parse.urlencode({"head_sha": head, "workflow_id": workflow})
               history = pages(read, f"{root}/actions/runs?{query}", "workflow_runs")
               ids = [run["id"] for run in history]
               if any(type(i) is not int or i <= 0 for i in ids) or len(set(ids)) != len(ids):
-                  raise ValueError("run id")
+                  raise Refusal("run id")
               for run in sorted(history, key=lambda run: run["id"], reverse=True):
                   if run["workflow_id"] != workflow or run["commit_sha"] != head:
-                      raise ValueError("history filter")
+                      raise Refusal("history filter")
                   if run["trigger_event"] != "pull_request":
                       continue
                   pr = payload(run)["pull_request"]
@@ -401,38 +426,46 @@ jobs:
                           or run["need_approval"] is not False or pr["head"]["sha"] != head
                           or pr["head"]["repo"]["full_name"] != repository or pr["base"]["repo"]["full_name"] != repository
                           or pr["base"]["ref"] != "main" or type(pr["draft"]) is not bool):
-                      raise ValueError("provenance")
+                      raise Refusal("provenance")
                   # A Draft run executes nothing, and a run still queued behind the merge has not started.
                   if pr["draft"] or (run["status"] in {"waiting", "blocked"} and unstarted(run)):
                       continue
                   # The newest Ready verdict decides: a failure, cancellation or unfinished run is no reuse.
                   if run["status"] != "success":
-                      return None
+                      status = run["status"] if run["status"] in STATUSES else "not success"
+                      return refuse(f"the newest Ready pull request run at the head is {status}")
                   if executed(read, root, run):
                       index = run["index_in_repo"]
                       if type(index) is not int or index <= 0:
-                          raise ValueError("index")
+                          raise Refusal("index")
                       return {"schema": "ci-gate.reused.v1", "repository": repository, "candidateCommit": sha,
                               "candidateTree": candidate, "pullRequest": number, "head": head,
                               "runId": run["id"], "runIndex": index}
                   # This Ready run reused an earlier verdict at the same head: the run before it decides.
-              return None
+              return refuse("no Ready pull request run at the head executed the gate")
 
 
           def main():
               record = None
+              reason = None
               env = os.environ
               try:
-                  if (env["ENABLED"] == "true" and env.get("MAIN_REUSE") == "true"
-                          and env["VERDICT_REF"] == "refs/heads/main" and not env.get("VERDICT_PR")
-                          and env.get("VERDICT_BEFORE") and SHA.fullmatch(env["VERDICT_SHA"])):
+                  if env["VERDICT_REF"] != "refs/heads/main" or env.get("VERDICT_PR"):
+                      pass  # a pull request or another branch: nothing to reuse and nothing to say
+                  elif env["ENABLED"] != "true":
+                      reason = "the gate is off"
+                  elif env.get("MAIN_REUSE") != "true":
+                      reason = "main-verdict-reuse is off for this repository"
+                  elif not env.get("VERDICT_BEFORE") or not SHA.fullmatch(env["VERDICT_SHA"]):
+                      reason = "this run carries no push of a full commit"
+                  else:
                       api = env["VERDICT_API"].rstrip("/")
                       parsed = urllib.parse.urlsplit(api)
                       repository = env["VERDICT_REPOSITORY"]
                       if (parsed.scheme != "https" or parsed.path != "/api/v1" or parsed.query or parsed.fragment
                               or parsed.username or parsed.password
                               or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)):
-                          raise ValueError("unsupported API")
+                          raise Refusal("unsupported API")
                       # The existing job credential, never an operator or admin token.
                       token = env["VERDICT_TOKEN"]
                       deadline = time.monotonic() + 25
@@ -446,21 +479,39 @@ jobs:
                       def read(path):
                           remaining = deadline - time.monotonic()
                           if remaining <= 0 or not path.startswith("/repos/"):
-                              raise ValueError("read bound")
+                              raise Refusal("read bound")
                           request = urllib.request.Request(api + path, headers={
                               "Authorization": "token " + token, "Accept": "application/json",
                               "User-Agent": "platform-foundations-ci-verdict/1"})
-                          with opener.open(request, timeout=min(5, remaining)) as response:
+                          try:
+                              response = opener.open(request, timeout=min(5, remaining))
+                          except urllib.error.HTTPError as error:
+                              # The status code and the read's fixed shape only: never the body, URL or headers.
+                              code = error.code if type(error.code) is int else 0
+                              error.close()
+                              raise Refusal(f"HTTP {code} on {endpoint(path)}") from None
+                          with response:
                               body = response.read(2 * 1024 * 1024 + 1)
                               if len(body) > 2 * 1024 * 1024:
-                                  raise ValueError("response bound")
+                                  raise Refusal("response bound")
                               return json.loads(body)
 
+                      del REFUSED[:]
                       record = verdict(read, repository, int(env["VERDICT_RUN_ID"]), env["VERDICT_SHA"])
-              except Exception:
-                  # Never echo response bodies, PR text, credentials or raw exception text.
-                  record = None
-                  print("::notice::No executed pull request verdict at this tree; running the full gate.")
+                      if record is None:
+                          reason = REFUSED[-1] if REFUSED else "no reason recorded"
+              except Refusal as error:
+                  record, reason = None, str(error)
+              except Exception as error:
+                  # Never echo response bodies, PR text, credentials or raw exception text: the class name only, and a
+                  # missing field by its name, which is always a literal key of this step.
+                  record, reason = None, type(error).__name__
+                  if (isinstance(error, KeyError) and len(error.args) == 1 and isinstance(error.args[0], str)
+                          and re.fullmatch(r"[a-z_]{1,40}", error.args[0])):
+                      reason = f"KeyError {error.args[0]}"
+              if reason:
+                  # A plain line: the runner keeps it in the job log, where a ::notice:: annotation was lost.
+                  print(f"CI_GATE_MAIN_REUSE refused: {reason}; running the full gate.")
               lines = ["reuse=" + ("true" if record else "false")]
               if record:
                   print(f"::notice::Reusing pull request #{record['pullRequest']}'s executed verdict at tree {record['candidateTree']}.")

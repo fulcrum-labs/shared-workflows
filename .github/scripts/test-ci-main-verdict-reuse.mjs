@@ -88,9 +88,11 @@ def read(path):
         return data["details"][url.path.rsplit("/", 1)[1]]
     raise AssertionError("unexpected read " + path)
 try:
-    print(json.dumps({"record": namespace["verdict"](read, "fulcrum-labs/fixture", 200, data["current"]["commit_sha"]), "reads": reads}))
+    record = namespace["verdict"](read, "fulcrum-labs/fixture", 200, data["current"]["commit_sha"])
+    print(json.dumps({"record": record, "reads": reads, "reason": None if record else (namespace["REFUSED"] or [None])[-1]}))
 except Exception as error:
-    print(json.dumps({"record": None, "error": type(error).__name__, "reads": reads}))
+    reason = str(error) if isinstance(error, namespace["Refusal"]) else None
+    print(json.dumps({"record": None, "error": type(error).__name__, "reason": reason, "reads": reads}))
 `], { input: JSON.stringify({ source: verdictSource, ...JSON.parse(JSON.stringify(data)) }), encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
@@ -194,15 +196,31 @@ function runMain(env, record = undefined) {
 import json, os, sys
 namespace = {"__name__": "fixture"}
 exec(compile(json.load(sys.stdin), "ci-gate.yml", "exec"), namespace)
+import io, urllib.error
 seen = []
+http = json.loads(os.environ.pop("FIXTURE_HTTP", "null"))
 class Recorder:
     def open(self, request, **kwargs):
         seen.append(request.full_url)
+        if http:
+            raise urllib.error.HTTPError(request.full_url + "?token=leak", http["code"], "secret reason text",
+                                         {"X-Leak": "header-value"}, io.BytesIO(http["body"].encode()))
         raise PermissionError("fixture refusal")
 namespace["urllib"].request.build_opener = lambda *args: Recorder()
 record = json.loads(os.environ.pop("FIXTURE_RECORD", "null"))
 if record is not None:
     namespace["verdict"] = lambda read, repository, run_id, sha: record
+refused = os.environ.pop("FIXTURE_REFUSE", "")
+if refused:
+    namespace["verdict"] = lambda read, repository, run_id, sha: namespace["refuse"](refused)
+raised = os.environ.pop("FIXTURE_RAISE", "")
+if raised:
+    def boom(read, repository, run_id, sha):
+        kind, _, text = raised.partition(":")
+        if kind == "KeyError":
+            raise KeyError(text)
+        json.loads(text)
+    namespace["verdict"] = boom
 namespace["main"]()
 print(json.dumps(seen))
 `], { input: JSON.stringify(verdictSource), encoding: 'utf8', timeout: 10000, env: {
@@ -213,7 +231,8 @@ print(json.dumps(seen))
     } });
     assert.equal(result.status, 0, result.stderr);
     const output = Object.fromEntries(readFileSync(join(folder, 'out'), 'utf8').trim().split('\n').map(l => l.split(/=(.*)/s).slice(0, 2)));
-    return { output, requests: JSON.parse(result.stdout.trim().split('\n').pop()) };
+    const printed = result.stdout.trim().split('\n');
+    return { output, requests: JSON.parse(printed.pop()), printed };
   } finally {
     rmSync(folder, { recursive: true, force: true });
   }
@@ -345,4 +364,95 @@ test('main-verdict-reuse is an input, on by default, so one repository can keep 
   const { output, requests } = runMain({ MAIN_REUSE: 'false' }, named());
   assert.deepEqual(output, { reuse: 'false' });
   assert.deepEqual(requests, []);
+});
+
+// A main push that runs the full gate says why in one plain line the runner keeps (a ::notice:: annotation was lost).
+// Every reason is a literal of the step: never a response body, a URL, a header or the job token.
+const REFUSED = reason => `CI_GATE_MAIN_REUSE refused: ${reason}; running the full gate.`;
+
+test('each refusal path names its fixed reason', () => {
+  const reason = (data, edit = () => {}) => { edit(data); return evaluate(data).reason; };
+  for (const status of ['failure', 'cancelled', 'running', 'waiting']) {
+    assert.equal(reason(fixture([prRun(160, { status }), prRun(150)])), `the newest Ready pull request run at the head is ${status}`);
+  }
+  assert.equal(reason(fixture([prRun(160, { status: 'Bad\nline' }), prRun(150)])), 'the newest Ready pull request run at the head is not success');
+  assert.equal(reason(fixture([prRun(160)], { 160: 'skipped' })), 'no Ready pull request run at the head executed the gate');
+  assert.equal(reason(fixture([])), 'no Ready pull request run at the head executed the gate');
+  assert.equal(reason(fixture(), d => { d.trees[HEAD] = 'e'.repeat(40); }), "the merged pull request's head has another tree");
+  assert.equal(reason(fixture(), d => { d.current.trigger_event = 'pull_request'; }), 'this run is not the push of this commit to main');
+  assert.equal(reason(fixture(), d => { d.pull.merged = false; }), 'this commit is not a same-repository pull request merged into main');
+  // A refused shape names the check it failed, a literal of the step.
+  assert.equal(reason(fixture([prRun(150, { is_fork_pull_request: true })])), 'provenance');
+  assert.equal(reason(fixture(), d => { d.jobs[150] = d.jobs[150].filter(job => job.name !== 'quality'); }), 'quality job');
+  assert.equal(reason(fixture(), d => { d.total = 2; }), 'incomplete history');
+  assert.equal(evaluate(fixture()).reason, null, 'a reuse refuses nothing');
+});
+
+test('main() prints one reason line on a main push that runs the full gate, and nothing on a pull request or a reuse', () => {
+  const cases = [
+    [{ ENABLED: 'false' }, 'the gate is off'],
+    [{ MAIN_REUSE: 'false' }, 'main-verdict-reuse is off for this repository'],
+    [{ MAIN_REUSE: '' }, 'main-verdict-reuse is off for this repository'],
+    [{ VERDICT_BEFORE: '' }, 'this run carries no push of a full commit'],
+    [{ VERDICT_SHA: 'main' }, 'this run carries no push of a full commit'],
+    [{ VERDICT_API: 'http://forge.example/api/v1' }, 'unsupported API'],
+    [{}, 'PermissionError'],
+    [{ FIXTURE_REFUSE: "the merged pull request's head has another tree" }, "the merged pull request's head has another tree"],
+    [{ FIXTURE_RAISE: 'KeyError:workflow_id' }, 'KeyError workflow_id'],
+    [{ FIXTURE_RAISE: 'KeyError:Bearer fixture-only' }, 'KeyError'],
+    [{ FIXTURE_RAISE: 'json:{"leak": token fixture-only' }, 'JSONDecodeError'],
+  ];
+  for (const [env, reason] of cases) {
+    const { output, printed } = runMain(env);
+    assert.deepEqual(output, { reuse: 'false' }, JSON.stringify(env));
+    assert.deepEqual(printed, [REFUSED(reason)], JSON.stringify(env));
+  }
+  for (const env of [{ VERDICT_PR: '7' }, { VERDICT_REF: 'refs/heads/other' }]) {
+    assert.deepEqual(runMain(env).printed, [], JSON.stringify(env));
+  }
+  const reused = runMain({}, named());
+  assert.equal(reused.output.reuse, 'true');
+  assert.ok(!reused.printed.some(line => line.startsWith('CI_GATE_MAIN_REUSE')), 'a reuse prints no refusal');
+});
+
+test('an HTTP refusal names its code and the read\'s fixed shape, never the body, URL, headers or token', () => {
+  for (const code of [401, 403, 404, 500, 302]) {
+    const { output, printed, requests } = runMain({ FIXTURE_HTTP: JSON.stringify({ code, body: '{"message":"secret body text"}' }) });
+    assert.deepEqual(output, { reuse: 'false' });
+    assert.deepEqual(requests, [`https://forge.example/api/v1${root}/actions/runs/200`]);
+    assert.deepEqual(printed, [REFUSED(`HTTP ${code} on actions/runs/{id}`)]);
+    for (const leak of ['secret', 'leak', 'header-value', 'fixture-only', 'forge.example', 'fulcrum-labs/fixture', '200']) {
+      assert.ok(!printed.join('\n').includes(leak), `${code} leaks ${leak}`);
+    }
+  }
+});
+
+test('a read is named by its fixed shape, and any other path by none', () => {
+  const result = spawnSync('python3', ['-I', '-c', `
+import json, sys
+namespace = {"__name__": "fixture"}
+exec(compile(json.load(sys.stdin), "ci-gate.yml", "exec"), namespace)
+root = "/repos/fulcrum-labs/fixture"
+print(json.dumps([namespace["endpoint"](root + path) for path in sys.argv[1:]]))
+`, '/actions/runs/200', `/commits/${MAIN}/pull`, `/git/commits/${HEAD}`, `/actions/runs?head_sha=${HEAD}&workflow_id=ci.yml&limit=50&page=1`,
+    '/actions/runs/150/jobs?limit=50&page=1', '/actions/jobs/1501', '/actions/secrets', `/contents/${'x'.repeat(10)}`],
+  { input: JSON.stringify(verdictSource), encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), ['actions/runs/{id}', 'commits/{sha}/pull', 'git/commits/{sha}', 'actions/runs',
+    'actions/runs/{id}/jobs', 'actions/jobs/{id}', 'another read', 'another read']);
+});
+
+test('every refusal text in the step is a literal, so the reason line can print nothing it read', () => {
+  const refusals = [...verdictSource.matchAll(/(?<!def )\b(?:raise Refusal|refuse)\((.*)\)/g)].map(m => m[1].replace(/\) from None$/, ''));
+  assert.ok(refusals.length >= 20, refusals.length);
+  const formatted = new Set(['f"HTTP {code} on {endpoint(path)}"', 'f"the newest Ready pull request run at the head is {status}"']);
+  for (const text of refusals) {
+    assert.ok(/^"[^"{}\\]+"$/.test(text) || formatted.has(text), text);
+  }
+  assert.doesNotMatch(verdictSource, /raise ValueError\(/, 'every refusal of this step is a Refusal');
+});
+
+test('the gate asks for no more than contents: read, the most every caller grants', () => {
+  // A called workflow that asks for more than its caller grants may fail at start; a wider grant is its own change.
+  assert.match(workflow, /^permissions:\n  contents: read\n\n/m);
 });
