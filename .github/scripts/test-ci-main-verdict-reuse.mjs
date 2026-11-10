@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -21,7 +21,47 @@ const repository = 'fulcrum-labs/fixture';
 const root = `/repos/${repository}`;
 const MAIN = 'c'.repeat(40);
 const HEAD = 'a'.repeat(40);
-const TREE = 'd'.repeat(40);
+
+// A real git repository whose root tree holds every entry kind a reused tree may: a file, an executable, a symlink, a
+// directory and a non-ASCII name, with `a`, `a-b` and `a0`, whose order changes once directory `a` sorts as `a/`.
+// Forgejo's tree listing of a commit is built from `git ls-tree` (its mode text, fmt "%06o", is git's: a directory's
+// `040000`), and TREE is git's own id of that tree, which the rebuild must reach.
+function git(dir, ...args) {
+  const result = spawnSync('git', ['-C', dir, '-c', 'commit.gpgsign=false', ...args], { encoding: 'buffer', env: {
+    ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  assert.equal(result.status, 0, result.stderr.toString());
+  return result.stdout;
+}
+const listingOf = (dir, rev) => git(dir, 'ls-tree', '-z', rev).toString('utf8').split('\0').filter(Boolean).map(record => {
+  const [meta, path] = [record.slice(0, record.indexOf('\t')), record.slice(record.indexOf('\t') + 1)];
+  const [mode, type, sha] = meta.split(' ');
+  return { path, mode, type, size: 0, sha, url: `https://forge.example/api/v1${'/repos/fulcrum-labs/fixture'}/git/${type}s/${sha}` };
+});
+const gitRepo = mkdtempSync(join(tmpdir(), 'ci-gate-tree-'));
+writeFileSync(join(gitRepo, 'README.md'), 'x\n');
+writeFileSync(join(gitRepo, 'run.sh'), '#!/bin/sh\n');
+chmodSync(join(gitRepo, 'run.sh'), 0o755);
+symlinkSync('README.md', join(gitRepo, 'link'));
+mkdirSync(join(gitRepo, 'a'));
+writeFileSync(join(gitRepo, 'a', 'inner.txt'), 'inner\n');
+writeFileSync(join(gitRepo, 'a-b'), 'a-b\n');
+writeFileSync(join(gitRepo, 'a0'), 'a0\n');
+writeFileSync(join(gitRepo, 'café.txt'), 'café\n');
+git(gitRepo, 'init', '-q');
+git(gitRepo, 'add', '-A');
+git(gitRepo, 'commit', '-qm', 'x');
+const COMMIT = git(gitRepo, 'rev-parse', 'HEAD').toString().trim();
+const TREE = git(gitRepo, 'rev-parse', 'HEAD^{tree}').toString().trim();
+const LISTING = listingOf(gitRepo, 'HEAD');
+// A later commit whose root also holds a gitlink (mode 160000), which no reused tree may.
+git(gitRepo, 'update-index', '--add', '--cacheinfo', `160000,${COMMIT},sub`);
+git(gitRepo, 'commit', '-qm', 'gitlink');
+const GITLINKED = listingOf(gitRepo, 'HEAD');
+rmSync(gitRepo, { recursive: true, force: true });
+// The same listing with one blob changed: a well-formed tree with another id.
+const ANOTHER = LISTING.map((entry, i) => (i === 0 ? { ...entry, sha: 'e'.repeat(40) } : entry));
+// Forgejo's GET /git/trees/{sha} answer: sha names the commit asked for, not the tree.
+const answer = (entries, over = {}) => ({ tree: entries, truncated: false, page: 1, total_count: entries.length, ...over });
 const WORK = 'CI gate (typecheck + lint + test + build)';
 
 function prRun(id, { draft = false, status = 'success', number = 42, started = '2026-11-10T10:00:00Z', ...over } = {}) {
@@ -48,7 +88,7 @@ function fixture(history = [prRun(150)], work = { 150: 'success' }) {
       event_payload: JSON.stringify({ ref: 'refs/heads/main', before: 'b'.repeat(40), after: MAIN }) },
     pull: { number: 42, merged: true, merge_commit_sha: MAIN, head: { sha: HEAD, repo: { full_name: repository } },
       base: { ref: 'main', repo: { full_name: repository } } },
-    trees: { [MAIN]: TREE, [HEAD]: TREE }, history, jobs: {}, details: {},
+    trees: { [MAIN]: answer(LISTING), [HEAD]: answer(LISTING) }, history, jobs: {}, details: {},
   };
   for (const run of history) {
     const made = jobsFor(run.id, work[run.id] ?? 'success');
@@ -76,9 +116,9 @@ def read(path):
         return data["current"]
     if url.path == root + "/commits/" + data["current"]["commit_sha"] + "/pull":
         return data["pull"]
-    if url.path.startswith(root + "/git/commits/"):
+    if url.path.startswith(root + "/git/trees/"):
         sha = url.path.rsplit("/", 1)[1]
-        return {"sha": sha, "commit": {"tree": {"sha": data["trees"][sha]}}}
+        return {"sha": sha, "url": "https://forge.example/api/v1" + url.path, **data["trees"][sha]}
     if url.path == root + "/actions/runs":
         assert query["head_sha"] == ["a" * 40] and query["workflow_id"] == ["ci.yml"], query
         return {"workflow_runs": data["history"][start:start + 50], "total_count": data.get("total", len(data["history"]))}
@@ -106,8 +146,57 @@ const named = (runId = 150) => ({
 test('a main push at the tree its merged pull request executed names that run', () => {
   const result = evaluate(fixture());
   assert.deepEqual(result.record, named(), JSON.stringify(result));
-  assert.ok(result.reads.includes(`${root}/git/commits/${MAIN}`) && result.reads.includes(`${root}/git/commits/${HEAD}`), 'both trees are read');
+  assert.ok(result.reads.includes(`${root}/git/trees/${MAIN}`) && result.reads.includes(`${root}/git/trees/${HEAD}`), 'both trees are read');
+  assert.ok(!result.reads.some(path => path.includes('/git/commits/')), 'a commit read names the commit id as its tree');
   assert.ok(result.reads.includes(`${root}/actions/jobs/1501`), 'the quality job steps are read');
+});
+
+// tree() run alone on one listing: git's tree id, or the fixed refusal it raised.
+function treeOf(listing, sha = COMMIT) {
+  const result = spawnSync('python3', ['-I', '-c', `
+import json, sys
+data = json.load(sys.stdin)
+namespace = {"__name__": "fixture"}
+exec(compile(data["source"], "ci-gate.yml", "exec"), namespace)
+reads = []
+def read(path):
+    reads.append(path)
+    return data["listing"]
+try:
+    print(json.dumps({"tree": namespace["tree"](read, "/repos/fulcrum-labs/fixture", data["sha"]), "reads": reads}))
+except namespace["Refusal"] as error:
+    print(json.dumps({"refusal": str(error), "reads": reads}))
+`], { input: JSON.stringify({ source: verdictSource, listing, sha }), encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test('the tree compared is git\'s own id, rebuilt from Forgejo\'s listing of the commit', () => {
+  assert.deepEqual(LISTING.map(entry => [entry.path, entry.mode]), [['README.md', '100644'], ['a-b', '100644'], ['a', '040000'],
+    ['a0', '100644'], ['café.txt', '100644'], ['link', '120000'], ['run.sh', '100755']]);
+  assert.deepEqual(treeOf({ sha: COMMIT, ...answer(LISTING) }), { tree: TREE, reads: [`${root}/git/trees/${COMMIT}`] });
+  // git's order, not the listing's, decides the id; a listing naming the tree's own id rebuilds the same.
+  assert.equal(treeOf({ sha: COMMIT, ...answer([...LISTING].reverse()) }).tree, TREE);
+  assert.equal(treeOf({ sha: TREE, ...answer(LISTING) }).tree, TREE);
+});
+
+test('a listing the rebuild cannot reproduce exactly refuses with a fixed reason', () => {
+  const entry = over => [{ ...LISTING[0], ...over }, ...LISTING.slice(1)];
+  const cases = [
+    ['gitlink', answer(GITLINKED), 'tree entry'], ['truncated', answer(LISTING, { truncated: true }), 'tree listing'],
+    ['unsaid truncation', answer(LISTING, { truncated: undefined }), 'tree listing'], ['page 2', answer(LISTING, { page: 2 }), 'tree listing'],
+    ['count', answer(LISTING, { total_count: LISTING.length + 1 }), 'tree listing'], ['another id', answer(LISTING, { sha: 'b'.repeat(40) }), 'tree listing'],
+    ['no entries', answer([]), 'tree listing'], ['no list', answer(LISTING, { tree: null }), 'tree listing'], ['not an object', [], 'tree listing'],
+    ['unknown mode', answer(entry({ mode: '100664' })), 'tree entry'], ['git object mode text', answer(entry({ mode: '40000', type: 'tree' })), 'tree entry'],
+    ['mode and type disagree', answer(entry({ type: 'tree' })), 'tree entry'], ['path', answer(entry({ path: 'a/b' })), 'tree entry'],
+    ['empty name', answer(entry({ path: '' })), 'tree entry'], ['dot dot', answer(entry({ path: '..' })), 'tree entry'],
+    ['lone surrogate', answer(entry({ path: '\ud800' })), 'tree entry'], ['uppercase id', answer(entry({ sha: LISTING[0].sha.toUpperCase() })), 'tree entry'],
+    ['short id', answer(entry({ sha: LISTING[0].sha.slice(0, 39) })), 'tree entry'],
+    ['duplicate', answer([...LISTING, LISTING[0]]), 'tree entry'], ['not an entry', answer([...LISTING.slice(1), null]), 'tree entry'],
+  ];
+  for (const [name, listing, refusal] of cases) {
+    assert.equal(treeOf(Array.isArray(listing) ? listing : { sha: COMMIT, ...listing }).refusal, refusal, name);
+  }
 });
 
 test('a Ready run that reused an earlier verdict defers to the executed run before it', () => {
@@ -130,7 +219,7 @@ test('the newest Ready verdict decides: a failed, cancelled or running one, or n
 
 test('another tree is no reuse, and the run history is not read', () => {
   const data = fixture();
-  data.trees[HEAD] = 'e'.repeat(40);
+  data.trees[HEAD] = answer(ANOTHER);
   const result = evaluate(data);
   assert.equal(result.record, null);
   assert.ok(!result.reads.some(path => path.includes('/actions/runs?')));
@@ -378,7 +467,9 @@ test('each refusal path names its fixed reason', () => {
   assert.equal(reason(fixture([prRun(160, { status: 'Bad\nline' }), prRun(150)])), 'the newest Ready pull request run at the head is not success');
   assert.equal(reason(fixture([prRun(160)], { 160: 'skipped' })), 'no Ready pull request run at the head executed the gate');
   assert.equal(reason(fixture([])), 'no Ready pull request run at the head executed the gate');
-  assert.equal(reason(fixture(), d => { d.trees[HEAD] = 'e'.repeat(40); }), "the merged pull request's head has another tree");
+  assert.equal(reason(fixture(), d => { d.trees[HEAD] = answer(ANOTHER); }), "the merged pull request's head has another tree");
+  assert.equal(reason(fixture(), d => { d.trees[HEAD] = answer(LISTING, { truncated: true }); }), 'tree listing');
+  assert.equal(reason(fixture(), d => { d.trees[MAIN] = answer(GITLINKED); }), 'tree entry');
   assert.equal(reason(fixture(), d => { d.current.trigger_event = 'pull_request'; }), 'this run is not the push of this commit to main');
   assert.equal(reason(fixture(), d => { d.pull.merged = false; }), 'this commit is not a same-repository pull request merged into main');
   // A refused shape names the check it failed, a literal of the step.
@@ -434,11 +525,11 @@ namespace = {"__name__": "fixture"}
 exec(compile(json.load(sys.stdin), "ci-gate.yml", "exec"), namespace)
 root = "/repos/fulcrum-labs/fixture"
 print(json.dumps([namespace["endpoint"](root + path) for path in sys.argv[1:]]))
-`, '/actions/runs/200', `/commits/${MAIN}/pull`, `/git/commits/${HEAD}`, `/actions/runs?head_sha=${HEAD}&workflow_id=ci.yml&limit=50&page=1`,
+`, '/actions/runs/200', `/commits/${MAIN}/pull`, `/git/trees/${HEAD}`, `/actions/runs?head_sha=${HEAD}&workflow_id=ci.yml&limit=50&page=1`,
     '/actions/runs/150/jobs?limit=50&page=1', '/actions/jobs/1501', '/actions/secrets', `/contents/${'x'.repeat(10)}`],
   { input: JSON.stringify(verdictSource), encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), ['actions/runs/{id}', 'commits/{sha}/pull', 'git/commits/{sha}', 'actions/runs',
+  assert.deepEqual(JSON.parse(result.stdout), ['actions/runs/{id}', 'commits/{sha}/pull', 'git/trees/{sha}', 'actions/runs',
     'actions/runs/{id}/jobs', 'actions/jobs/{id}', 'another read', 'another read']);
 });
 

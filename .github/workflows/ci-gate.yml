@@ -295,6 +295,7 @@ jobs:
         run: |
           python3 - <<'MAIN_VERDICT'
           import datetime
+          import hashlib
           import json
           import os
           import re
@@ -308,7 +309,7 @@ jobs:
           # The statuses a refusal may name; any other answer is named "not success".
           STATUSES = {"failure", "cancelled", "running", "waiting", "blocked", "skipped", "unknown"}
           # The reads this step makes, by their fixed shape (ids and shas stand as {id} and {sha}).
-          ENDPOINTS = {"actions/runs/{id}", "commits/{sha}/pull", "git/commits/{sha}", "actions/runs",
+          ENDPOINTS = {"actions/runs/{id}", "commits/{sha}/pull", "git/trees/{sha}", "actions/runs",
                        "actions/runs/{id}/jobs", "actions/jobs/{id}"}
           # Why the last verdict() returned None, for the step's one reason line.
           REFUSED = []
@@ -353,11 +354,45 @@ jobs:
               raise Refusal("page bound")
 
 
+          # The tree entry modes a reused tree may hold, as Forgejo's tree listing writes them (fmt "%06o"), with each one's
+          # object type and the mode text git's tree object holds (a directory's without its leading zero). A gitlink (160000)
+          # or any other mode is outside it, so such a tree is never reused.
+          MODES = {"100644": ("blob", b"100644"), "100755": ("blob", b"100755"), "120000": ("blob", b"120000"),
+                   "040000": ("tree", b"40000")}
+
+
           def tree(read, root, sha):
-              commit = read(f"{root}/git/commits/{sha}")
-              value = commit["commit"]["tree"]["sha"]
-              if commit["sha"] != sha or not isinstance(value, str) or not SHA.fullmatch(value):
-                  raise Refusal("commit")
+              # git's tree id of commit sha, rebuilt from Forgejo's GET /git/trees/{sha} listing; both sides of the comparison
+              # are rebuilt this way. Forgejo names the commit's own id where its tree's belongs (GET /git/commits/{sha} sets
+              # commit.tree.sha to the commit id: services/convert/git_commit.go, ToCommit), but the listing's entries are the
+              # tree's own (mode, name, object id), from which git's tree object follows: `tree <size>\0`, then
+              # `<mode> <name>\0<20-byte id>` per entry in git's order (a directory's name sorts as name + "/").
+              listing = read(f"{root}/git/trees/{sha}")
+              entries = listing.get("tree") if isinstance(listing, dict) else None
+              if (not isinstance(entries, list) or not 0 < len(entries) <= 1000 or listing.get("truncated") is not False
+                      or listing.get("page") != 1 or listing.get("total_count") != len(entries)):
+                  raise Refusal("tree listing")
+              rows = []
+              for entry in entries:
+                  if not isinstance(entry, dict):
+                      raise Refusal("tree entry")
+                  name, mode, kind, object_id = entry.get("path"), entry.get("mode"), entry.get("type"), entry.get("sha")
+                  if (not isinstance(name, str) or name in ("", ".", "..") or "/" in name or "\0" in name
+                          or MODES.get(mode, (None,))[0] != kind or not isinstance(object_id, str) or not SHA.fullmatch(object_id)):
+                      raise Refusal("tree entry")
+                  try:
+                      raw = name.encode("utf-8")
+                  except UnicodeEncodeError:
+                      raise Refusal("tree entry") from None
+                  rows.append((raw + b"/" if kind == "tree" else raw, MODES[mode][1] + b" " + raw + b"\0" + bytes.fromhex(object_id)))
+              rows.sort(key=lambda row: row[0])
+              if len({key for key, _ in rows}) != len(rows):
+                  raise Refusal("tree entry")
+              body = b"".join(row for _, row in rows)
+              value = hashlib.sha1(b"tree %d\0" % len(body) + body).hexdigest()
+              # The listing names the id it resolved: the commit asked for, or this tree should Forgejo ever answer with it.
+              if listing.get("sha") not in (sha, value):
+                  raise Refusal("tree listing")
               return value
 
 
