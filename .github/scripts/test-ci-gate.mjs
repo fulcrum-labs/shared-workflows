@@ -177,6 +177,8 @@ test('pnpm cache discovery uses a store owned by the job or declared runner slot
 });
 
 const routedRunsOn = "${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}";
+// quality alone takes route's quality-runner first: the scan lane when a main push reuses its pull request's verdict.
+const routedQualityRunsOn = "${{ fromJSON(needs.route.outputs.quality-runner || needs.route.outputs.runner || inputs.runs-on) }}";
 const routedScanRunsOn = "${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}";
 
 test('non-container scanner jobs use the self-hosted fleet safely', () => {
@@ -603,7 +605,7 @@ test('every gate job runs on a Draft pull request: the heavy ones fail it first,
     assert.match(head, /^    needs: \[route\]$/m, `${m[1]} needs route`);
     assert.doesNotMatch(head, /runs-on:.*github\./, `${m[1]} runs-on must not read the github context`);
     assert.ok(
-      head.split('\n').includes(`    runs-on: ${['gitleaks', 'grype'].includes(m[1]) ? routedScanRunsOn : routedRunsOn}`),
+      head.split('\n').includes(`    runs-on: ${['gitleaks', 'grype'].includes(m[1]) ? routedScanRunsOn : m[1] === 'quality' ? routedQualityRunsOn : routedRunsOn}`),
       `${m[1]} lane`,
     );
     // PF #691: a failed route must not skip a required job.
@@ -661,7 +663,7 @@ test('the route job picks the runner labels at run time: Draft light lane, optio
     writeFileSync(out, '');
     const r = spawnSync('bash', ['-c', script], {
       encoding: 'utf8',
-      env: { PATH: process.env.PATH, EVENT_NAME: '', IS_DRAFT: '', REF: '', RUNS_ON: '["go-heavy"]', SCAN_RUNS_ON: '', MAIN_RUNS_ON: '', ENABLED: 'true', ...env, GITHUB_OUTPUT: out },
+      env: { PATH: process.env.PATH, EVENT_NAME: '', IS_DRAFT: '', PR_NUMBER: '', BEFORE: '', REF: '', RUNS_ON: '["go-heavy"]', SCAN_RUNS_ON: '', MAIN_RUNS_ON: '', ENABLED: 'true', ...env, GITHUB_OUTPUT: out },
     });
     assert.equal(r.status, 0, r.stderr);
     return Object.fromEntries(readFileSync(out, 'utf8').trim().split('\n').map(l => l.split(/=(.*)/s).slice(0, 2)));
@@ -684,6 +686,12 @@ test('the route job picks the runner labels at run time: Draft light lane, optio
   assert.deepEqual(run({ ...pushMain, MAIN_RUNS_ON: main }), { runner: main, 'scan-runner': heavy }, 'a push to main takes main-runs-on, scans stay');
   assert.deepEqual(run({ ...pushMain, MAIN_RUNS_ON: main, SCAN_RUNS_ON: scans }), { runner: main, 'scan-runner': scans }, 'main scans stay on scan-runs-on');
   assert.deepEqual(run(pushMain), { runner: heavy, 'scan-runner': heavy }, 'main-runs-on empty means runs-on');
+  // Forgejo runs a local reusable call as workflow_call: a push is a before commit and no pull request in the payload.
+  const calledPush = { EVENT_NAME: 'workflow_call', REF: 'refs/heads/main', BEFORE: 'b'.repeat(40) };
+  assert.deepEqual(run({ ...calledPush, MAIN_RUNS_ON: main }), { runner: main, 'scan-runner': heavy }, 'a Forgejo-called push to main takes main-runs-on');
+  assert.deepEqual(run({ ...calledPush, PR_NUMBER: '7', IS_DRAFT: 'false', MAIN_RUNS_ON: main }), { runner: heavy, 'scan-runner': heavy }, 'a Forgejo-called pull request never takes the main lane');
+  assert.deepEqual(run({ ...calledPush, BEFORE: '', MAIN_RUNS_ON: main }), { runner: heavy, 'scan-runner': heavy }, 'a Forgejo call without a push payload is not a push');
+  assert.deepEqual(run({ ...calledPush, REF: 'refs/heads/other', MAIN_RUNS_ON: main }), { runner: heavy, 'scan-runner': heavy }, 'a Forgejo-called push elsewhere uses runs-on');
   assert.deepEqual(run({ EVENT_NAME: 'push', REF: 'refs/heads/other', MAIN_RUNS_ON: main }), { runner: heavy, 'scan-runner': heavy }, 'a push elsewhere uses runs-on');
   assert.deepEqual(run({ EVENT_NAME: 'workflow_dispatch', REF: 'refs/heads/main', MAIN_RUNS_ON: main, SCAN_RUNS_ON: scans }), { runner: heavy, 'scan-runner': scans }, 'only a push takes the main lane');
   for (const event of [readyPr, draftPr, pushMain]) {
@@ -774,6 +782,38 @@ test('a draft is never classified, so its run still fails by design', () => {
   assert.equal(result.stdout.trim(), 'None');
   const push = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', env: { EVENT_NAME: 'push', BEFORE: '0'.repeat(40), AFTER: 'a'.repeat(40), REPOSITORY: 'o/r', API: 'http://127.0.0.1:9', TOKEN: 'x' } });
   assert.equal(push.stdout.trim(), 'None', 'a new branch has no before: full gate');
+});
+
+// Forgejo names a local reusable call workflow_call, so the classifier reads the event from the payload: an
+// event-name test listed no files there and every Forgejo change ran the full gate (ci-draft-light, 2026-11-10).
+test('a Forgejo-called run is classified from its payload, not its event name', () => {
+  const script = `import json
+ns = {'__name__': 'test'}
+exec(${JSON.stringify(classifier)}, ns)
+seen = []
+def get(path):
+    seen.append(path)
+    if '/pulls/' in path:
+        return [{'filename': 'AGENTS.md'}]
+    return {'files': [{'filename': 'CLAUDE.md'}]}
+ns['get'] = get
+print(json.dumps({'files': ns['changed_files'](), 'seen': seen}))`;
+  const run = env => {
+    const r = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', env: { REPOSITORY: 'o/r', API: 'x', TOKEN: 'x', BEFORE: '', AFTER: 'a'.repeat(40), PR_NUMBER: '', IS_DRAFT: '', ...env } });
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+  const before = 'b'.repeat(40);
+  for (const event of ['pull_request', 'workflow_call']) {
+    assert.deepEqual(run({ EVENT_NAME: event, PR_NUMBER: '7', IS_DRAFT: 'false' }), { files: ['AGENTS.md'], seen: ['/repos/o/r/pulls/7/files?limit=50&per_page=50&page=1'] }, event);
+    assert.deepEqual(run({ EVENT_NAME: event, PR_NUMBER: '7', IS_DRAFT: 'true' }), { files: null, seen: [] }, `${event} Draft`);
+  }
+  for (const event of ['push', 'workflow_call']) {
+    assert.deepEqual(run({ EVENT_NAME: event, BEFORE: before }), { files: ['CLAUDE.md'], seen: [`/repos/o/r/compare/${before}...${'a'.repeat(40)}`] }, event);
+  }
+  assert.deepEqual(run({ EVENT_NAME: 'workflow_call' }), { files: null, seen: [] }, 'neither payload: full gate');
+  assert.deepEqual(run({ EVENT_NAME: 'workflow_dispatch', BEFORE: before }), { files: null, seen: [] }, 'another event: full gate');
+  assert.deepEqual(run({ EVENT_NAME: 'pull_request_target', PR_NUMBER: '7', IS_DRAFT: 'false' }), { files: null, seen: [] }, 'pull_request_target: full gate');
 });
 
 test('the file listing pages by both Forgejo limit and GitHub per_page, and a compare of 300 files runs the full gate', () => {

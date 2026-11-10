@@ -14,7 +14,7 @@ on:
       main-runs-on:
         type: string
         default: ''
-        description: 'Optional. The runner labels a push to refs/heads/main asks for instead of runs-on, as a JSON array; empty means runs-on. The Forgejo copies of foundry, infra, platform-foundations and cockpit pass ["main-heavy"], a reserved lane in platform-foundations config/runner-fleet.yaml (fleet saturation ruling, 2026-10-23). Scans stay on scan-runs-on.'
+        description: 'Optional. The runner labels a push to refs/heads/main asks for instead of runs-on, as a JSON array; empty means runs-on. A push is read from the payload (a pushed before commit and no pull request), because Forgejo names a local reusable call workflow_call. No caller passes it on 2026-11-10. Scans stay on scan-runs-on.'
       node-version:
         type: string
         default: '24.18.0'
@@ -88,6 +88,9 @@ jobs:
     outputs:
       runner: ${{ steps.route.outputs.runner }}
       scan-runner: ${{ steps.route.outputs.scan-runner }}
+      quality-runner: ${{ steps.main-verdict.outputs.quality-runner }}
+      main-reused: ${{ steps.main-verdict.outputs.reuse }}
+      main-provenance: ${{ steps.main-verdict.outputs.provenance }}
       inert: ${{ steps.inert.outputs.inert }}
       code-free: ${{ steps.inert.outputs.code-free }}
       docs-changed: ${{ steps.inert.outputs.docs-changed }}
@@ -97,6 +100,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
           REF: ${{ github.ref }}
           RUNS_ON: ${{ inputs.runs-on }}
           SCAN_RUNS_ON: ${{ inputs.scan-runs-on }}
@@ -111,7 +116,9 @@ jobs:
           if [ "$ENABLED" != true ] || [ "$IS_DRAFT" = true ]; then
             runner='["fulcrum-light"]'
             scan='["fulcrum-light"]'
-          elif [ "$EVENT_NAME" = push ] && [ "$REF" = refs/heads/main ] && [ -n "$MAIN_RUNS_ON" ]; then
+          # A push is read from the payload too: a Forgejo-called push carries a before commit and no pull request.
+          elif { [ "$EVENT_NAME" = push ] || { [ "$EVENT_NAME" = workflow_call ] && [ -z "${PR_NUMBER:-}" ] && [ -n "${BEFORE:-}" ]; }; } \
+              && [ "$REF" = refs/heads/main ] && [ -n "$MAIN_RUNS_ON" ]; then
             runner="$MAIN_RUNS_ON"
           fi
           echo "runner=$runner" >> "$GITHUB_OUTPUT"
@@ -214,7 +221,10 @@ jobs:
 
           def changed_files():
               repo = os.environ["REPOSITORY"]
-              if os.environ["EVENT_NAME"] == "pull_request":
+              # The payload says which event this is: Forgejo names a local reusable call workflow_call, so an
+              # event-name test listed no files there and every Forgejo change ran the full gate.
+              event, number = os.environ["EVENT_NAME"], os.environ.get("PR_NUMBER", "")
+              if number and event in ("pull_request", "workflow_call"):
                   if os.environ.get("IS_DRAFT") == "true":
                       return None
                   number = int(os.environ["PR_NUMBER"])
@@ -228,7 +238,7 @@ jobs:
                       if len(batch) < 50:
                           return files
                   raise ValueError("listing too long")
-              if os.environ["EVENT_NAME"] == "push":
+              if not number and event in ("push", "workflow_call") and os.environ.get("BEFORE"):
                   before, after = os.environ["BEFORE"], os.environ["AFTER"]
                   if not (re.fullmatch(r"[0-9a-f]{40}", before) and re.fullmatch(r"[0-9a-f]{40}", after)) or set(before) == {"0"}:
                       return None
@@ -267,11 +277,219 @@ jobs:
               main()
           INERT_CLASSIFIER
 
+      # A push to main whose tree is the tree its merged pull request's Ready run executed and passed reuses that
+      # verdict: quality then runs on the scan lane, names that run in one line and skips its build and test steps.
+      # The scans and docs-lint still run in full on main: grype's database moves after a pull request passed (177
+      # main-only grype failures in 30 days, ci-main-reuse verdict 2026-11-10). Only an executed verdict counts: the
+      # newest Ready pull request run at the merged head must have succeeded, and quality's "CI gate" step must have
+      # run there, not been reused. Any other answer, an unreadable one or a different tree runs the full gate.
+      - name: Reuse the merged pull request's executed verdict at an identical tree
+        id: main-verdict
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          ENABLED: ${{ inputs.enabled }}
+          VERDICT_API: ${{ github.api_url }}
+          VERDICT_REPOSITORY: ${{ github.repository }}
+          VERDICT_RUN_ID: ${{ github.run_id }}
+          VERDICT_TOKEN: ${{ github.token }}
+          VERDICT_SHA: ${{ github.sha }}
+          VERDICT_REF: ${{ github.ref }}
+          VERDICT_PR: ${{ github.event.pull_request.number }}
+          VERDICT_BEFORE: ${{ github.event.before }}
+          SCAN_RUNNER: ${{ steps.route.outputs.scan-runner }}
+        run: |
+          python3 - <<'MAIN_VERDICT'
+          import datetime
+          import json
+          import os
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+
+          SHA = re.compile(r"[0-9a-f]{40}")
+          WORK = "CI gate (typecheck + lint + test + build)"
+
+
+          def payload(run):
+              value = json.loads(run["event_payload"])
+              if not isinstance(value, dict):
+                  raise ValueError("payload")
+              return value
+
+
+          def pages(read, path, key=None):
+              entries = []
+              for page in range(1, 5):
+                  result = read(path + ("&" if "?" in path else "?") + f"limit=50&page={page}")
+                  batch = result[key] if key else result
+                  if not isinstance(batch, list) or len(batch) > 50:
+                      raise ValueError("page")
+                  entries.extend(batch)
+                  if len(batch) < 50:
+                      if key and result["total_count"] != len(entries):
+                          raise ValueError("incomplete history")
+                      return entries
+              raise ValueError("page bound")
+
+
+          def tree(read, root, sha):
+              commit = read(f"{root}/git/commits/{sha}")
+              value = commit["commit"]["tree"]["sha"]
+              if commit["sha"] != sha or not isinstance(value, str) or not SHA.fullmatch(value):
+                  raise ValueError("commit")
+              return value
+
+
+          def unstarted(run):
+              start = datetime.datetime.fromisoformat(run["started"].replace("Z", "+00:00"))
+              return start.timestamp() <= 0
+
+
+          def executed(read, root, run):
+              # True when run's quality job executed the CI gate step and succeeded; False when that step was
+              # skipped because the run reused an earlier verdict (an edit, or a merged pull request's metadata
+              # event). Anything else raises.
+              jobs = [job for job in pages(read, f"{root}/actions/runs/{run['id']}/jobs") if job["name"] == "quality"]
+              if len(jobs) != 1:
+                  raise ValueError("quality job")
+              job = jobs[0]
+              if (type(job["id"]) is not int or job["id"] <= 0 or job["run_id"] != run["id"] or job["status"] != "success"
+                      or type(job["task_id"]) is not int or job["task_id"] <= 0):
+                  raise ValueError("unexecuted quality")
+              detail = read(f"{root}/actions/jobs/{job['id']}")
+              for key in ("id", "run_id", "task_id", "name", "status"):
+                  if type(detail[key]) is not type(job[key]) or detail[key] != job[key]:
+                      raise ValueError("job changed")
+              steps = detail["steps"]
+              if not isinstance(steps, list) or not 1 <= len(steps) <= 100:
+                  raise ValueError("steps")
+              work = [step for step in steps if isinstance(step, dict) and step.get("name") == WORK]
+              if len(work) != 1 or work[0]["status"] not in {"success", "skipped"}:
+                  raise ValueError("work")
+              return work[0]["status"] == "success"
+
+
+          def verdict(read, repository, run_id, sha):
+              root = "/repos/" + "/".join(urllib.parse.quote(p, safe="") for p in repository.split("/"))
+              current = read(f"{root}/actions/runs/{run_id}")
+              event = payload(current)
+              workflow = current["workflow_id"]
+              if (current["id"] != run_id or current["trigger_event"] != "push" or current["commit_sha"] != sha
+                      or current["repository"]["full_name"] != repository or "pull_request" in event
+                      or event.get("ref") != "refs/heads/main" or event.get("after") != sha
+                      or not isinstance(workflow, str) or not workflow.strip()):
+                  return None
+              pull = read(f"{root}/commits/{sha}/pull")
+              number, head = pull["number"], pull["head"]["sha"]
+              if (type(number) is not int or number <= 0 or pull["merged"] is not True or pull["merge_commit_sha"] != sha
+                      or pull["base"]["ref"] != "main" or pull["base"]["repo"]["full_name"] != repository
+                      or pull["head"]["repo"]["full_name"] != repository or not isinstance(head, str) or not SHA.fullmatch(head)):
+                  return None
+              candidate = tree(read, root, sha)
+              if tree(read, root, head) != candidate:
+                  return None
+              query = urllib.parse.urlencode({"head_sha": head, "workflow_id": workflow})
+              history = pages(read, f"{root}/actions/runs?{query}", "workflow_runs")
+              ids = [run["id"] for run in history]
+              if any(type(i) is not int or i <= 0 for i in ids) or len(set(ids)) != len(ids):
+                  raise ValueError("run id")
+              for run in sorted(history, key=lambda run: run["id"], reverse=True):
+                  if run["workflow_id"] != workflow or run["commit_sha"] != head:
+                      raise ValueError("history filter")
+                  if run["trigger_event"] != "pull_request":
+                      continue
+                  pr = payload(run)["pull_request"]
+                  if pr["number"] != number:
+                      continue
+                  if (run["repository"]["full_name"] != repository or run["is_fork_pull_request"] is not False
+                          or run["need_approval"] is not False or pr["head"]["sha"] != head
+                          or pr["head"]["repo"]["full_name"] != repository or pr["base"]["repo"]["full_name"] != repository
+                          or pr["base"]["ref"] != "main" or type(pr["draft"]) is not bool):
+                      raise ValueError("provenance")
+                  # A Draft run executes nothing, and a run still queued behind the merge has not started.
+                  if pr["draft"] or (run["status"] in {"waiting", "blocked"} and unstarted(run)):
+                      continue
+                  # The newest Ready verdict decides: a failure, cancellation or unfinished run is no reuse.
+                  if run["status"] != "success":
+                      return None
+                  if executed(read, root, run):
+                      index = run["index_in_repo"]
+                      if type(index) is not int or index <= 0:
+                          raise ValueError("index")
+                      return {"schema": "ci-gate.reused.v1", "repository": repository, "candidateCommit": sha,
+                              "candidateTree": candidate, "pullRequest": number, "head": head,
+                              "runId": run["id"], "runIndex": index}
+                  # This Ready run reused an earlier verdict at the same head: the run before it decides.
+              return None
+
+
+          def main():
+              record = None
+              env = os.environ
+              try:
+                  if (env["ENABLED"] == "true" and env["VERDICT_REF"] == "refs/heads/main" and not env.get("VERDICT_PR")
+                          and env.get("VERDICT_BEFORE") and SHA.fullmatch(env["VERDICT_SHA"])):
+                      api = env["VERDICT_API"].rstrip("/")
+                      parsed = urllib.parse.urlsplit(api)
+                      repository = env["VERDICT_REPOSITORY"]
+                      if (parsed.scheme != "https" or parsed.path != "/api/v1" or parsed.query or parsed.fragment
+                              or parsed.username or parsed.password
+                              or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)):
+                          raise ValueError("unsupported API")
+                      # The existing job credential, never an operator or admin token.
+                      token = env["VERDICT_TOKEN"]
+                      deadline = time.monotonic() + 25
+
+                      class NoRedirect(urllib.request.HTTPRedirectHandler):
+                          def redirect_request(self, *args, **kwargs):
+                              return None
+
+                      opener = urllib.request.build_opener(NoRedirect)
+
+                      def read(path):
+                          remaining = deadline - time.monotonic()
+                          if remaining <= 0 or not path.startswith("/repos/"):
+                              raise ValueError("read bound")
+                          request = urllib.request.Request(api + path, headers={
+                              "Authorization": "token " + token, "Accept": "application/json",
+                              "User-Agent": "platform-foundations-ci-verdict/1"})
+                          with opener.open(request, timeout=min(5, remaining)) as response:
+                              body = response.read(2 * 1024 * 1024 + 1)
+                              if len(body) > 2 * 1024 * 1024:
+                                  raise ValueError("response bound")
+                              return json.loads(body)
+
+                      record = verdict(read, repository, int(env["VERDICT_RUN_ID"]), env["VERDICT_SHA"])
+              except Exception:
+                  # Never echo response bodies, PR text, credentials or raw exception text.
+                  record = None
+                  print("::notice::No executed pull request verdict at this tree; running the full gate.")
+              lines = ["reuse=" + ("true" if record else "false")]
+              if record:
+                  print(f"::notice::Reusing pull request #{record['pullRequest']}'s executed verdict at tree {record['candidateTree']}.")
+                  lines.append("provenance=" + json.dumps(record, sort_keys=True, separators=(",", ":")))
+                  try:
+                      lane = json.loads(env.get("SCAN_RUNNER", ""))
+                      if isinstance(lane, list) and lane and all(isinstance(label, str) and label for label in lane):
+                          lines.append("quality-runner=" + json.dumps(lane, separators=(",", ":")))
+                  except ValueError:
+                      pass
+              with open(env["GITHUB_OUTPUT"], "a") as output:
+                  output.write("\n".join(lines) + "\n")
+
+
+          if __name__ == "__main__":
+              main()
+          MAIN_VERDICT
+
   quality:
     if: ${{ !cancelled() && inputs.enabled && needs.route.outputs.inert != 'true' }}
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runner || inputs.runs-on) }}
+    # A main push that reuses its merged pull request's executed verdict only names that run: the scan lane.
+    runs-on: ${{ fromJSON(needs.route.outputs.quality-runner || needs.route.outputs.runner || inputs.runs-on) }}
     # 45, not 25: under a saturated self-hosted pool (2026-09-30 Forgejo flip day) infra's quality ran past 25
     # minutes three times with no failing test and was cancelled each time; a timeout is a guard, not a budget.
     timeout-minutes: 45
@@ -290,6 +508,41 @@ jobs:
           echo "::error::Draft runs are never green; the Ready run decides." >&2
           exit 1
 
+      # route's main-verdict step found that this push to main has the tree its merged pull request's Ready run
+      # executed and passed. This job still runs and succeeds, never skips (a skipped required job reads as green to
+      # Forgejo but not to a release or converge listener): it prints one line naming that run and skips every step
+      # below. A provenance route wrote but this step cannot read exactly fails the job loudly.
+      - name: Name the merged pull request run this main push reused
+        id: main-verdict
+        if: ${{ needs.route.outputs.main-reused == 'true' }}
+        env:
+          PROVENANCE: ${{ needs.route.outputs.main-provenance }}
+          SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'MAIN_REUSED'
+          import json
+          import os
+          import re
+          import sys
+
+          FIELDS = {"candidateCommit", "candidateTree", "head", "pullRequest", "repository", "runId", "runIndex", "schema"}
+          try:
+              record = json.loads(os.environ["PROVENANCE"])
+              if (not isinstance(record, dict) or set(record) != FIELDS or record["schema"] != "ci-gate.reused.v1"
+                      or record["repository"] != os.environ["REPOSITORY"] or record["candidateCommit"] != os.environ["SHA"]
+                      or any(not isinstance(record[k], str) or not re.fullmatch(r"[0-9a-f]{40}", record[k])
+                             for k in ("candidateCommit", "candidateTree", "head"))
+                      or any(type(record[k]) is not int or record[k] <= 0 for k in ("pullRequest", "runId", "runIndex"))):
+                  raise ValueError("provenance")
+          except (KeyError, TypeError, ValueError):
+              print("::error::route named a reused verdict without exact provenance; this main run is not green.", file=sys.stderr)
+              sys.exit(1)
+          print("CI_GATE_REUSED_V1 " + json.dumps(record, sort_keys=True, separators=(",", ":")))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("reuse=true\n")
+          MAIN_REUSED
+
       # Reuse only the existing gate's complete success verdict at an immutable
       # head/base pair. No new status, cache or credential is created. Unsupported
       # APIs and missing evidence execute every normal gate step below.
@@ -304,6 +557,8 @@ jobs:
           VERDICT_RUN_ID: ${{ github.run_id }}
           VERDICT_TOKEN: ${{ github.token }}
           VERDICT_DOCS_LINT: ${{ inputs.docs-lint-enabled }}
+          # Only quality has a main-verdict step; in every other job this is empty and the scans run on main.
+          VERDICT_MAIN_REUSED: ${{ steps.main-verdict.outputs.reuse }}
         run: |
           python3 - <<'PRIOR_VERDICT'
           import datetime
@@ -578,6 +833,11 @@ jobs:
 
           def main():
               reuse = False
+              if os.environ.get("VERDICT_MAIN_REUSED") == "true":
+                  # quality named the merged pull request run whose executed verdict this main push reuses.
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                      output.write("reuse=true\n")
+                  return
               try:
                   api = os.environ["VERDICT_API"].rstrip("/")
                   parsed = urllib.parse.urlsplit(api)

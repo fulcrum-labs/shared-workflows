@@ -79,7 +79,10 @@ const ciGateRunsOn = {
   scan: "${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}",
 };
 const expectedRunsOn = jobName =>
-  ['gitleaks', 'grype'].includes(jobName) ? ciGateRunsOn.scan : ciGateRunsOn.default;
+  ['gitleaks', 'grype'].includes(jobName) ? ciGateRunsOn.scan
+    // quality takes the scan lane only when a main push reuses its merged pull request's executed verdict.
+    : jobName === 'quality' ? '${{ fromJSON(needs.route.outputs.quality-runner || needs.route.outputs.runner || inputs.runs-on) }}'
+      : ciGateRunsOn.default;
 
 test('all shared-workflow compute defaults to the self-hosted runner fleet', () => {
   const ciGate = workflows.get('ci-gate.yml').source;
