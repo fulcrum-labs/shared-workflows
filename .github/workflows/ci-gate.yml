@@ -106,7 +106,9 @@ jobs:
           set -euo pipefail
           runner="$RUNS_ON"
           scan="${SCAN_RUNS_ON:-$RUNS_ON}"
-          if [ "$ENABLED" != true ] || { [ "$EVENT_NAME" = pull_request ] && [ "$IS_DRAFT" = true ]; }; then
+          # A Draft is read from the pull_request payload alone: under Forgejo's workflow_call the event
+          # name is workflow_call, not pull_request (see quality's "Draft runs are never green").
+          if [ "$ENABLED" != true ] || [ "$IS_DRAFT" = true ]; then
             runner='["fulcrum-light"]'
             scan='["fulcrum-light"]'
           elif [ "$EVENT_NAME" = push ] && [ "$REF" = refs/heads/main ] && [ -n "$MAIN_RUNS_ON" ]; then
@@ -278,8 +280,12 @@ jobs:
       # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
       # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
       # before any checkout or API call; the Ready run decides.
+      # A Draft is read from the pull_request payload, never from the event name: a consumer calls this
+      # gate as a local reusable workflow, where Forgejo names the event workflow_call although the caller
+      # ran on pull_request, so an event-name test never fired there and every Forgejo Draft ran the full
+      # gate (infra run 10501, 2026-11-10: a WIP draft's quality ran 20 minutes on go-heavy).
       - name: Draft runs are never green
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        if: ${{ github.event.pull_request.draft == true }}
         run: |
           echo "::error::Draft runs are never green; the Ready run decides." >&2
           exit 1
@@ -1056,8 +1062,12 @@ jobs:
       # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
       # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
       # before any checkout or API call; the Ready run decides.
+      # A Draft is read from the pull_request payload, never from the event name: a consumer calls this
+      # gate as a local reusable workflow, where Forgejo names the event workflow_call although the caller
+      # ran on pull_request, so an event-name test never fired there and every Forgejo Draft ran the full
+      # gate (infra run 10501, 2026-11-10: a WIP draft's quality ran 20 minutes on go-heavy).
       - name: Draft runs are never green
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        if: ${{ github.event.pull_request.draft == true }}
         run: |
           echo "::error::Draft runs are never green; the Ready run decides." >&2
           exit 1
@@ -1167,15 +1177,9 @@ jobs:
     runs-on: ${{ fromJSON(needs.route.outputs.scan-runner || (inputs.scan-runs-on != '' && inputs.scan-runs-on || inputs.runs-on)) }}
     timeout-minutes: 5
     steps:
-      # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
-      # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
-      # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
-      # before any checkout or API call; the Ready run decides.
-      - name: Draft runs are never green
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
-        run: |
-          echo "::error::Draft runs are never green; the Ready run decides." >&2
-          exit 1
+      # gitleaks and grype are a Draft's light checks: they run on every Draft push (on the light lane, see
+      # route) and report a real verdict, so a leaked secret or a vulnerable dependency shows before Ready.
+      # They carry no Draft guard. A Draft still never reads green: quality always fails it (its first step).
 
       - *prior-verdict
 
@@ -1321,8 +1325,12 @@ jobs:
       # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
       # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
       # before any checkout or API call; the Ready run decides.
+      # A Draft is read from the pull_request payload, never from the event name: a consumer calls this
+      # gate as a local reusable workflow, where Forgejo names the event workflow_call although the caller
+      # ran on pull_request, so an event-name test never fired there and every Forgejo Draft ran the full
+      # gate (infra run 10501, 2026-11-10: a WIP draft's quality ran 20 minutes on go-heavy).
       - name: Draft runs are never green
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        if: ${{ github.event.pull_request.draft == true }}
         run: |
           echo "::error::Draft runs are never green; the Ready run decides." >&2
           exit 1
@@ -1420,15 +1428,9 @@ jobs:
     # not a budget.
     timeout-minutes: 20
     steps:
-      # A required job must never conclude skipped: Forgejo and GitHub both count a skipped job as
-      # success, and a queued one posts no status. PF #691 (2026-10-22) merged on a Draft run's skipped
-      # gate before the Ready run started. So a Draft runs this job on the light lane and fails here,
-      # before any checkout or API call; the Ready run decides.
-      - name: Draft runs are never green
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
-        run: |
-          echo "::error::Draft runs are never green; the Ready run decides." >&2
-          exit 1
+      # gitleaks and grype are a Draft's light checks: they run on every Draft push (on the light lane, see
+      # route) and report a real verdict, so a leaked secret or a vulnerable dependency shows before Ready.
+      # They carry no Draft guard. A Draft still never reads green: quality always fails it (its first step).
 
       - *prior-verdict
 

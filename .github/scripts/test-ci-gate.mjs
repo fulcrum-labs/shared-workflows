@@ -589,8 +589,10 @@ test('the quality job refuses any tracked node_modules entry, symlinks included'
 })
 
 // PF #691 (2026-10-22): a Draft run's skipped required job posted success and auto-merge fired before
-// the Ready run started. No job may skip on a Draft; each fails in its first step on the light lane.
-test('every gate job fails a Draft pull request in its first step and runs it on the light lane', () => {
+// the Ready run started. No job may skip on a Draft. quality, docs-lint and semgrep fail it in their first
+// step on the light lane; gitleaks and grype are the Draft's light checks and run in full, while quality's
+// failure keeps the Draft red.
+test('every gate job runs on a Draft pull request: the heavy ones fail it first, the scans run on the light lane', () => {
   const starts = [...workflow.matchAll(/^  (quality|docs-lint|gitleaks|semgrep|grype):$/gm)];
   assert.match(workflow, /^  docs-lint:\n    if: \$\{\{ !cancelled\(\) && inputs\.enabled && inputs\.docs-lint-enabled && \(needs\.route\.outputs\.inert != 'true' \|\| needs\.route\.outputs\.docs-changed == 'true'\) \}\}$/m);
   assert.deepEqual(starts.map(m => m[1]), ['quality', 'docs-lint', 'gitleaks', 'semgrep', 'grype']);
@@ -607,9 +609,28 @@ test('every gate job fails a Draft pull request in its first step and runs it on
     // PF #691: a failed route must not skip a required job.
     assert.match(head, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled( && inputs\.docs-lint-enabled)?( && needs\.route\.outputs\.(inert|code-free) != 'true')?( && \(needs\.route\.outputs\.inert != 'true' \|\| needs\.route\.outputs\.docs-changed == 'true'\))? \}\}$/m, `${m[1]} must survive a failed route`);
     const steps = job.slice(job.indexOf('    steps:\n') + '    steps:\n'.length);
-    const first = steps.slice(steps.indexOf('      - name:'));
-    assert.match(first, /^      - name: Draft runs are never green\n        if: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.draft \}\}\n/, `${m[1]} first step`);
+    const first = steps.slice(steps.indexOf('      - '));
+    if (['gitleaks', 'grype'].includes(m[1])) {
+      assert.doesNotMatch(job, /Draft runs are never green/, `${m[1]} runs on a Draft`);
+      assert.match(first, /^      - \*prior-verdict\n/, `${m[1]} first step`);
+    } else {
+      assert.match(first, /^      - name: Draft runs are never green\n        if: \$\{\{ github\.event\.pull_request\.draft == true \}\}\n/, `${m[1]} first step`);
+    }
     assert.doesNotMatch(job.split('\n    steps:')[0], /\n    if: .*draft/, `${m[1]} must not skip on a draft`);
+  }
+  // The guard reads the payload, never the event name: Forgejo names a local reusable call workflow_call
+  // (infra run 10501, 2026-11-10), and a guard that also required event_name == 'pull_request' never fired.
+  const guards = [...workflow.matchAll(/- name: Draft runs are never green\n        if: \$\{\{ (.+) \}\}\n/g)].map(g => g[1]);
+  assert.equal(guards.length, 3, 'quality, docs-lint and semgrep');
+  for (const expression of guards) {
+    assert.doesNotMatch(expression, /event_name/, 'a Draft guard must not read the event name');
+    const fires = event => Function('github', `return ${expression.replaceAll('.pull_request.', '.pull_request?.').replaceAll(' == ', ' === ')}`)(event);
+    const pr = draft => ({ number: 7, draft, head: { sha: 'a'.repeat(40) }, base: { sha: 'b'.repeat(40) } });
+    assert.equal(fires({ event_name: 'pull_request', event: { pull_request: pr(true) } }), true, 'a Draft on pull_request');
+    assert.equal(fires({ event_name: 'workflow_call', event: { pull_request: pr(true) } }), true, 'a Draft through a Forgejo local call');
+    assert.equal(fires({ event_name: 'workflow_call', event: { pull_request: pr(false) } }), false, 'a Ready pull request');
+    assert.equal(fires({ event_name: 'workflow_call', event: { before: 'c'.repeat(40), after: 'a'.repeat(40) } }), false, 'a push');
+    assert.equal(fires({ event_name: 'merge_group', event: { merge_group: {} } }), false, 'a merge group');
   }
   const step = workflow.match(/- name: Draft runs are never green\n        if: [^\n]+\n        run: \|\n((?:          [^\n]*\n)+)/)[1].replace(/^ {10}/gm, '');
   const r = spawnSync('bash', ['-c', step], { encoding: 'utf8' });
@@ -654,6 +675,9 @@ test('the route job picks the runner labels at run time: Draft light lane, optio
   const pushMain = { EVENT_NAME: 'push', REF: 'refs/heads/main' };
 
   assert.deepEqual(run(draftPr), { runner: light, 'scan-runner': light }, 'a Draft runs on the light lane');
+  // Forgejo runs a local reusable call as workflow_call: the payload, not the event name, says Draft.
+  assert.deepEqual(run({ ...draftPr, EVENT_NAME: 'workflow_call' }), { runner: light, 'scan-runner': light }, 'a Forgejo-called Draft runs on the light lane');
+  assert.deepEqual(run({ ...readyPr, EVENT_NAME: 'workflow_call' }), { runner: heavy, 'scan-runner': heavy }, 'a Forgejo-called Ready PR uses runs-on');
   assert.deepEqual(run({ ...draftPr, MAIN_RUNS_ON: main, SCAN_RUNS_ON: scans }), { runner: light, 'scan-runner': light }, 'a Draft ignores both overrides');
   assert.deepEqual(run(readyPr), { runner: heavy, 'scan-runner': heavy }, 'a Ready PR uses runs-on');
   assert.deepEqual(run({ ...readyPr, MAIN_RUNS_ON: main }), { runner: heavy, 'scan-runner': heavy }, 'a PR never takes the main lane');
