@@ -780,13 +780,14 @@ test('a draft is never classified, so its run still fails by design', () => {
   const result = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', env: { EVENT_NAME: 'pull_request', IS_DRAFT: 'true', REPOSITORY: 'o/r', PR_NUMBER: '1', API: 'http://127.0.0.1:9', TOKEN: 'x' } });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), 'None');
-  const push = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', env: { EVENT_NAME: 'push', BEFORE: '0'.repeat(40), AFTER: 'a'.repeat(40), REPOSITORY: 'o/r', API: 'http://127.0.0.1:9', TOKEN: 'x' } });
-  assert.equal(push.stdout.trim(), 'None', 'a new branch has no before: full gate');
+  const push = spawnSync('python3', ['-I', '-c', script], { encoding: 'utf8', env: { EVENT_NAME: 'push', REPOSITORY: 'o/r', API: 'http://127.0.0.1:9', TOKEN: 'x' } });
+  assert.equal(push.stdout.trim(), 'None', 'a push: full gate');
 });
 
 // Forgejo names a local reusable call workflow_call, so the classifier reads the event from the payload: an
 // event-name test listed no files there and every Forgejo change ran the full gate (ci-draft-light, 2026-11-10).
-test('a Forgejo-called run is classified from its payload, not its event name', () => {
+// A push lists nothing, on either forge: main pushes keep the full run (coordinator ruling, 10 Nov 2026).
+test('a Forgejo-called run is classified from its payload, not its event name, and a push is never classified', () => {
   const script = `import json
 ns = {'__name__': 'test'}
 exec(${JSON.stringify(classifier)}, ns)
@@ -809,16 +810,16 @@ print(json.dumps({'files': ns['changed_files'](), 'seen': seen}))`;
     assert.deepEqual(run({ EVENT_NAME: event, PR_NUMBER: '7', IS_DRAFT: 'true' }), { files: null, seen: [] }, `${event} Draft`);
   }
   for (const event of ['push', 'workflow_call']) {
-    assert.deepEqual(run({ EVENT_NAME: event, BEFORE: before }), { files: ['CLAUDE.md'], seen: [`/repos/o/r/compare/${before}...${'a'.repeat(40)}`] }, event);
+    assert.deepEqual(run({ EVENT_NAME: event, BEFORE: before }), { files: null, seen: [] }, `${event} push: full gate`);
   }
+  assert.doesNotMatch(classifier, /compare\//, 'no push listing to fall back on');
   assert.deepEqual(run({ EVENT_NAME: 'workflow_call' }), { files: null, seen: [] }, 'neither payload: full gate');
   assert.deepEqual(run({ EVENT_NAME: 'workflow_dispatch', BEFORE: before }), { files: null, seen: [] }, 'another event: full gate');
   assert.deepEqual(run({ EVENT_NAME: 'pull_request_target', PR_NUMBER: '7', IS_DRAFT: 'false' }), { files: null, seen: [] }, 'pull_request_target: full gate');
 });
 
-test('the file listing pages by both Forgejo limit and GitHub per_page, and a compare of 300 files runs the full gate', () => {
+test('the file listing pages by both Forgejo limit and GitHub per_page', () => {
   assert.match(workflow, /pulls\/\{number\}\/files\?limit=50&per_page=50&page=\{page\}/);
-  assert.match(workflow, /len\(entries\) >= 300/);
 });
 
 test('content markdown anywhere is never inert, so a content change runs the full gate', () => {

@@ -206,7 +206,7 @@ if record is not None:
 namespace["main"]()
 print(json.dumps(seen))
 `], { input: JSON.stringify(verdictSource), encoding: 'utf8', timeout: 10000, env: {
-      PATH: process.env.PATH, ENABLED: 'true', VERDICT_API: 'https://forge.example/api/v1', VERDICT_REPOSITORY: repository,
+      PATH: process.env.PATH, ENABLED: 'true', MAIN_REUSE: 'true', VERDICT_API: 'https://forge.example/api/v1', VERDICT_REPOSITORY: repository,
       VERDICT_RUN_ID: '200', VERDICT_TOKEN: 'fixture-only', VERDICT_SHA: MAIN, VERDICT_REF: 'refs/heads/main', VERDICT_PR: '',
       VERDICT_BEFORE: 'b'.repeat(40), SCAN_RUNNER: '["fulcrum-light"]', GITHUB_OUTPUT: join(folder, 'out'),
       ...(record === undefined ? {} : { FIXTURE_RECORD: JSON.stringify(record) }), ...env,
@@ -219,8 +219,8 @@ print(json.dumps(seen))
   }
 }
 
-test('main() reads nothing for a pull request, a disabled gate, another ref or a run with no push payload', () => {
-  for (const env of [{ ENABLED: 'false' }, { VERDICT_PR: '7' }, { VERDICT_REF: 'refs/heads/other' }, { VERDICT_BEFORE: '' }, { VERDICT_SHA: 'main' }]) {
+test('main() reads nothing for a pull request, a disabled gate or lever, another ref or a run with no push payload', () => {
+  for (const env of [{ ENABLED: 'false' }, { MAIN_REUSE: 'false' }, { MAIN_REUSE: '' }, { VERDICT_PR: '7' }, { VERDICT_REF: 'refs/heads/other' }, { VERDICT_BEFORE: '' }, { VERDICT_SHA: 'main' }]) {
     const { output, requests } = runMain(env);
     assert.deepEqual(output, { reuse: 'false' }, JSON.stringify(env));
     assert.deepEqual(requests, [], JSON.stringify(env));
@@ -318,6 +318,7 @@ test('route decides, quality alone names the run, and the scans and docs-lint ne
     '      main-reused: ${{ steps.main-verdict.outputs.reuse }}',
     '      main-provenance: ${{ steps.main-verdict.outputs.provenance }}',
     '          SCAN_RUNNER: ${{ steps.route.outputs.scan-runner }}',
+    '          MAIN_REUSE: ${{ inputs.main-verdict-reuse }}',
     '          VERDICT_PR: ${{ github.event.pull_request.number }}',
     '          VERDICT_BEFORE: ${{ github.event.before }}',
   ]) assert.ok(route.split('\n').includes(line), line);
@@ -336,4 +337,12 @@ test('route decides, quality alone names the run, and the scans and docs-lint ne
     assert.doesNotMatch(other, /id: main-verdict|main-reused|main-provenance|quality-runner/, `${name} has no main verdict of its own`);
   }
   assert.equal([...workflow.matchAll(/^        id: main-verdict$/gm)].length, 2, 'route decides, quality names');
+});
+
+test('main-verdict-reuse is an input, on by default, so one repository can keep every main push on the full gate', () => {
+  assert.match(workflow, /^      main-verdict-reuse:\n        type: boolean\n        default: true\n/m);
+  // A lever set false reads nothing and leaves quality on its own runner with every step.
+  const { output, requests } = runMain({ MAIN_REUSE: 'false' }, named());
+  assert.deepEqual(output, { reuse: 'false' });
+  assert.deepEqual(requests, []);
 });

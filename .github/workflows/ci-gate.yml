@@ -32,7 +32,11 @@ on:
       skip-inert-changes:
         type: boolean
         default: true
-        description: 'Optional. Skip the build, test and dependency-scan jobs (quality, grype, and semgrep when no code file changed) for a change whose every file is inert: agent-instruction and settings files and docs that no build, test or deploy reads (route, step "Classify changed files"). gitleaks always runs, and docs-lint when a doc changed. A listing that cannot be read, a draft, or any other file runs the full gate. false is the rollback lever: every change runs the full gate.'
+        description: 'Optional. Skip the build, test and dependency-scan jobs (quality, grype, and semgrep when no code file changed) for a change whose every file is inert: agent-instruction and settings files and docs that no build, test or deploy reads (route, step "Classify changed files"). gitleaks always runs, and docs-lint when a doc changed. A push, a listing that cannot be read, a draft, or any other file runs the full gate. false is the rollback lever: every change runs the full gate.'
+      main-verdict-reuse:
+        type: boolean
+        default: true
+        description: 'Optional. A push to main whose git tree equals the tree its merged pull request''s Ready run executed and passed reuses that verdict: quality names that run in one line and skips its build and test steps, and the scans still run (route, step "Reuse the merged pull request''s executed verdict at an identical tree"). false is the per-repository lever: every main push runs the full gate.'
       turbo-cache-enabled:
         type: boolean
         default: false
@@ -128,8 +132,9 @@ jobs:
       # deploy reads -- needs no build, test or dependency scan. Platform-foundations' conventions sync opens such a
       # PR in every repo several times a day. The allowlist below is strict: a file not named here is not inert, so
       # a workflow file, package.json, a lockfile, a lint or tsconfig, .gitleaksignore or any source runs the full
-      # gate; so does one inert file beside one other. Fail open: a listing that cannot be read, a draft, a push with
-      # no usable "before", or a truncated listing leaves every output empty and the full gate runs. The same
+      # gate; so does one inert file beside one other. Fail open: a push, a listing that cannot be read, a draft or a
+      # truncated listing leaves every output empty and the full gate runs. A push lists no files: main pushes keep the
+      # full run (coordinator ruling, 10 Nov 2026). The same
       # allowlist is in fulcrum-labs/deploy-jobs bin/converge.sh (inert_path); change both together.
       - name: Classify changed files
         id: inert
@@ -143,13 +148,10 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.sha }}
         run: |
           python3 - <<'INERT_CLASSIFIER'
           import json
           import os
-          import re
           import sys
           import urllib.request
 
@@ -238,16 +240,7 @@ jobs:
                       if len(batch) < 50:
                           return files
                   raise ValueError("listing too long")
-              if not number and event in ("push", "workflow_call") and os.environ.get("BEFORE"):
-                  before, after = os.environ["BEFORE"], os.environ["AFTER"]
-                  if not (re.fullmatch(r"[0-9a-f]{40}", before) and re.fullmatch(r"[0-9a-f]{40}", after)) or set(before) == {"0"}:
-                      return None
-                  result = get(f"/repos/{repo}/compare/{before}...{after}")
-                  entries = result["files"]
-                  # GitHub caps a compare listing at 300 files, Forgejo at its diff-file limit; a listing that reaches 300 may be cut short.
-                  if not isinstance(entries, list) or len(entries) >= 300:
-                      raise ValueError("compare listing")
-                  return names(entries)
+              # A push, and any other event, lists nothing: main pushes keep the full gate.
               return None
 
 
@@ -289,6 +282,7 @@ jobs:
         timeout-minutes: 1
         env:
           ENABLED: ${{ inputs.enabled }}
+          MAIN_REUSE: ${{ inputs.main-verdict-reuse }}
           VERDICT_API: ${{ github.api_url }}
           VERDICT_REPOSITORY: ${{ github.repository }}
           VERDICT_RUN_ID: ${{ github.run_id }}
@@ -429,7 +423,8 @@ jobs:
               record = None
               env = os.environ
               try:
-                  if (env["ENABLED"] == "true" and env["VERDICT_REF"] == "refs/heads/main" and not env.get("VERDICT_PR")
+                  if (env["ENABLED"] == "true" and env.get("MAIN_REUSE") == "true"
+                          and env["VERDICT_REF"] == "refs/heads/main" and not env.get("VERDICT_PR")
                           and env.get("VERDICT_BEFORE") and SHA.fullmatch(env["VERDICT_SHA"])):
                       api = env["VERDICT_API"].rstrip("/")
                       parsed = urllib.parse.urlsplit(api)
