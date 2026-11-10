@@ -32,6 +32,15 @@ on:
           GitHub environment the job runs in, and where its CF_DEPLOY_API_TOKEN
           lives. Default keeps every existing caller on `production`, exactly
           as before this input existed.
+      runner-labels:
+        type: string
+        default: '["self-hosted","Linux","X64"]'
+        description: >-
+          JSON array of runner labels the deploy job runs on. The default is
+          the general self-hosted pool, exactly as before this input existed.
+          A caller points it at a runner reserved for production deploys so a
+          deploy never queues behind the general pool's CI jobs, and falls
+          back by omitting the input.
       build-command:
         type: string
         required: true
@@ -189,7 +198,7 @@ concurrency:
 jobs:
   deploy:
     # break-glass: swap runs-on back to ubuntu-24.04 if self-hosted fleet unavailable
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     environment: ${{ inputs.environment }}
     timeout-minutes: 30
     steps:
