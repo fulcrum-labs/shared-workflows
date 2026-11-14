@@ -832,3 +832,16 @@ test('content markdown anywhere is never inert, so a content change runs the ful
     assert.equal(classify(['AGENTS.md', file]).inert, 'false', `${file} beside an inert file`);
   }
 });
+
+test('the StarwindUI check is one step of quality, on by default, pull requests only, with its rollback input', () => {
+  assert.match(workflow, /starwind-check:\n        type: boolean\n        default: true\n/);
+  const step = workflow.split(/^      - /m).filter(s => s.startsWith('name: StarwindUI hand-built controls'));
+  assert.equal(step.length, 1);
+  assert.match(step[0], /if: \$\{\{ steps\.prior-verdict\.outputs\.reuse != 'true' && inputs\.starwind-check && github\.event\.pull_request\.base\.sha != '' \}\}/);
+  assert.match(step[0], /STARWIND_BASE: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  assert.match(step[0], /node scripts\/ci\/starwind-check\.mjs/);
+  assert.match(step[0], /::warning::scripts\/ci\/starwind-check\.mjs is not in this repository yet/);
+  const quality = workflow.slice(workflow.indexOf('\n  quality:\n'), workflow.indexOf('\n  docs-lint:\n'));
+  assert.ok(quality.includes('name: StarwindUI hand-built controls'), 'the step lives in the quality job');
+  assert.equal(workflow.split('name: StarwindUI hand-built controls').length, 2, 'no other job carries it');
+});

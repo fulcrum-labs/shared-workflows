@@ -25,6 +25,10 @@ on:
         type: boolean
         default: false
         description: 'Optional. Run the docs-convention lint job (@fulcrum-labs/docs-lint). Repos opt in via platform-foundations maintenance.docs_lint.'
+      starwind-check:
+        type: boolean
+        default: true
+        description: 'Optional. On a pull request, fail the quality job when it adds a hand-built <button>, <input>, <select>, <textarea>, <dialog> or <details> to an .astro file outside components/starwind and components/starwind-pro, unless a "starwind-exception: <reason>" comment sits on the same line or within the 3 lines above (marked ones print a notice and a summary). Runs scripts/ci/starwind-check.mjs from platform-foundations; lines the pull request did not add are never flagged. false is the rollback lever.'
       enabled:
         type: boolean
         default: true
@@ -1078,6 +1082,22 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
         if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}
+
+      # StarwindUI is the Astro UI standard (kb decision-really-use-starwindui-consistent-ui-2026-11-13): a hand-built
+      # control that a pull request adds needs a stated reason. The logic is platform-foundations' templates/scripts/ci/
+      # starwind-check.mjs, delivered to every consumer by the conventions sync; it reads only the lines this pull request
+      # adds against its merge base, and does nothing on a push. A consumer the sync has not reached yet has no script:
+      # that prints a warning instead of failing the gate, so a sync never has to land before this gate does.
+      - name: StarwindUI hand-built controls
+        if: ${{ steps.prior-verdict.outputs.reuse != 'true' && inputs.starwind-check && github.event.pull_request.base.sha != '' }}
+        env:
+          STARWIND_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ ! -f scripts/ci/starwind-check.mjs ]; then
+            echo "::warning::scripts/ci/starwind-check.mjs is not in this repository yet (the conventions sync delivers it); StarwindUI check skipped"
+            exit 0
+          fi
+          node scripts/ci/starwind-check.mjs
 
       - name: Resolve Turbo cache eligibility
         if: ${{ steps.prior-verdict.outputs.reuse != 'true' }}

@@ -359,7 +359,7 @@ test('all original steps retain their conditions and run when reuse is absent', 
   const guarded = steps.filter(s => !s.startsWith('*prior-verdict') && !s.startsWith('&prior-verdict') && !s.startsWith('name: Draft runs are never green') && !s.startsWith('name: Choose runner labels') && !s.startsWith('name: Classify changed files')
     && !s.startsWith("name: Reuse the merged pull request's executed verdict at an identical tree")
     && !s.startsWith('name: Name the merged pull request run this main push reused'));
-  assert.equal(guarded.length, 33, 'all normal gate steps remain present');
+  assert.equal(guarded.length, 34, 'all normal gate steps remain present');
   for (const step of guarded) assert.match(step, /^ {8}if: \$\{\{ steps\.prior-verdict\.outputs\.reuse != 'true'/m);
   assert.match(workflow, /if: \$\{\{ steps\.prior-verdict\.outputs\.reuse != 'true' && \(steps\.turbo-cache\.outputs\.eligible == 'true'\) \}\}/);
   assert.match(workflow, /^    if: \$\{\{ !cancelled\(\) && inputs\.enabled && inputs\.docs-lint-enabled && /m);
